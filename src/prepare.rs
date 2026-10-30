@@ -634,7 +634,10 @@ pub fn worker(system: &Path, userdata: &Path, base: &Path, mode: &str) -> io::Re
         cleanup.push(e.to_string());
     }
     if !cleanup.is_empty() {
-        if mode == "--selinux-probe-worker" || mode == "--servicemanager-preflight-worker" {
+        if mode == "--selinux-probe-worker"
+            || mode == "--servicemanager-preflight-worker"
+            || mode == "--servicemanager-runtime-preflight-worker"
+        {
             println!(
                 "SELinux transition resource summary: {}",
                 serde_json::json!({"cleanup": "failed", "scope": "system_userdata_mounts_and_loops", "errors": cleanup})
@@ -646,7 +649,10 @@ pub fn worker(system: &Path, userdata: &Path, base: &Path, mode: &str) -> io::Re
             cleanup.join("; ")
         )));
     }
-    if mode == "--selinux-probe-worker" || mode == "--servicemanager-preflight-worker" {
+    if mode == "--selinux-probe-worker"
+        || mode == "--servicemanager-preflight-worker"
+        || mode == "--servicemanager-runtime-preflight-worker"
+    {
         println!(
             "SELinux transition resource summary: {}",
             serde_json::json!({"cleanup": "passed", "scope": "system_userdata_mounts_and_loops"})

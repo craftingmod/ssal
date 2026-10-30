@@ -19,6 +19,7 @@ fn main() {
                 "probe-binder",
                 "probe-selinux-transition",
                 "probe-servicemanager-preflight",
+                "probe-servicemanager-runtime-preflight",
                 "remove",
             ]
             .contains(&a.as_str())
@@ -50,7 +51,7 @@ fn main() {
         }
         _ => {
             eprintln!(
-                "usage: ssal doctor [PROFILE_NAME] | prepare PROFILE_NAME | probe-binder PROFILE_NAME | probe-selinux-transition PROFILE_NAME | probe-servicemanager-preflight PROFILE_NAME | remove PROFILE_NAME | status | logs | add IMAGE_NAME PATH | create IMAGE_NAME [PROFILE_NAME] | switch IMAGE_NAME | return\nNames: 1-64 ASCII letters, digits, underscores or hyphens"
+                "usage: ssal doctor [PROFILE_NAME] | prepare PROFILE_NAME | probe-binder PROFILE_NAME | probe-selinux-transition PROFILE_NAME | probe-servicemanager-preflight PROFILE_NAME | probe-servicemanager-runtime-preflight PROFILE_NAME | remove PROFILE_NAME | status | logs | add IMAGE_NAME PATH | create IMAGE_NAME [PROFILE_NAME] | switch IMAGE_NAME | return\nNames: 1-64 ASCII letters, digits, underscores or hyphens"
             );
             std::process::exit(2)
         }

@@ -3,7 +3,7 @@ use super::*;
 use serde_json::{json, Value};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 
-fn digest(path: &Path) -> io::Result<String> {
+pub(super) fn digest(path: &Path) -> io::Result<String> {
     use sha2::{Digest, Sha256};
     let mut file = fs::File::open(path)?;
     let mut hash = Sha256::new();
@@ -18,7 +18,7 @@ fn digest(path: &Path) -> io::Result<String> {
     Ok(hash.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
-fn metadata(path: &Path) -> io::Result<Value> {
+pub(super) fn metadata(path: &Path) -> io::Result<Value> {
     let meta = fs::metadata(path)?;
     let name =
         std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).map_err(io::Error::other)?;
@@ -49,7 +49,7 @@ fn metadata(path: &Path) -> io::Result<Value> {
     )
 }
 
-fn observe(root: &Path, name: &str) -> Value {
+pub(super) fn observe(root: &Path, name: &str) -> Value {
     let guest = crate::guest_mounts::guest_path(root, name).and_then(|p| metadata(&p));
     let host = metadata(&Path::new("/").join(name));
     let same = match (&guest, &host) {
@@ -62,7 +62,7 @@ fn observe(root: &Path, name: &str) -> Value {
         "host": host.as_ref().ok(), "host_error": host.as_ref().err().map(ToString::to_string), "same_host_object": same})
 }
 
-fn rc_spec(contents: &str) -> io::Result<Value> {
+pub(super) fn rc_spec(contents: &str) -> io::Result<Value> {
     let mut active = false;
     let mut directives = std::collections::BTreeMap::new();
     let mut service = None;
@@ -116,7 +116,7 @@ fn rc_spec(contents: &str) -> io::Result<Value> {
     )
 }
 
-fn fds() -> io::Result<Value> {
+pub(super) fn fds() -> io::Result<Value> {
     let numbers: Vec<i32> = fs::read_dir("/proc/self/fd")?
         .filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
         .collect();

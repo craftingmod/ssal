@@ -42,3 +42,5 @@ WebUI 소스는 `frontend/`에 있으며 `bun run build:web`으로 `out/webroot/
 SELinux 전환 사전 검사는 `ssal probe-selinux-transition PROFILE_NAME`으로 실행합니다. [검사 범위와 기기 결과](docs/selinux-transition-probe.md)를 참고하세요.
 
 정식 Guest servicemanager의 실행 없는 권한·환경·격리 검사는 `ssal probe-servicemanager-preflight PROFILE_NAME`으로 실행합니다. [실행 선행 조건과 기기 결과](docs/servicemanager-preflight.md)를 참고하세요.
+
+실제 private Binder를 연결하고 라벨 호환성·실행 명세·Host 노출 경로를 조사하는 후속 검사는 `ssal probe-servicemanager-runtime-preflight PROFILE_NAME`으로 실행합니다. 실제 서비스는 실행하지 않습니다. [런타임 차단 요인과 기기 결과](docs/servicemanager-runtime-preflight.md)를 참고하세요.

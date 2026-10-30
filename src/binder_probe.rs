@@ -53,14 +53,128 @@ fn mount_id(file: &File) -> io::Result<u64> {
         .map_err(io::Error::other)
 }
 
-struct Session {
+pub(crate) struct Session {
     mounts: Vec<PathBuf>,
     device: Option<File>,
     created_mount: Option<u64>,
 }
 
 impl Session {
-    fn cleanup(&mut self) -> io::Result<()> {
+    pub(crate) fn new() -> Self {
+        Self {
+            mounts: Vec::new(),
+            device: None,
+            created_mount: None,
+        }
+    }
+
+    /// Creates and binds only a private driver; no context manager or IPC.
+    pub(crate) fn provision(&mut self, root: &Path) -> io::Result<(u32, u32, i32)> {
+        let host = fs::metadata("/dev/binder")?;
+        if !host.file_type().is_char_device() {
+            return Err(io::Error::other("host binder is not a character device"));
+        }
+        let target = crate::guest_mounts::guest_path(root, "dev/binderfs")?;
+        if !target.is_dir() {
+            return Err(io::Error::other("binderfs mountpoint missing"));
+        }
+        if unsafe {
+            libc::mount(
+                c"binder".as_ptr(),
+                cpath(&target)?.as_ptr(),
+                c"binder".as_ptr(),
+                libc::MS_NOSUID | libc::MS_NOEXEC,
+                c"max=4".as_ptr().cast(),
+            )
+        } != 0
+        {
+            let e = io::Error::last_os_error();
+            return Err(io::Error::new(
+                e.kind(),
+                format!("mount private binderfs {}: {e}", target.display()),
+            ));
+        }
+        self.mounts.push(target.clone());
+        let control = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(target.join("binder-control"))?;
+        let private_mount = mount_id(&control)?;
+        self.created_mount = Some(private_mount);
+        let mut request = BinderfsDevice {
+            name: [0; 256],
+            major: 0,
+            minor: 0,
+        };
+        // Some Android kernels prepopulate binder/hwbinder/vndbinder on mount.
+        // Allocate our own name instead of treating those as an allocation.
+        request.name[..10].copy_from_slice(b"ssal-probe");
+        // _IOWR('b', 1, struct binderfs_device), size=264 on arm64 and x86_64.
+        if unsafe { libc::ioctl(control.as_raw_fd(), 0xc1086201u32 as _, &mut request) } != 0 {
+            return Err(io::Error::other(format!(
+                "BINDER_CTL_ADD: {}",
+                io::Error::last_os_error()
+            )));
+        }
+        let source = target.join("ssal-probe");
+        let device = OpenOptions::new().read(true).write(true).open(&source)?;
+        let meta = device.metadata()?;
+        if !meta.file_type().is_char_device()
+            || meta.rdev() != libc::makedev(request.major, request.minor)
+            || meta.rdev() == host.rdev()
+            || mount_id(&device)? != private_mount
+        {
+            return Err(io::Error::other(
+                "private Binder identity verification failed",
+            ));
+        }
+        let alias = crate::guest_mounts::guest_path(root, "dev/binder")?;
+        if fs::metadata(&alias)?.rdev() != meta.rdev() {
+            if unsafe {
+                libc::mount(
+                    cpath(&source)?.as_ptr(),
+                    cpath(&alias)?.as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_BIND,
+                    std::ptr::null(),
+                )
+            } != 0
+            {
+                return Err(io::Error::other(format!(
+                    "bind private /dev/binder: {}",
+                    io::Error::last_os_error()
+                )));
+            }
+            self.mounts.push(alias.clone());
+        }
+        let alias_file = OpenOptions::new().read(true).write(true).open(&alias)?;
+        let alias_meta = alias_file.metadata()?;
+        if (alias_meta.dev(), alias_meta.ino(), alias_meta.rdev())
+            != (meta.dev(), meta.ino(), meta.rdev())
+        {
+            return Err(io::Error::other(
+                "guest /dev/binder does not resolve to private device",
+            ));
+        }
+        let mut protocol: i32 = 0;
+        if unsafe { libc::ioctl(device.as_raw_fd(), 0xc0046209u32 as _, &mut protocol) } != 0 {
+            return Err(io::Error::other(format!(
+                "BINDER_VERSION: {}",
+                io::Error::last_os_error()
+            )));
+        }
+        if protocol != 8 {
+            return Err(io::Error::other(format!(
+                "unsupported arm64 Binder protocol {protocol}"
+            )));
+        }
+        println!("private Binder device: {}:{} mount_id={private_mount}; host device={}:{}; protocol={protocol}; label={}", request.major, request.minor, libc::major(host.rdev()), libc::minor(host.rdev()), ssal::unix::image_context(&device).unwrap_or_else(|e| format!("unavailable: {e}")));
+        self.device = Some(device);
+        drop(alias_file);
+        drop(control);
+        Ok((request.major, request.minor, protocol))
+    }
+    pub(crate) fn cleanup(&mut self) -> io::Result<()> {
         self.device.take();
         let mut errors = Vec::new();
         let mut remaining = Vec::new();
@@ -127,125 +241,16 @@ pub fn verify(root: &Path) -> io::Result<()> {
             "host /dev/binder is not a character device",
         ));
     }
-    let target = crate::guest_mounts::guest_path(root, "dev/binderfs")?;
-    if !target.is_dir() {
-        return Err(io::Error::other(
-            "guest /dev/binderfs mountpoint absent; shared /dev is not modified",
-        ));
-    }
-    let mut session = Session {
-        mounts: Vec::new(),
-        device: None,
-        created_mount: None,
-    };
-    let result = (|| {
+    let mut session = Session::new();
+    let result = (|| -> io::Result<()> {
         report.device_created = Status::Failed;
-        if unsafe {
-            libc::mount(
-                c"binder".as_ptr(),
-                cpath(&target)?.as_ptr(),
-                c"binder".as_ptr(),
-                libc::MS_NOSUID | libc::MS_NOEXEC,
-                c"max=4".as_ptr().cast(),
-            )
-        } != 0
-        {
-            let e = io::Error::last_os_error();
-            report.device_created = if e.raw_os_error() == Some(libc::ENODEV) {
-                Status::Unavailable
-            } else {
-                Status::Failed
-            };
-            return Err(io::Error::new(
-                e.kind(),
-                format!("mount private binderfs {}: {e}", target.display()),
-            ));
-        }
-        session.mounts.push(target.clone());
-        let control = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(target.join("binder-control"))?;
-        let private_mount = mount_id(&control)?;
-        session.created_mount = Some(private_mount);
-        let mut request = BinderfsDevice {
-            name: [0; 256],
-            major: 0,
-            minor: 0,
-        };
-        // Some Android kernels prepopulate binder/hwbinder/vndbinder on mount.
-        // Allocate our own name instead of treating those as an allocation.
-        request.name[..10].copy_from_slice(b"ssal-probe");
-        // _IOWR('b', 1, struct binderfs_device), size=264 on arm64 and x86_64.
-        if unsafe { libc::ioctl(control.as_raw_fd(), 0xc1086201u32 as _, &mut request) } != 0 {
-            return Err(io::Error::other(format!(
-                "BINDER_CTL_ADD: {}",
-                io::Error::last_os_error()
-            )));
-        }
-        let source = target.join("ssal-probe");
-        let device = OpenOptions::new().read(true).write(true).open(&source)?;
-        let meta = device.metadata()?;
-        if !meta.file_type().is_char_device()
-            || meta.rdev() != libc::makedev(request.major, request.minor)
-            || meta.rdev() == host.rdev()
-            || mount_id(&device)? != private_mount
-        {
-            return Err(io::Error::other(
-                "private Binder identity verification failed",
-            ));
-        }
+        let (major, minor, protocol) = session.provision(root)?;
         report.device_created = Status::Passed;
-        report.device_opened = Status::Failed;
-        let alias = crate::guest_mounts::guest_path(root, "dev/binder")?;
-        if fs::metadata(&alias)?.rdev() != meta.rdev() {
-            if unsafe {
-                libc::mount(
-                    cpath(&source)?.as_ptr(),
-                    cpath(&alias)?.as_ptr(),
-                    std::ptr::null(),
-                    libc::MS_BIND,
-                    std::ptr::null(),
-                )
-            } != 0
-            {
-                return Err(io::Error::other(format!(
-                    "bind private /dev/binder: {}",
-                    io::Error::last_os_error()
-                )));
-            }
-            session.mounts.push(alias.clone());
-        }
-        let alias_file = OpenOptions::new().read(true).write(true).open(&alias)?;
-        let alias_meta = alias_file.metadata()?;
-        if (alias_meta.dev(), alias_meta.ino(), alias_meta.rdev())
-            != (meta.dev(), meta.ino(), meta.rdev())
-        {
-            return Err(io::Error::other(
-                "guest /dev/binder does not resolve to private device",
-            ));
-        }
-        let mut protocol: i32 = 0;
-        if unsafe { libc::ioctl(device.as_raw_fd(), 0xc0046209u32 as _, &mut protocol) } != 0 {
-            return Err(io::Error::other(format!(
-                "BINDER_VERSION: {}",
-                io::Error::last_os_error()
-            )));
-        }
-        if protocol != 8 {
-            return Err(io::Error::other(format!(
-                "unsupported arm64 Binder protocol {protocol}"
-            )));
-        }
         report.device_opened = Status::Passed;
         report.driver_protocol = Some(protocol);
-        println!("private Binder device: {}:{} mount_id={private_mount}; host device={}:{}; protocol={protocol}; label={}", request.major, request.minor, libc::major(host.rdev()), libc::minor(host.rdev()), ssal::unix::image_context(&device).unwrap_or_else(|e| format!("unavailable: {e}")));
-        session.device = Some(device);
-        drop(alias_file);
-        drop(control);
         // A fresh exec is mandatory: no inherited libbinder ProcessState/FDs.
         // The helper is only admitted after exact private device identity checks.
-        crate::guest_probe::binder_ipc(root, request.major, request.minor, &mut |stage| {
+        crate::guest_probe::binder_ipc(root, major, minor, &mut |stage| {
             if stage == "context_manager_attempt" {
                 report.context_manager = Status::Failed;
             }

@@ -946,6 +946,9 @@ pub fn verify(
         if mode == "--servicemanager-preflight-worker" {
             crate::selinux_probe::preflight::verify(&root)?;
         }
+        if mode == "--servicemanager-runtime-preflight-worker" {
+            crate::selinux_probe::runtime_preflight::verify(&root)?;
+        }
         same_directory(userdata, &root.join("data"))?;
         println!("mount profile: {}\nrootfs: {}\nmedia views: verified against guest /data/media\nshared /dev: Binder/properties/devices shared; sockets and block paths masked\nchroot/pivot_root dynamic shell and userdata write/read: verified\nAPEX activation, guest services, FUSE permissions, SELinux compatibility: NOT validated", profile.name, root.display());
         let info = fs::read_to_string("/proc/self/mountinfo")?;
@@ -974,7 +977,10 @@ pub fn verify(
         }
     });
     let cleanup = cleanup.and(residual);
-    if mode == "--selinux-probe-worker" || mode == "--servicemanager-preflight-worker" {
+    if mode == "--selinux-probe-worker"
+        || mode == "--servicemanager-preflight-worker"
+        || mode == "--servicemanager-runtime-preflight-worker"
+    {
         println!(
             "SELinux transition resource summary: {}",
             serde_json::json!({
