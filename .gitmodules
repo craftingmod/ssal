@@ -1,0 +1,3 @@
+[submodule "FreeSam"]
+	path = FreeSam
+	url = https://codeberg.org/qwiterh/FreeSam.git
