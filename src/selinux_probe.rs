@@ -16,6 +16,8 @@ unsafe fn errno_ptr() -> *mut i32 {
 
 const TARGET: &str = "u:r:servicemanager:s0";
 
+pub mod preflight;
+
 fn context(path: &str) -> io::Result<String> {
     Ok(fs::read_to_string(path)?.trim_matches('\0').trim().into())
 }
