@@ -1,0 +1,13 @@
+[package]
+name = "ssal"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "ssal"
+path = "src/ssal.rs"
+
+[[bin]]
+name = "ssald"
+path = "src/ssald.rs"

@@ -1,10 +1,10 @@
 {
   "name": "ssal",
-  "module": "index.ts",
   "type": "module",
   "private": true,
   "scripts": {
-    "typecheck": "bun check"
+    "setup:windows": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File ./scripts/dev.ps1 setup",
+    "build:windows": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File ./scripts/dev.ps1 build"
   },
   "devDependencies": {
     "@types/bun": "latest"

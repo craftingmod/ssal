@@ -1,0 +1,6 @@
+id=ssal
+name=ssal (build mock)
+version=0.1.0-mock
+versionCode=1
+author=ssal
+description=Build-system mock; hot-switch is not implemented.
