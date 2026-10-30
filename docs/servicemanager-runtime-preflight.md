@@ -1,5 +1,7 @@
 # servicemanager 런타임 사전 검사
 
+후속 구현은 임시 Guest 라벨/DAC 변경과 UID 1000 시험 워커를 추가했다. 현재 명령의 확장 범위와 최신 결과는 [실행 환경 검증](servicemanager-execution-environment.md)을 참고한다. 아래는 최초 읽기 전용 조사 당시의 결과다.
+
 `ssal probe-servicemanager-runtime-preflight PROFILE_NAME`을 추가했다. `launch_enabled=false`를 유지하며 실제 Android 서비스, setexeccon, context manager 설정, Binder transaction, property 요청을 실행하지 않는다. 기존 prepare의 linkerconfig 생성과 shell/rootfs 검사 이후 전용 검사를 수행한다. SELinux 정책, permissive 상태, Host/Guest 파일 라벨은 변경하지 않는다.
 
 ```sh

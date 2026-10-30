@@ -304,7 +304,11 @@ fn run(command: &mut Command, stage: &str) -> io::Result<Output> {
     run_with_timeout(command, stage, Duration::from_secs(20))
 }
 
-fn run_with_timeout(command: &mut Command, stage: &str, timeout: Duration) -> io::Result<Output> {
+pub(crate) fn run_with_timeout(
+    command: &mut Command,
+    stage: &str,
+    timeout: Duration,
+) -> io::Result<Output> {
     let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

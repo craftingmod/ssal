@@ -638,6 +638,28 @@ mod daemon {
 #[cfg(unix)]
 fn main() {
     let args: Vec<_> = std::env::args_os().collect();
+    if args
+        .get(1)
+        .is_some_and(|a| a == "--runtime-credentials-worker")
+    {
+        if args.len() != 5 || unsafe { libc::geteuid() } != 0 {
+            eprintln!("invalid runtime credentials worker");
+            std::process::exit(1);
+        }
+        let result = selinux_probe::runtime_preflight::environment::identity_worker(
+            std::path::Path::new(&args[2]),
+            args[3].to_str().unwrap_or(""),
+            args[4].to_str().unwrap_or(""),
+        );
+        match result {
+            Ok(v) => println!("{v}"),
+            Err(e) => {
+                eprintln!("runtime credentials: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     if args.get(1).is_some_and(|arg| {
         arg == "--prepare-worker"
             || arg == "--binder-probe-worker"

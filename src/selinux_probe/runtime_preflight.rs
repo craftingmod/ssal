@@ -1,9 +1,10 @@
-//! Disposable runtime investigation. No service exec, setexeccon or relabeling.
+//! Disposable runtime investigation. Guest-only labels/DAC; no service exec.
 use super::preflight::{digest, fds, metadata, observe, rc_spec};
 use super::*;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::os::unix::fs::MetadataExt;
+pub(crate) mod environment;
 
 #[derive(Serialize)]
 struct ServiceExecutionSpec {
@@ -25,7 +26,7 @@ struct ServiceExecutionSpec {
 impl ServiceExecutionSpec {
     fn servicemanager() -> Self {
         Self {
-            version: 1,
+            version: 2,
             executable: "/system/bin/servicemanager",
             selinux_domain: TARGET,
             uid: 1000,
@@ -34,7 +35,7 @@ impl ServiceExecutionSpec {
             capabilities: json!({"inheritable": 0, "permitted": 0, "effective": 0, "ambient": 0, "bounding": 0}),
             fd_allowlist: json!({"0": "/dev/null read", "1": "session log write", "2": "session log write", "other": "close; no host root, Binder, property, kmsg or socket FDs", "kmsg_rc_override": "omit; guest logging backend required"}),
             rlimits: json!({"nofile": {"soft": 1024, "hard": 1024}, "core": {"soft": 0, "hard": 0}, "other": "preserve worker_limits snapshot in this report; verify after applying overrides"}),
-            namespaces: json!({"mount": "private recursively; chroot/pivot_root required", "pid": "new with private proc required", "net": "new required", "user": "host UID mapping, no new user namespace", "uts": "new required", "ipc": "new required", "cgroup": "guest-owned task profile destination required"}),
+            namespaces: json!({"mount": "private recursively; chroot required", "pid": "private proc required; empty proc mask tested as restrictive alternative only", "net": "new required", "user": "host UID mapping, no new user namespace", "uts": "new required", "ipc": "new if supported, record unshare errors", "cgroup": "guest-owned task profile destination required"}),
             task_profiles: vec!["ProcessCapacityHigh"],
             environment: json!({"clear_inherited": true, "PATH": "/system/bin", "ANDROID_ROOT": "/system", "ANDROID_DATA": "/data", "ANDROID_SOCKET_*": "forbidden", "ANDROID_FILE_*": "forbidden"}),
             launch_enabled: false,
@@ -172,7 +173,7 @@ fn spec_preflight(root: &Path) -> io::Result<Value> {
         "task_profile_files": profile_files, "worker_fds": fds()?,
         "worker_limits": fs::read_to_string("/proc/self/limits")?,
         "capability_prerequisites": capability_prerequisites,
-        "private_binder_dac": {"status": if binder_dac_rw { "passed" } else { "blocked" }, "read_write_allowed_by_mode": binder_dac_rw, "metadata": metadata(&binder_path)?, "traversal": traversal, "scope": "mode bits for spec UID/GID/groups; ACL/target SELinux and ioctl not replaced by this check; no chmod/chown"},
+        "private_binder_dac": {"status": if binder_dac_rw { "passed" } else { "blocked" }, "read_write_allowed_by_mode": binder_dac_rw, "metadata": metadata(&binder_path)?, "traversal": traversal, "scope": "mode bits after Guest-only preparation; actual open results are reported separately"},
         "application": "not_run", "prerequisites": ["verify CAP_SETUID/CAP_SETGID/CAP_SETPCAP/CAP_SYS_ADMIN and syscall results in disposable child", "validate every rc directive or explicit logging override", "resolve task profile actions and guest-owned cgroup destinations; do not apply Host task profile", "implement close-all-except allowlist and verify resulting FDs", "apply and verify all credentials/capability sets, rlimits, namespaces and root in disposable child", "freeze remaining inherited rlimits; exact target-domain loader and ioctl access remain untested"]}),
     )
 }
@@ -252,6 +253,18 @@ pub fn verify(root: &Path) -> io::Result<()> {
         "stages": {"selinux_labels": {"status": "not_run"}, "private_binder": {"status": "not_run"}, "execution_spec": {"status": "not_run"}, "host_protection": {"status": "not_run"}, "host_unchanged": {"status": "not_run"}, "cleanup": {"status": "not_run"}},
         "domain_transition": "not_run", "service_launch": "not_run", "ready_for_service_launch": false});
     let before = host_services();
+    for name in [
+        "selinux_label_compatibility",
+        "binder_dac",
+        "binder_isolation",
+        "execution_credentials",
+        "namespace_isolation",
+        "property_isolation",
+        "media_isolation",
+    ] {
+        report["stages"][name] = json!({"status":"not_run"});
+    }
+    let resources_before = host_resources();
     report["boot_id"] = json!(context("/proc/sys/kernel/random/boot_id").ok());
     report["executable_sha256"] = json!(crate::guest_mounts::guest_path(
         root,
@@ -278,15 +291,52 @@ pub fn verify(root: &Path) -> io::Result<()> {
                 json!({"status": "passed", "major": major, "minor": minor, "protocol": protocol, "identity": observe(root, "dev/binder"), "context_manager": "not_run", "ipc": "not_run"}),
             )
         });
+        if report["stages"]["private_binder"]["status"] == "passed" {
+            let environment = environment::verify(root, &mut binder);
+            match environment {
+                Ok(value) => {
+                    for name in [
+                        "selinux_label_compatibility",
+                        "binder_dac",
+                        "binder_isolation",
+                        "execution_credentials",
+                        "namespace_isolation",
+                        "property_isolation",
+                        "media_isolation",
+                    ] {
+                        report["stages"][name] = value[name].clone();
+                    }
+                    report["environment_validation"] = value;
+                    report["labels_modified"] = json!(
+                        report["environment_validation"]["selinux_label_compatibility"]
+                            ["linkerconfig"]["original_label"]
+                            != report["environment_validation"]["selinux_label_compatibility"]
+                                ["linkerconfig"]["label"]
+                    );
+                    report["host_labels_modified"] = json!(false);
+                }
+                Err(e) => {
+                    report["environment_validation"] = json!({"status": "failed", "error": e.to_string(), "cleanup_failed": e.to_string().contains("RECOVERY_REQUIRED")})
+                }
+            }
+        }
         stage(&mut report, "selinux_labels", || compatibility(root));
         stage(&mut report, "execution_spec", || spec_preflight(root));
         stage(&mut report, "host_protection", || protections(root));
     } else {
         report["admission"] = json!({"status": "blocked", "reason": "Host snapshot/global Enforcing/enforcing target AV unavailable", "host_error": before.as_ref().err().map(ToString::to_string)});
     }
-    let cleanup = binder.cleanup();
+    let environment_cleanup_ok =
+        report["environment_validation"]["temporary_view_cleanup"]["status"] != "failed"
+            && report["environment_validation"]["cleanup_failed"] != true;
+    let cleanup = binder.cleanup().and_then(|()| if environment_cleanup_ok { Ok(()) } else { Err(io::Error::other("RECOVERY_REQUIRED: runtime environment diagnostics/cleanup failed; see environment_validation")) });
     report["stages"]["cleanup"] = json!({"status": if cleanup.is_ok() { "passed" } else { "failed" }, "scope": "private Binder FD and mounts only; rootfs/loop/scratch reports follow", "recovery_required": cleanup.is_err(), "error": cleanup.as_ref().err().map(ToString::to_string)});
     let after = host_services();
+    let resources_after = host_resources();
+    let resource_same = resources_before
+        .as_ref()
+        .is_ok_and(|a| resources_after.as_ref().is_ok_and(|b| a == b));
+    report["host_resources"] = json!({"status": if resource_same { "passed" } else { "failed" }, "before": resources_before.as_ref().ok(), "after": resources_after.as_ref().ok(), "before_error": resources_before.err().map(|e|e.to_string()), "after_error": resources_after.err().map(|e|e.to_string())});
     let policy_after = policy_hash();
     let policy_hash_same = policy_before
         .as_ref()
@@ -306,6 +356,7 @@ pub fn verify(root: &Path) -> io::Result<()> {
         .is_ok_and(|a| metadata(Path::new("/dev/binder")).is_ok_and(|b| *a == b))
         && context("/sys/fs/selinux/enforce").is_ok_and(|v| v == "1")
         && policy_hash_same != Some(false)
+        && resource_same
         && initial_av.as_ref().is_ok_and(|a| {
             final_av
                 .as_ref()
@@ -323,6 +374,25 @@ pub fn verify(root: &Path) -> io::Result<()> {
     Err(io::Error::other(
         "runtime preflight blocked; no Android service executed; launch_enabled=false",
     ))
+}
+
+fn host_resources() -> io::Result<Value> {
+    let paths = [
+        "/dev/binder",
+        "/dev/binderfs",
+        "/dev/__properties__",
+        "/dev/kmsg",
+        "/data/media",
+        "/linkerconfig",
+        "/linkerconfig/ld.config.txt",
+    ];
+    let metadata: Vec<_> = paths
+        .iter()
+        .map(|p| metadata(Path::new(p)))
+        .collect::<io::Result<_>>()?;
+    Ok(
+        json!({"metadata": metadata, "host_init_mountinfo": fs::read_to_string("/proc/1/mountinfo")?}),
+    )
 }
 
 #[cfg(test)]

@@ -44,3 +44,5 @@ SELinux 전환 사전 검사는 `ssal probe-selinux-transition PROFILE_NAME`으�
 정식 Guest servicemanager의 실행 없는 권한·환경·격리 검사는 `ssal probe-servicemanager-preflight PROFILE_NAME`으로 실행합니다. [실행 선행 조건과 기기 결과](docs/servicemanager-preflight.md)를 참고하세요.
 
 실제 private Binder를 연결하고 라벨 호환성·실행 명세·Host 노출 경로를 조사하는 후속 검사는 `ssal probe-servicemanager-runtime-preflight PROFILE_NAME`으로 실행합니다. 실제 서비스는 실행하지 않습니다. [런타임 차단 요인과 기기 결과](docs/servicemanager-runtime-preflight.md)를 참고하세요.
+
+이 검사는 임시 Guest 라벨/DAC 적용과 UID 1000 시험 워커 검증도 수행합니다. [실행 환경 검증 결과와 남은 차단](docs/servicemanager-execution-environment.md)을 참고하세요. 실제 servicemanager 실행은 계속 차단됩니다.

@@ -70,6 +70,14 @@ impl Session {
 
     /// Creates and binds only a private driver; no context manager or IPC.
     pub(crate) fn provision(&mut self, root: &Path) -> io::Result<(u32, u32, i32)> {
+        self.provision_with_context(root, None)
+    }
+
+    pub(crate) fn provision_with_context(
+        &mut self,
+        root: &Path,
+        label: Option<&str>,
+    ) -> io::Result<(u32, u32, i32)> {
         let host = fs::metadata("/dev/binder")?;
         if !host.file_type().is_char_device() {
             return Err(io::Error::other("host binder is not a character device"));
@@ -78,13 +86,19 @@ impl Session {
         if !target.is_dir() {
             return Err(io::Error::other("binderfs mountpoint missing"));
         }
+        let options = CString::new(match label {
+            Some("u:object_r:binder_device:s0") => "max=4,context=u:object_r:binder_device:s0",
+            None => "max=4",
+            _ => return Err(io::Error::other("unsupported private Binder context")),
+        })
+        .map_err(io::Error::other)?;
         if unsafe {
             libc::mount(
                 c"binder".as_ptr(),
                 cpath(&target)?.as_ptr(),
                 c"binder".as_ptr(),
                 libc::MS_NOSUID | libc::MS_NOEXEC,
-                c"max=4".as_ptr().cast(),
+                options.as_ptr().cast(),
             )
         } != 0
         {
@@ -173,6 +187,20 @@ impl Session {
         drop(alias_file);
         drop(control);
         Ok((request.major, request.minor, protocol))
+    }
+
+    /// Only the FD allocated by this private session may be modified.
+    pub(crate) fn private_device(&self) -> io::Result<&File> {
+        let file = self
+            .device
+            .as_ref()
+            .ok_or_else(|| io::Error::other("private Binder absent"))?;
+        if Some(mount_id(file)?) != self.created_mount
+            || file.metadata()?.rdev() == fs::metadata("/dev/binder")?.rdev()
+        {
+            return Err(io::Error::other("private Binder ownership guard failed"));
+        }
+        Ok(file)
     }
     pub(crate) fn cleanup(&mut self) -> io::Result<()> {
         self.device.take();
