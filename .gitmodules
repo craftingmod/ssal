@@ -1,3 +1,11 @@
-[submodule "FreeSam"]
-	path = FreeSam
+[submodule "vendor/android_system_sepolicy"]
+	path = vendor/android_system_sepolicy
+	url = https://github.com/LineageOS/android_system_sepolicy.git
+	branch = lineage-23.2
+[submodule "vendor/android_device_lineage_sepolicy"]
+	path = vendor/android_device_lineage_sepolicy
+	url = https://github.com/LineageOS/android_device_lineage_sepolicy.git
+	branch = lineage-23.2
+[submodule "vendor/freesam"]
+	path = vendor/freesam
 	url = https://codeberg.org/qwiterh/FreeSam.git
