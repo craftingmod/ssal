@@ -637,6 +637,7 @@ pub fn worker(system: &Path, userdata: &Path, base: &Path, mode: &str) -> io::Re
         if mode == "--selinux-probe-worker"
             || mode == "--servicemanager-preflight-worker"
             || mode == "--servicemanager-runtime-preflight-worker"
+            || mode == "--enforcing-binder-worker"
         {
             println!(
                 "SELinux transition resource summary: {}",
@@ -652,6 +653,7 @@ pub fn worker(system: &Path, userdata: &Path, base: &Path, mode: &str) -> io::Re
     if mode == "--selinux-probe-worker"
         || mode == "--servicemanager-preflight-worker"
         || mode == "--servicemanager-runtime-preflight-worker"
+        || mode == "--enforcing-binder-worker"
     {
         println!(
             "SELinux transition resource summary: {}",

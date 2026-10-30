@@ -22,7 +22,7 @@ const entries: { name: string; path: string; mode: number }[] = [
     path: `module/${name}`,
     mode: name.endsWith(".sh") ? 0o100755 : 0o100644,
   })),
-  ...["ssal", "ssald", "ssal-selinux-identity"].map((name) => ({
+  ...["ssal", "ssald", "ssal-selinux-identity", "ssal-enforcing-binder"].map((name) => ({
     name: `bin/${name}`,
     path: `out/bin/${name}`,
     mode: 0o100755,

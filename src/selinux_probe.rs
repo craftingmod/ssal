@@ -16,6 +16,7 @@ unsafe fn errno_ptr() -> *mut i32 {
 
 const TARGET: &str = "u:r:servicemanager:s0";
 
+pub mod enforcing;
 pub mod preflight;
 pub mod runtime_preflight;
 
@@ -91,13 +92,9 @@ fn query(source: &str, target: &str, class: &str, permission: &str) -> io::Resul
         .read(true)
         .write(true)
         .open("/sys/fs/selinux/access")?;
-    access
-        .write_all(format!("{source} {target} {index} {requested:x}").as_bytes())
-        .map_err(|e| io::Error::other(format!("AV write {class}:{permission}: {e}")))?;
+    access.write_all(format!("{source} {target} {index} {requested:x}").as_bytes())?;
     let mut reply = String::new();
-    access
-        .read_to_string(&mut reply)
-        .map_err(|e| io::Error::other(format!("AV read {class}:{permission}: {e}")))?;
+    access.read_to_string(&mut reply)?;
     let (allowed, permissive_domain, sequence) = parse_av(&reply, requested)?;
     Ok(Decision {
         api: "selinuxfs/access (security_compute_av_flags_raw wire protocol)",
@@ -252,21 +249,20 @@ fn host_services() -> io::Result<serde_json::Value> {
             Ok(v) => v,
             Err(_) => continue,
         };
-        let name = command
-            .split('\0')
-            .next()
-            .unwrap_or("")
-            .rsplit('/')
-            .next()
-            .unwrap_or("");
+        let executable = command.split('\0').next().unwrap_or("");
+        let name = executable.rsplit('/').next().unwrap_or("");
         if ![
             "init",
             "servicemanager",
             "zygote",
             "zygote64",
             "surfaceflinger",
+            "system_server",
+            "hwservicemanager",
+            "vndservicemanager",
         ]
         .contains(&name)
+            && !executable.starts_with("/vendor/bin/")
         {
             continue;
         }
@@ -283,7 +279,13 @@ fn host_services() -> io::Result<serde_json::Value> {
             "executable": fs::read_link(entry.path().join("exe"))?
         }));
     }
-    for required in ["init", "servicemanager", "zygote64", "surfaceflinger"] {
+    for required in [
+        "init",
+        "servicemanager",
+        "zygote64",
+        "surfaceflinger",
+        "system_server",
+    ] {
         if !services.values().any(|v| v["name"] == required) {
             return Err(io::Error::other(format!("missing host {required}")));
         }

@@ -7,7 +7,7 @@ use std::os::unix::fs::MetadataExt;
 pub(crate) mod environment;
 
 #[derive(Serialize)]
-struct ServiceExecutionSpec {
+pub(super) struct ServiceExecutionSpec {
     version: u32,
     executable: &'static str,
     selinux_domain: &'static str,
@@ -24,7 +24,7 @@ struct ServiceExecutionSpec {
 }
 
 impl ServiceExecutionSpec {
-    fn servicemanager() -> Self {
+    pub(super) fn servicemanager() -> Self {
         Self {
             version: 2,
             executable: "/system/bin/servicemanager",
@@ -376,13 +376,16 @@ pub fn verify(root: &Path) -> io::Result<()> {
     ))
 }
 
-fn host_resources() -> io::Result<Value> {
+pub(super) fn host_resources() -> io::Result<Value> {
     let paths = [
         "/dev/binder",
         "/dev/binderfs",
         "/dev/__properties__",
         "/dev/kmsg",
         "/data/media",
+        "/data/user",
+        "/data/system",
+        "/data/misc",
         "/linkerconfig",
         "/linkerconfig/ld.config.txt",
     ];

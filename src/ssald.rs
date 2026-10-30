@@ -666,6 +666,7 @@ fn main() {
             || arg == "--selinux-probe-worker"
             || arg == "--servicemanager-preflight-worker"
             || arg == "--servicemanager-runtime-preflight-worker"
+            || arg == "--enforcing-binder-worker"
     }) {
         if args.len() != 5 || unsafe { libc::geteuid() } != 0 {
             eprintln!("invalid prepare worker invocation");

@@ -50,3 +50,5 @@ SELinux 전환 사전 검사는 `ssal probe-selinux-transition PROFILE_NAME`으�
 Private Binder의 Enforcing 접근 방안은 [후속 조사](docs/private-binder-enforcing-research.md)에 정리했습니다. 현재 alias bind에 가려진 원본 `binder` 노드 검사, `context`/`fscontext` 분리와 최소 정책 후보를 다룹니다. 새 기기 검증 결과는 아닙니다.
 
 후속 [구현·기기 실험](docs/private-binder-device-20261031.md)에서는 원본 binder_device 선택과 enforcing servicemanager/UID 1000의 제한된 ioctl 검사를 통과했습니다. 추가 정책은 적용하지 않았으며, enforcing IPC·service_contexts와 정식 서비스 기동은 미검증입니다.
+
+최신 [Enforcing Binder IPC·레지스트리 시험](docs/enforcing-binder-device-20261031.md)은 기존 정책에서 shell → servicemanager의 실제 transaction, Guest libbinder echo와 Binder 객체 전달을 확인했습니다. 같은 도메인의 거부 대조군을 구분했으며, service_contexts의 9개 context가 차단됩니다. 정식 Android 서비스 실행과 launch_enabled 해제는 수행하지 않았습니다.

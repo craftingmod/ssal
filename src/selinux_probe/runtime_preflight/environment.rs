@@ -39,7 +39,10 @@ fn attempt(result: io::Result<()>) -> Value {
     }
 }
 
-fn prepare_labels(root: &Path, binder: &mut crate::binder_probe::Session) -> io::Result<Value> {
+pub(crate) fn prepare_labels(
+    root: &Path,
+    binder: &mut crate::binder_probe::Session,
+) -> io::Result<Value> {
     let original_binder = file_label(binder.private_device()?)?;
     let mut attempts = if original_binder == BINDER_LABEL {
         vec![json!({"method":"original_genfs_label","result":{"status":"passed"}})]
@@ -103,11 +106,11 @@ fn prepare_labels(root: &Path, binder: &mut crate::binder_probe::Session) -> io:
     )
 }
 
-struct Masks {
-    paths: Vec<std::path::PathBuf>,
+pub(crate) struct Masks {
+    pub(crate) paths: Vec<std::path::PathBuf>,
 }
 impl Masks {
-    fn mount(
+    pub(crate) fn mount(
         &mut self,
         source: &str,
         target: &Path,
@@ -133,7 +136,7 @@ impl Masks {
         self.paths.push(target.to_owned());
         Ok(())
     }
-    fn cleanup(&mut self) -> io::Result<()> {
+    pub(crate) fn cleanup(&mut self) -> io::Result<()> {
         while let Some(path) = self.paths.last() {
             syscall_result(unsafe { libc::umount2(cpath(path)?.as_ptr(), 0) })?;
             self.paths.pop();
@@ -196,7 +199,7 @@ fn run_identity(root: &Path, private_rdev: u64, host_rdev: u64) -> io::Result<Va
     Ok(json!({"status": "passed", "child_reaped": true, "identity": value}))
 }
 
-fn minimal_devices(
+pub(crate) fn minimal_devices(
     root: &Path,
     binder: &crate::binder_probe::Session,
     masks: &mut Masks,

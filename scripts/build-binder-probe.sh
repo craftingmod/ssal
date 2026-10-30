@@ -42,7 +42,7 @@ mkdir -p out/bin
     -I "$ssal_headers/system/logging/liblog/include" \
     -I "$ssal_headers/system/libbase/include" \
     native/binder-probe/main.cpp -L "$ssal_guest_libs" \
-    -nostdlib++ -Wl,--allow-shlib-undefined -lbinder -lutils -lc++ -llog -o out/bin/ssal-binder-probe
+    -nostdlib++ -Wl,--allow-shlib-undefined -lbinder -lutils -lc++ -llog -ldl -o out/bin/ssal-binder-probe
 # Only the helper is packaged; linked platform libraries stay in the guest image.
 SSAL_GUEST_LIBS="$ssal_guest_libs" SSAL_REVISION="$ssal_revision" python3 - <<'PY'
 import hashlib, json, os, pathlib
