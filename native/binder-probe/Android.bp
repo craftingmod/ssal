@@ -1,0 +1,7 @@
+cc_binary {
+    name: "ssal-binder-probe",
+    srcs: ["main.cpp"],
+    shared_libs: ["libbinder", "libutils"],
+    cflags: ["-Wall", "-Wextra", "-Werror"],
+    cpp_std: "c++17",
+}

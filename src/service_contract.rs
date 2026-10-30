@@ -1,6 +1,6 @@
 //! Target execution contract, not a service launcher. Never derives service
 //! readiness from successful probes in the management SELinux domain.
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fs::File;
 use std::io;
@@ -208,6 +208,63 @@ pub fn blocked_summary() -> io::Result<String> {
     Ok(format!("service contract {}: launch DISABLED; requires private properties/framework Binder, per-service execution/SELinux proof, device HAL and restore plan; contract specified, runtime backends not implemented", contract.name))
 }
 
+#[derive(Serialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum EntrypointStatus {
+    Available,
+    Missing,
+    NotExecutable,
+    NotRegularFile,
+    AccessDenied,
+    InvalidPath,
+    Error,
+}
+
+#[derive(Serialize)]
+struct Entrypoint {
+    status: EntrypointStatus,
+    file_label: Option<String>,
+    detail: Option<String>,
+    validation_scope: &'static str,
+}
+
+fn entrypoint(root: &Path, executable: &str) -> Entrypoint {
+    let mut report = Entrypoint {
+        status: EntrypointStatus::InvalidPath,
+        file_label: None,
+        detail: None,
+        validation_scope: "file_metadata_only",
+    };
+    if !guest_absolute(executable) {
+        return report;
+    }
+    let inspected = (|| -> io::Result<()> {
+        let path = crate::guest_mounts::guest_path(root, executable.trim_start_matches('/'))?;
+        let metadata = std::fs::metadata(&path)?;
+        report.status = if !metadata.is_file() {
+            EntrypointStatus::NotRegularFile
+        } else if metadata.permissions().mode() & 0o111 == 0 {
+            EntrypointStatus::NotExecutable
+        } else {
+            EntrypointStatus::Available
+        };
+        match File::open(path).and_then(|file| ssal::unix::image_context(&file)) {
+            Ok(label) => report.file_label = Some(label),
+            Err(e) => report.detail = Some(format!("file label unavailable: {e}")),
+        }
+        Ok(())
+    })();
+    if let Err(e) = inspected {
+        report.status = match e.kind() {
+            io::ErrorKind::NotFound => EntrypointStatus::Missing,
+            io::ErrorKind::PermissionDenied => EntrypointStatus::AccessDenied,
+            _ => EntrypointStatus::Error,
+        };
+        report.detail = Some(e.to_string());
+    }
+    report
+}
+
 pub fn report(root: &Path, probe: &crate::guest_probe::ProbeReport) -> io::Result<()> {
     let contract = load()?;
     println!("{}", blocked_summary()?);
@@ -235,19 +292,10 @@ pub fn report(root: &Path, probe: &crate::guest_probe::ProbeReport) -> io::Resul
     for service in order {
         let entrypoint = match service.executable.as_deref() {
             None => "zygote-managed child; no direct exec".into(),
-            Some(executable) => {
-                match crate::guest_mounts::guest_path(root, executable).and_then(File::open) {
-                    Ok(file) => format!(
-                        "{executable}; regular_file_with_execute_bits={}; file_label={}",
-                        file.metadata().is_ok_and(
-                            |meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0
-                        ),
-                        ssal::unix::image_context(&file)
-                            .unwrap_or_else(|e| format!("unavailable: {e}"))
-                    ),
-                    Err(e) => format!("{executable}; unavailable: {e}"),
-                }
-            }
+            Some(executable) => format!(
+                "{executable}; {}",
+                serde_json::to_string(&entrypoint(root, executable))?
+            ),
         };
         println!("service {}: may_spawn=false; expected_domain={}; actual_service_domain=not_started; entrypoint={entrypoint}; required_before_spawn={}", service.name, service.domain, service.requires.join(","));
     }
@@ -257,6 +305,38 @@ pub fn report(root: &Path, probe: &crate::guest_probe::ProbeReport) -> io::Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn absolute_service_paths_are_resolved_and_errors_are_distinct() -> io::Result<()> {
+        let root = std::env::temp_dir().join(format!("ssal-service-path-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("system/bin"))?;
+        let executable = root.join("system/bin/servicemanager");
+        assert_eq!(
+            entrypoint(&root, "/system/bin/servicemanager").status,
+            EntrypointStatus::Missing
+        );
+        std::fs::write(&executable, b"fixture")?;
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o644))?;
+        assert_eq!(
+            entrypoint(&root, "/system/bin/servicemanager").status,
+            EntrypointStatus::NotExecutable
+        );
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))?;
+        assert_eq!(
+            entrypoint(&root, "/system/bin/servicemanager").status,
+            EntrypointStatus::Available
+        );
+        assert_eq!(
+            entrypoint(&root, "/system/bin").status,
+            EntrypointStatus::NotRegularFile
+        );
+        assert_eq!(
+            entrypoint(&root, "../system/bin/servicemanager").status,
+            EntrypointStatus::InvalidPath
+        );
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
 
     #[test]
     fn dependency_order_and_fail_closed_contract() -> io::Result<()> {

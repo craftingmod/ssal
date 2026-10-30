@@ -240,7 +240,7 @@ impl Mounts {
 }
 
 // Reject symlinks at every directory component, including persistent userdata.
-fn directory(root: &Path, relative_path: &str, mode: u32) -> io::Result<PathBuf> {
+pub(crate) fn directory(root: &Path, relative_path: &str, mode: u32) -> io::Result<PathBuf> {
     if !relative(relative_path) {
         return Err(io::Error::other("invalid directory path"));
     }
@@ -735,7 +735,12 @@ fn code_bridges(mounts: &mut Mounts, root: &Path, patch_dir: &Path) -> io::Resul
     let code = directory(root, "run/ssal", 0o755)?;
     let daemon = std::env::current_exe()?;
     if let Some(module_bin) = daemon.parent() {
-        for name in ["ssal", "ssald"] {
+        for name in [
+            "ssal",
+            "ssald",
+            "ssal-binder-probe",
+            "ssal-binder-probe.json",
+        ] {
             let source = module_bin.join(name);
             if source.is_file() {
                 let target = code.join(name);
@@ -766,6 +771,7 @@ pub fn verify(
     userdata: &Path,
     base: &Path,
     loop_nodes: &crate::prepare::LoopNodes,
+    binder_probe: bool,
 ) -> io::Result<()> {
     let profile = profile()?;
     let root = base.join("rootfs");
@@ -931,6 +937,9 @@ pub fn verify(
         linkerconfig(&root)?;
         let probe = crate::guest_probe::verify(&root, userdata)?;
         crate::service_contract::report(&root, &probe)?;
+        if binder_probe {
+            crate::binder_probe::verify(&root)?;
+        }
         same_directory(userdata, &root.join("data"))?;
         println!("mount profile: {}\nrootfs: {}\nmedia views: verified against guest /data/media\nshared /dev: Binder/properties/devices shared; sockets and block paths masked\nchroot/pivot_root dynamic shell and userdata write/read: verified\nAPEX activation, guest services, FUSE permissions, SELinux compatibility: NOT validated", profile.name, root.display());
         let info = fs::read_to_string("/proc/self/mountinfo")?;

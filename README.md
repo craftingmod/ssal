@@ -16,6 +16,8 @@ KernelSU 모듈과 Android arm64 CLI의 초기 구현입니다. `ssald`가 root 
 
 서비스 실행의 목표와 기동·종료·복구 조건은 [서비스 실행 계약](docs/service-execution-contract.md)에 정의했습니다. prepare는 linkerconfig 구조 요약, 식별자를 노출하지 않는 CE/DE 경로 정책 비교, shell 전용 SELinux 관찰과 VINTF의 `passed/failed/unavailable/error`를 출력하고 서비스별 기동 차단 사유를 확인합니다. 계약 검증은 구현했지만 private property/Binder·HAL 중계·서비스 런처는 아직 없으며 Android 서비스를 시작하지 않습니다.
 
+`ssal probe-binder PROFILE_NAME`은 별도 [독립 Binder 시험](docs/binder-probe.md)을 실행합니다. 새 binderfs 장치 생성·열기·최소 IPC·정리를 각각 기록하며 AOSP servicemanager나 HAL은 실행하지 않습니다. IPC 헬퍼는 게스트 플랫폼 라이브러리와 별도 빌드하고 이미지 일치 해시를 검사합니다. 일반 prepare와 Android 서비스 기동 차단은 유지합니다.
+
 ## 빌드
 
 WSLc, Bun과 네트워크가 필요합니다. PowerShell에서 실행합니다.

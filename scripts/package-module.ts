@@ -1,6 +1,8 @@
 import { readFile, readdir, writeFile, rename } from "node:fs/promises"
 import { join } from "node:path"
 import AdmZip from "adm-zip"
+import { existsSync } from "node:fs"
+import { createHash } from "node:crypto"
 
 // Keep ZIP metadata deterministic, including the Unix executable permissions.
 const entries: { name: string; path: string; mode: number }[] = [
@@ -26,6 +28,24 @@ const entries: { name: string; path: string; mode: number }[] = [
     mode: 0o100755,
   })),
 ]
+if (existsSync("out/bin/ssal-binder-probe") || existsSync("out/bin/ssal-binder-probe.json")) {
+  const manifest = JSON.parse(await readFile("out/bin/ssal-binder-probe.json", "utf8"))
+  for (const [key, path] of [
+    ["helper_sha256", "out/bin/ssal-binder-probe"],
+    ["source_sha256", "native/binder-probe/main.cpp"],
+    ["build_script_sha256", "scripts/build-binder-probe.sh"],
+  ] as const) {
+    const digest = createHash("sha256").update(await readFile(path)).digest("hex")
+    if (manifest[key] !== digest) throw new Error(`Stale Binder helper: ${path}; rebuild before packaging`)
+  }
+  if (manifest.header_revision !== "android-16.0.0_r2") throw new Error("Unsupported Binder helper header revision")
+  entries.push(
+    { name: "bin/ssal-binder-probe", path: "out/bin/ssal-binder-probe", mode: 0o100755 },
+    { name: "bin/ssal-binder-probe.json", path: "out/bin/ssal-binder-probe.json", mode: 0o100644 },
+    { name: "NOTICE.binder-probe", path: "native/binder-probe/NOTICE", mode: 0o100644 },
+    { name: "LICENSE.binder-probe", path: "native/binder-probe/LICENSE.apache-2.0", mode: 0o100644 },
+  )
+}
 async function addWeb(dir: string, prefix = "webroot"): Promise<void> {
   for (const entry of (await readdir(dir, { withFileTypes: true })).sort(
     (a, b) => a.name.localeCompare(b.name),

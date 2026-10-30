@@ -493,7 +493,7 @@ pub(crate) fn mount_image(source: &Path, target: &Path, readonly: bool) -> io::R
     Ok(())
 }
 
-pub fn worker(system: &Path, userdata: &Path, base: &Path) -> io::Result<()> {
+pub fn worker(system: &Path, userdata: &Path, base: &Path, binder_probe: bool) -> io::Result<()> {
     if unsafe { libc::unshare(libc::CLONE_NEWNS) } != 0 {
         return Err(io::Error::last_os_error());
     }
@@ -617,7 +617,7 @@ pub fn worker(system: &Path, userdata: &Path, base: &Path) -> io::Result<()> {
             userdata.display(),
             matches.join("\n")
         );
-        crate::guest_mounts::verify(&system_target, userdata, base, &loop_nodes)?;
+        crate::guest_mounts::verify(&system_target, userdata, base, &loop_nodes, binder_probe)?;
         Ok(())
     })();
     let mut cleanup = Vec::new();

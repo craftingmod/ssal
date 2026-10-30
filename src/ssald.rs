@@ -1,4 +1,6 @@
 #[cfg(unix)]
+mod binder_probe;
+#[cfg(unix)]
 mod guest_mounts;
 #[cfg(unix)]
 mod guest_probe;
@@ -319,11 +321,11 @@ mod daemon {
                 }
             }
             "doctor" => reply(&mut stream, true, format!("daemon and root socket: OK\nmount namespace: {}\nloop control: {}\ndevice profile, Binder, property, HAL and guest services: not implemented; switching unavailable", Path::new("/proc/self/ns/mnt").exists(), Path::new("/dev/loop-control").exists())),
-            "prepare" => {
+            "prepare" | "probe-binder" => {
                 let Some(name) = req.profile_name.as_deref().filter(|name| valid_image_name(name)) else { return reply(&mut stream, false, "invalid profile name"); };
                 let guard = busy.lock().unwrap();
                 if *guard { return reply(&mut stream, false, "another operation is running"); }
-                let result = prepare_session(&root, name);
+                let result = prepare_session(&root, name, req.command == "probe-binder");
                 match result { Ok(message) => { log(&root, &message); reply(&mut stream, true, message) }, Err(e) => { let message = format!("prepare failed: {e}"); log(&root, &message); reply(&mut stream, false, message) } }
             }
             "remove" => {
@@ -373,7 +375,7 @@ mod daemon {
             _ => reply(&mut stream, false, "unknown command")
         }
     }
-    fn prepare_session(root: &Path, name: &str) -> io::Result<String> {
+    fn prepare_session(root: &Path, name: &str, binder_probe: bool) -> io::Result<String> {
         let profile = super::prepare::check(root, name)?;
         let base = root
             .join("mnt")
@@ -383,7 +385,11 @@ mod daemon {
             fs::create_dir(base.join("system"))?;
             fs::create_dir(base.join("data"))?;
             let output = Command::new(std::env::current_exe()?)
-                .arg("--prepare-worker")
+                .arg(if binder_probe {
+                    "--binder-probe-worker"
+                } else {
+                    "--prepare-worker"
+                })
                 .arg(&profile.system)
                 .arg(&profile.userdata)
                 .arg(&base)
@@ -626,7 +632,10 @@ mod daemon {
 #[cfg(unix)]
 fn main() {
     let args: Vec<_> = std::env::args_os().collect();
-    if args.get(1).is_some_and(|arg| arg == "--prepare-worker") {
+    if args
+        .get(1)
+        .is_some_and(|arg| arg == "--prepare-worker" || arg == "--binder-probe-worker")
+    {
         if args.len() != 5 || unsafe { libc::geteuid() } != 0 {
             eprintln!("invalid prepare worker invocation");
             std::process::exit(1);
@@ -635,6 +644,7 @@ fn main() {
             std::path::Path::new(&args[2]),
             std::path::Path::new(&args[3]),
             std::path::Path::new(&args[4]),
+            args[1] == "--binder-probe-worker",
         ) {
             eprintln!("prepare worker: {e}");
             std::process::exit(1);

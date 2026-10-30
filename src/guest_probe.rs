@@ -5,7 +5,7 @@ use std::fs::{self, File};
 use std::io::{self, Read};
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
@@ -854,4 +854,154 @@ echo 'guest runtime paths and write/read checks: OK'
     };
     println!("guest probe summary: {}", serde_json::to_string(&report)?);
     Ok(report)
+}
+
+pub fn binder_ipc(
+    root: &Path,
+    major: u32,
+    minor: u32,
+    stage: &mut dyn FnMut(&str),
+) -> io::Result<()> {
+    let source = match crate::guest_mounts::guest_path(root, "run/ssal/ssal-binder-probe") {
+        Ok(source) => source,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            stage("unavailable");
+            println!("Binder IPC: unavailable; AOSP helper not packaged; device-only result, no IPC claim");
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
+    let manifest_path = crate::guest_mounts::guest_path(root, "run/ssal/ssal-binder-probe.json")?;
+    let manifest: serde_json::Value = serde_json::from_slice(&fs::read(manifest_path)?)?;
+    if manifest["header_revision"] != "android-16.0.0_r2" {
+        return Err(io::Error::other(
+            "unsupported Binder helper header revision",
+        ));
+    }
+    let digest = |path: &Path| -> io::Result<String> {
+        use sha2::{Digest, Sha256};
+        let mut file = File::open(path)?;
+        let mut hash = Sha256::new();
+        let mut buffer = [0; 65536];
+        loop {
+            let count = file.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            hash.update(&buffer[..count]);
+        }
+        Ok(hash
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect())
+    };
+    if manifest["helper_sha256"].as_str() != Some(digest(&source)?.as_str()) {
+        return Err(io::Error::other(
+            "Binder helper binary/manifest hash mismatch",
+        ));
+    }
+    for library in ["libbinder.so", "libutils.so", "libc++.so"] {
+        let path = crate::guest_mounts::guest_path(root, &format!("system/lib64/{library}"))?;
+        if manifest["guest_library_sha256"][library].as_str() != Some(digest(&path)?.as_str()) {
+            return Err(io::Error::other(format!("Binder helper was linked against a different guest {library}; rebuild for this image")));
+        }
+    }
+    println!("Binder helper binary and guest platform library hashes: verified; header revision android-16.0.0_r2");
+    let directory = crate::guest_mounts::directory(root, "data/local/tmp", 0o755)?;
+    let name = format!(".ssal-binder-probe-{}", std::process::id());
+    let target = directory.join(&name);
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&target)?;
+    let mut mounted = false;
+    let result = (|| {
+        if unsafe {
+            libc::mount(
+                cpath(&source)?.as_ptr(),
+                cpath(&target)?.as_ptr(),
+                std::ptr::null(),
+                libc::MS_BIND,
+                std::ptr::null(),
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        mounted = true;
+        if unsafe {
+            libc::mount(
+                std::ptr::null(),
+                cpath(&target)?.as_ptr(),
+                std::ptr::null(),
+                libc::MS_BIND
+                    | libc::MS_REMOUNT
+                    | libc::MS_RDONLY
+                    | libc::MS_NOSUID
+                    | libc::MS_NODEV,
+                std::ptr::null(),
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        // /data/local/tmp is covered by the generated unrestricted linker section.
+        let executable = format!("/data/local/tmp/{name}");
+        let mut cmd = command(root, &executable, false)?;
+        cmd.args([
+            "selftest",
+            "/dev/binder",
+            &major.to_string(),
+            &minor.to_string(),
+        ]);
+        let output = run(&mut cmd, "private Binder IPC helper")?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        println!("{stdout}{}", String::from_utf8_lossy(&output.stderr));
+        if stdout
+            .lines()
+            .any(|line| line == "SSAL_BINDER_CONTEXT_MANAGER=attempted")
+        {
+            stage("context_manager_attempt");
+        }
+        if stdout
+            .lines()
+            .any(|line| line == "SSAL_BINDER_CONTEXT_MANAGER=passed")
+        {
+            stage("context_manager");
+        }
+        if stdout
+            .lines()
+            .any(|line| line == "SSAL_BINDER_IPC=attempted")
+        {
+            stage("ipc_attempt");
+        }
+        if !output.status.success() {
+            return Err(io::Error::other(format!(
+                "private Binder helper failed: {}",
+                output.status
+            )));
+        }
+        if !stdout.lines().any(|line| line == "SSAL_BINDER_IPC=passed") {
+            return Err(io::Error::other(
+                "private Binder helper returned no IPC success evidence",
+            ));
+        }
+        stage("ipc");
+        Ok(())
+    })();
+    let cleanup = (|| {
+        if mounted && unsafe { libc::umount2(cpath(&target)?.as_ptr(), 0) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        fs::remove_file(&target)
+    })();
+    match (result, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(e), Ok(())) | (Ok(()), Err(e)) => Err(e),
+        (Err(e), Err(cleanup)) => Err(io::Error::other(format!(
+            "{e}; Binder helper cleanup: {cleanup}"
+        ))),
+    }
 }

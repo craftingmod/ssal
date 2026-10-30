@@ -1,0 +1,14 @@
+SSAL Binder probe uses Android Open Source Project platform headers.
+
+Android libbinder and libutils headers:
+Copyright (C) 2005-2025 The Android Open Source Project
+
+The header source dependencies are obtained from the official Android
+repositories at the android-16.0.0_r2 tag. Original copyright and Apache
+License 2.0 notices are retained in the downloaded headers. See the
+accompanying LICENSE.binder-probe for the Apache License 2.0 text.
+
+The platform shared libraries used for linking are read from the user's
+guest image and are NOT redistributed in the SSAL module. At runtime the
+probe uses that guest image's libraries; their hashes are checked before
+the probe is executed.
