@@ -1,2 +1,3 @@
 #!/system/bin/sh
-# Build mock: do not start ssald until its implementation is ready.
+MODDIR=${0%/*}
+"$MODDIR/bin/ssald" >> /data/local/ssal/logs/daemon.log 2>&1 &

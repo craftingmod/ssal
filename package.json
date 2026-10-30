@@ -1,10 +1,16 @@
 {
   "name": "ssal",
-  "type": "module",
   "private": true,
+  "type": "module",
   "scripts": {
+    "build:web": "bun scripts/build-web.ts",
+    "package": "bun scripts/package-module.ts",
     "setup:windows": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File ./scripts/dev.ps1 setup",
-    "build:windows": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File ./scripts/dev.ps1 build"
+    "build:windows": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File ./scripts/dev.ps1 build",
+    "fmt:frontend": "bun fmt"
+  },
+  "dependencies": {
+    "adm-zip": "^0.6.1"
   },
   "devDependencies": {
     "@types/bun": "latest"

@@ -1,6 +1,6 @@
 id=ssal
-name=ssal (build mock)
-version=0.1.0-mock
+name=ssal
+version=0.1.0-alpha
 versionCode=1
 author=ssal
-description=Build-system mock; hot-switch is not implemented.
+description=Image registration and management daemon; hot-switch not yet available.

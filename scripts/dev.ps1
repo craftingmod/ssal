@@ -54,7 +54,13 @@ try {
         }
         'image' { Invoke-Wslc build -f containers/builder/Containerfile -t ssal-builder:dev . }
         'start' { Invoke-Wslc run -d --name ssal-dev --mount "type=bind,source=$root,target=/src" -w /src ssal-builder:dev sleep infinity }
-        'build' { Invoke-Wslc exec ssal-dev bash scripts/build-android.sh }
+        'build' {
+            Invoke-Wslc exec ssal-dev bash scripts/build-android.sh
+            & bun run build:web
+            if ($LASTEXITCODE -ne 0) { throw 'WebUI build failed' }
+            & bun run package
+            if ($LASTEXITCODE -ne 0) { throw 'Module packaging failed' }
+        }
         'check' { Invoke-Wslc exec ssal-dev bash -c 'cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked && shellcheck scripts/*.sh' }
         'userdata' { Invoke-Wslc exec ssal-dev bash scripts/make-userdata.sh /src/out/userdata-test.img $Size }
         'stop' { Invoke-Wslc container stop ssal-dev }

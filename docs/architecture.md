@@ -14,7 +14,7 @@ FreeSam의 LineageOS hot-switch를 KernelSU 모듈과 CLI 중심으로 재구성
 3. LineageOS의 `/data`는 호스트 OneUI와 데이터를 공유하지 않는다. `/data/media`, `/data/adb`, 앱 데이터, 설정, ADB 인증 정보까지 게스트에서 독립적으로 관리한다.
 4. 배포 바이너리와 스크립트는 호스트 `/data/adb/modules/ssal/`에 두고, 등록한 시스템 이미지·설정·사용자 데이터 이미지·실제 마운트 지점·로그는 호스트 `/data/local/ssal/` 아래에서 용도별로 나눈다.
 
-이미지 다운로드는 사용자가 외부 도구로 수행한다. 사용자는 압축 해제된 `system.img`를 `/sdcard/Download/` 등 접근 가능한 위치에 준비하고 `ssal add lineage <경로>`로 등록한다. ssal은 로컬 파일을 관리 저장소로 복사하며 다운로드·URL 입력·압축 해제 기능은 구현 범위에 포함하지 않는다.
+이미지 다운로드는 사용자가 외부 도구로 수행한다. 사용자는 압축 해제된 `system.img`를 `/sdcard/Download/` 등 접근 가능한 위치에 준비하고 `ssal add <image_name> <경로>`로 등록한다. ssal은 로컬 파일을 관리 저장소로 복사하며 다운로드·URL 입력·압축 해제 기능은 구현 범위에 포함하지 않는다.
 
 여기서 부팅은 커널 재부팅이나 부팅 슬롯 전환이 아니다. 호스트 커널을 유지한 상태에서 OneUI 프레임워크를 중지하고 LineageOS 프레임워크를 시작하는 hot-switch다. OneUI 복귀 시에도 기존 앱 프로세스가 그대로 재개되는 것은 아니며, 프레임워크와 앱을 다시 시작할 수 있다.
 
@@ -79,7 +79,8 @@ CLI는 전환 스크립트를 직접 실행하지 않는다. 데몬에 작업을
 │     ├─ system.img
 │     └─ manifest.json
 ├─ guests/
-│  └─ lineage/
+│  └─ <profile-name>/
+│     ├─ profile.json
 │     └─ userdata.img
 ├─ mnt/
 │  └─ <session-id>/
@@ -102,7 +103,7 @@ CLI는 전환 스크립트를 직접 실행하지 않는다. 데몬에 작업을
 초기 구현은 ext4 loop 이미지인 `userdata.img`를 게스트 `/data` 전체에 마운트하는 방식을 권장한다.
 
 ```text
-호스트 /data/local/ssal/guests/lineage/userdata.img
+호스트 /data/local/ssal/guests/<profile-name>/userdata.img
                        │ loop mount
                        ▼
 게스트 /data
@@ -262,14 +263,14 @@ CLI 인터페이스 초안은 다음과 같다.
 
 ```sh
 ssal doctor
-ssal add lineage /sdcard/Download/system.img
-ssal switch lineage
+ssal add <image_name> /sdcard/Download/system.img
+ssal switch <image_name>
 ssal status
 ssal logs --follow
 ssal return
 ```
 
-`doctor`는 기기 프로파일, namespace·loop 지원, 필수 서비스와 자산, SELinux 조건, 여유 공간을 점검한다. `add lineage <경로>`는 사용자가 준비한 시스템 이미지를 복사·검증하고 `lineage` 게스트에 등록한다. 최초 등록 시 userdata 크기 등은 `ssal.toml`의 설정을 사용하고, 실제 userdata 생성은 최초 준비 단계에서 수행한다. `switch`는 작업을 데몬에 접수하며 재연결 가능한 작업 ID를 반환한다. `status`는 현재 상태와 마지막 실패·복구 결과를 제공한다.
+`doctor`는 기기 프로파일, namespace·loop 지원, 필수 서비스와 자산, SELinux 조건, 여유 공간을 점검한다. `add <image_name> <경로>`는 사용자가 준비한 시스템 이미지를 복사·검증하고 지정한 이름으로 등록한다. 이미지 이름은 영문 대소문자, 숫자, `_`, `-`로 구성된 1~64자다. 최초 등록 시 userdata 크기 등은 `ssal.toml`의 설정을 사용하고, 실제 userdata 생성은 최초 준비 단계에서 수행한다. `switch`는 작업을 데몬에 접수하며 재연결 가능한 작업 ID를 반환한다. `status`는 현재 상태와 마지막 실패·복구 결과를 제공한다.
 
 관리 소켓은 root 소유로 두고 peer 자격을 검사한다. 게스트에 소켓을 제공할 경우 허용 명령을 분리한다. 임의 shell 실행을 기본 RPC로 제공하지 않는다. CLI와 데몬의 프로토콜 버전을 명시하고, 이미지 등록·교체·전환 간 충돌을 직렬화한다.
 
@@ -280,7 +281,7 @@ ssal return
 3. 복사한 파일의 형식·내용을 검증하고 해시를 계산한다. 등록 해시는 이후 변경 감지용이며 배포처의 진위 확인을 대신하지 않는다. 초기 지원 형식은 압축 해제된 raw ext4 `system.img`로 한정하고, 압축 파일과 Android sparse 이미지는 사용자가 외부에서 변환하도록 안내한다.
 4. 복사와 검증을 완료한 파일을 `images/<image-id>/system.img`로 확정하고 manifest와 게스트의 이미지 참조를 갱신한다. 실패 시 기존 등록과 userdata를 유지하고 임시 파일을 정리한다.
 
-등록 후에는 원본 파일을 삭제하거나 이동해도 세션 실행에 영향을 주지 않는다. 같은 `lineage`에 다시 등록하면 호스트 활성 상태에서 시스템 이미지 참조만 교체하고 기존 userdata는 보존한다. 실행 중인 세션의 이미지와 userdata는 덮어쓰지 않는다. 새 시스템 이미지와 기존 userdata의 호환성은 별도로 검사하고, userdata 초기화는 명시적인 별도 작업으로 취급한다.
+등록 후에는 원본 파일을 삭제하거나 이동해도 세션 실행에 영향을 주지 않는다. 같은 이미지 이름으로 다시 등록하면 호스트 활성 상태에서 시스템 이미지 참조만 교체하고 기존 userdata는 보존한다. 실행 중인 세션의 이미지와 userdata는 덮어쓰지 않는다. 새 시스템 이미지와 기존 userdata의 호환성은 별도로 검사하고, userdata 초기화는 명시적인 별도 작업으로 취급한다.
 
 이미지 manifest에는 해시, 이미지 형식, 확인 가능한 Android 버전, 필요한 호환성 자산과 프로파일 정보를 기록한다. 다운로드 주소나 다운로드 진행 상태는 관리하지 않는다.
 
@@ -314,7 +315,7 @@ FreeSam은 기기 호환성 자료와 동작 참고용으로 활용한다. 기�
 
 ### 단계 2: 독립 userdata와 namespace
 
-`ssal add lineage <경로>`로 로컬 이미지를 복사·등록하고 원본 파일 삭제 후에도 등록 이미지가 유효한지 확인한다. 복사 실패와 공간 부족 시 기존 등록 및 userdata가 보존되는지도 확인한다. OneUI를 실행한 채 게스트 rootfs와 userdata를 구성한다. 호스트 mount가 변하지 않는지, 게스트 `/data`가 userdata 이미지에서만 제공되는지 확인한다. 호스트 전용 표식 파일과 게스트 전용 표식 파일로 일반 경로에서 상호 노출과 역방향 쓰기가 없는지 확인한다. 이 검사는 root에 대한 보안 격리 증명과 구분한다.
+`ssal add <image_name> <경로>`로 로컬 이미지를 복사·등록하고 원본 파일 삭제 후에도 등록 이미지가 유효한지 확인한다. 복사 실패와 공간 부족 시 기존 등록 및 userdata가 보존되는지도 확인한다. OneUI를 실행한 채 게스트 rootfs와 userdata를 구성한다. 호스트 mount가 변하지 않는지, 게스트 `/data`가 userdata 이미지에서만 제공되는지 확인한다. 호스트 전용 표식 파일과 게스트 전용 표식 파일로 일반 경로에서 상호 노출과 역방향 쓰기가 없는지 확인한다. 이 검사는 root에 대한 보안 격리 증명과 구분한다.
 
 ### 단계 3: 게스트 데이터 서비스
 

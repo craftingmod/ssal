@@ -1,0 +1,37 @@
+:root {
+  color-scheme: light dark;
+  font-family: system-ui, sans-serif;
+}
+body {
+  margin: 0;
+  background: light-dark(#f5f6f8, #14171c);
+  color: light-dark(#20242a, #eef1f5);
+}
+main {
+  max-width: 36rem;
+  padding: 2rem 1.5rem;
+  margin: auto;
+}
+h1 {
+  margin-bottom: 0.5rem;
+}
+p {
+  line-height: 1.5;
+}
+button {
+  border: 0;
+  border-radius: 0.65rem;
+  padding: 0.85rem 1.2rem;
+  background: #4969d8;
+  color: white;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+button:disabled {
+  opacity: 0.55;
+  cursor: wait;
+}
+#status {
+  white-space: pre-wrap;
+}
