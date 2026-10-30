@@ -9,3 +9,15 @@
 [submodule "vendor/freesam"]
 	path = vendor/freesam
 	url = https://codeberg.org/qwiterh/FreeSam.git
+[submodule "vendor/treble_manifest"]
+	path = vendor/treble_manifest
+	url = https://github.com/MisterZtr/treble_manifest.git
+	branch = lineage-23.2
+[submodule "vendor/device_phh_treble"]
+	path = vendor/device_phh_treble
+	url = https://github.com/TrebleDroid/device_phh_treble.git
+	branch = android-16.0
+[submodule "vendor/LineageOS_gsi"]
+	path = vendor/LineageOS_gsi
+	url = https://github.com/MisterZtr/LineageOS_gsi.git
+	branch = lineage-23.2
