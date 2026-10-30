@@ -120,19 +120,31 @@ impl Session {
             major: 0,
             minor: 0,
         };
-        // Some Android kernels prepopulate binder/hwbinder/vndbinder on mount.
-        // Allocate our own name instead of treating those as an allocation.
-        request.name[..10].copy_from_slice(b"ssal-probe");
+        // Inspect the original node before any alias bind hides its genfs label.
+        // Only reuse a default node on the fresh mount whose control FD we own.
+        let source = target.join("binder");
+        let created_by = match fs::symlink_metadata(&source) {
+            Ok(meta) if meta.file_type().is_char_device() => "kernel_mount_default",
+            Ok(_) => return Err(io::Error::other("private binder is not a character device")),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => "BINDER_CTL_ADD",
+            Err(e) => return Err(e),
+        };
+        request.name[..6].copy_from_slice(b"binder");
         // _IOWR('b', 1, struct binderfs_device), size=264 on arm64 and x86_64.
-        if unsafe { libc::ioctl(control.as_raw_fd(), 0xc1086201u32 as _, &mut request) } != 0 {
+        if created_by == "BINDER_CTL_ADD"
+            && unsafe { libc::ioctl(control.as_raw_fd(), 0xc1086201u32 as _, &mut request) } != 0
+        {
             return Err(io::Error::other(format!(
                 "BINDER_CTL_ADD: {}",
                 io::Error::last_os_error()
             )));
         }
-        let source = target.join("ssal-probe");
         let device = OpenOptions::new().read(true).write(true).open(&source)?;
         let meta = device.metadata()?;
+        if created_by == "kernel_mount_default" {
+            request.major = libc::major(meta.rdev()) as u32;
+            request.minor = libc::minor(meta.rdev()) as u32;
+        }
         if !meta.file_type().is_char_device()
             || meta.rdev() != libc::makedev(request.major, request.minor)
             || meta.rdev() == host.rdev()
@@ -142,6 +154,7 @@ impl Session {
                 "private Binder identity verification failed",
             ));
         }
+        println!("private Binder original node: created_by={created_by}; dev={} inode={} rdev={}; label={}", meta.dev(), meta.ino(), meta.rdev(), ssal::unix::image_context(&device).unwrap_or_else(|e| format!("unavailable: {e}")));
         let alias = crate::guest_mounts::guest_path(root, "dev/binder")?;
         if fs::metadata(&alias)?.rdev() != meta.rdev() {
             if unsafe {

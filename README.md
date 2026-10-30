@@ -46,3 +46,7 @@ SELinux 전환 사전 검사는 `ssal probe-selinux-transition PROFILE_NAME`으�
 실제 private Binder를 연결하고 라벨 호환성·실행 명세·Host 노출 경로를 조사하는 후속 검사는 `ssal probe-servicemanager-runtime-preflight PROFILE_NAME`으로 실행합니다. 실제 서비스는 실행하지 않습니다. [런타임 차단 요인과 기기 결과](docs/servicemanager-runtime-preflight.md)를 참고하세요.
 
 이 검사는 임시 Guest 라벨/DAC 적용과 UID 1000 시험 워커 검증도 수행합니다. [실행 환경 검증 결과와 남은 차단](docs/servicemanager-execution-environment.md)을 참고하세요. 실제 servicemanager 실행은 계속 차단됩니다.
+
+Private Binder의 Enforcing 접근 방안은 [후속 조사](docs/private-binder-enforcing-research.md)에 정리했습니다. 현재 alias bind에 가려진 원본 `binder` 노드 검사, `context`/`fscontext` 분리와 최소 정책 후보를 다룹니다. 새 기기 검증 결과는 아닙니다.
+
+후속 [구현·기기 실험](docs/private-binder-device-20261031.md)에서는 원본 binder_device 선택과 enforcing servicemanager/UID 1000의 제한된 ioctl 검사를 통과했습니다. 추가 정책은 적용하지 않았으며, enforcing IPC·service_contexts와 정식 서비스 기동은 미검증입니다.

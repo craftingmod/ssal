@@ -34,6 +34,8 @@ Guest가 생성한 `/linkerconfig/ld.config.txt`를 FD로 열고, 전용 Guest t
 
 따라서 현재 시험한 방법에서는 기존 `binder_device` 타입을 private binderfs에 적용해 차단을 해결하지 못했다. context mount EACCES 하나만으로 누락된 SELinux 규칙을 특정하지는 않는다. mount labeling의 커널/파일시스템 제약과 감사 근거가 더 필요하다. 임의 mknod로 Binder 객체를 복제하거나 Host Binder를 대체 장치로 사용하지 않았다.
 
+후속 [Enforcing 접근 조사](private-binder-enforcing-research.md)에서 현재 코드가 `ssal-probe`를 원본 `/dev/binderfs/binder` 위에 bind한다는 점을 확인했다. 따라서 위 결과는 alias 이전의 원본 `binder` genfs 라벨을 검증한 것이 아니다. 정책 무변경 원본 노드 검사와 `context`/`fscontext` 분리 후보가 남아 있으며, 새 기기 시험으로 확인해야 한다.
+
 현재 `binderfs` 라벨을 유지한다면 실제 servicemanager 접근에는 정책 허용 확장이 필요하다. 또는 별도 타입을 적용할 수 있는 장치 라벨링 방법과 정책을 함께 마련해야 한다. 이번 작업은 어느 정책도 추가하지 않았다. 정책 원본 읽기는 EINVAL이며, 실효 AV sequence와 Enforcing을 비교했다. 현재 KernelSU 실효 정책 결과를 변경 전 순정 삼성 정책의 결과로 간주하지 않는다.
 
 | 방식 | 장점 | 보안상 제한·선행 조건 |

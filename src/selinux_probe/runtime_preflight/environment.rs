@@ -41,9 +41,13 @@ fn attempt(result: io::Result<()>) -> Value {
 
 fn prepare_labels(root: &Path, binder: &mut crate::binder_probe::Session) -> io::Result<Value> {
     let original_binder = file_label(binder.private_device()?)?;
-    let mut attempts = vec![
-        json!({"method": "private_fd_fsetxattr", "result": attempt(set_label(binder.private_device()?, BINDER_LABEL))}),
-    ];
+    let mut attempts = if original_binder == BINDER_LABEL {
+        vec![json!({"method":"original_genfs_label","result":{"status":"passed"}})]
+    } else {
+        vec![
+            json!({"method": "private_fd_fsetxattr", "result": attempt(set_label(binder.private_device()?, BINDER_LABEL))}),
+        ]
+    };
     if file_label(binder.private_device()?)? != BINDER_LABEL {
         // A fresh security-context mount is also scoped to our private superblock.
         // Never remount, relabel or chmod the shared Host device/superblock.

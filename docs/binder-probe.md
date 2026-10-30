@@ -16,8 +16,8 @@
 ## 디바이스 관리
 
 1. private mount namespace의 게스트 `/dev/binderfs`에 새 binderfs를 `max=4,nosuid,noexec`로 mount한다. `nodev`는 장치 접근이 필요하므로 사용하지 않는다. 공유 `/dev`에 새 디렉터리나 노드를 직접 만들지 않는다.
-2. 새 `binder-control`에 `BINDER_CTL_ADD`를 호출해 `ssal-probe`라는 장치를 만든다. 일부 Android 커널은 새 binderfs에도 binder/hwbinder/vndbinder를 미리 생성하므로 `binder` 이름의 EEXIST를 피한다.
-3. ioctl 응답의 major/minor, 실제 character device의 rdev와 fdinfo mount ID가 일치하고 호스트 Binder와 rdev가 다른지 확인한다. 게스트 `/dev/binder`가 이 장치를 가리키도록 필요한 bind mount만 추가한다.
+2. 새 인스턴스의 원본 `binder` 노드를 먼저 검사하고 사용한다. 없을 때만 새 `binder-control`에 `BINDER_CTL_ADD(name=binder)`를 호출한다. 생성 경로를 구분하고 alias 연결 전에 라벨을 기록한다. 일부 Android 커널은 mount 시 기본 노드를 생성한다.
+3. ioctl 생성이면 응답의 major/minor를 대조하고, 모든 경로에서 실제 character device의 fdinfo mount ID가 해당 새 인스턴스와 일치하고 호스트 Binder와 rdev가 다른지 확인한다. 게스트 `/dev/binder`가 이 장치를 가리키도록 필요한 bind mount만 추가한다.
 4. `BINDER_VERSION`으로 arm64 프로토콜 8을 확인한다. 이 시점은 장치 생성·열기 성공이며 IPC 성공은 아니다.
 5. 헬퍼 종료 후 fd와 alias bind를 해제하고 binderfs를 일반 unmount한다. 생성한 mount ID가 남아 있지 않은지와 호스트 `/dev/binder`의 identity가 보존됐는지 확인한다.
 
