@@ -634,11 +634,23 @@ pub fn worker(system: &Path, userdata: &Path, base: &Path, mode: &str) -> io::Re
         cleanup.push(e.to_string());
     }
     if !cleanup.is_empty() {
+        if mode == "--selinux-probe-worker" {
+            println!(
+                "SELinux transition resource summary: {}",
+                serde_json::json!({"cleanup": "failed", "scope": "system_userdata_mounts_and_loops", "errors": cleanup})
+            );
+        }
         return Err(io::Error::other(format!(
             "{}; {}",
             result.err().map(|e| e.to_string()).unwrap_or_default(),
             cleanup.join("; ")
         )));
+    }
+    if mode == "--selinux-probe-worker" {
+        println!(
+            "SELinux transition resource summary: {}",
+            serde_json::json!({"cleanup": "passed", "scope": "system_userdata_mounts_and_loops"})
+        );
     }
     result?;
     println!("mount cleanup and session loop backing release checks: OK");

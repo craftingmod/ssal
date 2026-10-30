@@ -971,6 +971,15 @@ pub fn verify(
         }
     });
     let cleanup = cleanup.and(residual);
+    if mode == "--selinux-probe-worker" {
+        println!(
+            "SELinux transition resource summary: {}",
+            serde_json::json!({
+                "cleanup": if cleanup.is_ok() { "passed" } else { "failed" },
+                "scope": "guest_rootfs_mounts", "error": cleanup.as_ref().err().map(ToString::to_string)
+            })
+        );
+    }
     match (result, cleanup) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(e), Ok(())) | (Ok(()), Err(e)) => Err(e),

@@ -1,0 +1,423 @@
+{
+  "probe": {
+    "automatic_transition_api": "selinuxfs/create process class; policy prediction only, no automatic exec performed",
+    "boot_id": "22419c4a-6ae5-4533-9c81-ef709df3a058",
+    "cleanup": "passed",
+    "cleanup_scope": "probe_child_and_fds; mount_and_loop_result_follows",
+    "denied_permissions": [
+      {
+        "allowed": false,
+        "allowed_mask": 0,
+        "api": "selinuxfs/access (security_compute_av_flags_raw wire protocol)",
+        "class": "file",
+        "class_index": 6,
+        "flags": 0,
+        "permission": "entrypoint",
+        "permissive_domain": false,
+        "raw_response": "0 ffffffff 0 ffffffff 1 0",
+        "requested_mask": 67108864,
+        "sequence": 1,
+        "source": "u:r:servicemanager:s0",
+        "target": "u:object_r:shell_data_file:s0"
+      }
+    ],
+    "exec_transition": "blocked",
+    "failure": "exec blocked: denied_permissions=[{\"allowed\":false,\"allowed_mask\":0,\"api\":\"selinuxfs/access (security_compute_av_flags_raw wire protocol)\",\"class\":\"file\",\"class_index\":6,\"flags\":0,\"permission\":\"entrypoint\",\"permissive_domain\":false,\"raw_response\":\"0 ffffffff 0 ffffffff 1 0\",\"requested_mask\":67108864,\"sequence\":1,\"source\":\"u:r:servicemanager:s0\",\"target\":\"u:object_r:shell_data_file:s0\"}], target_permissive=false, setexeccon_errno=0; labels and policy unchanged",
+    "global_enforcing": true,
+    "guest_automatic_transition": "u:r:ksu:s0",
+    "guest_permission_check": "passed",
+    "guest_permissions": [
+      {
+        "allowed": true,
+        "allowed_mask": 4294967295,
+        "api": "selinuxfs/access (security_compute_av_flags_raw wire protocol)",
+        "class": "process",
+        "class_index": 2,
+        "flags": 1,
+        "permission": "setexec",
+        "permissive_domain": true,
+        "raw_response": "ffffffff ffffffff 0 ffffffff 1 1",
+        "requested_mask": 131072,
+        "sequence": 1,
+        "source": "u:r:ksu:s0",
+        "target": "u:r:ksu:s0"
+      },
+      {
+        "allowed": true,
+        "allowed_mask": 4294967295,
+        "api": "selinuxfs/access (security_compute_av_flags_raw wire protocol)",
+        "class": "process",
+        "class_index": 2,
+        "flags": 1,
+        "permission": "transition",
+        "permissive_domain": true,
+        "raw_response": "ffffffff ffffffff 0 ffffffff 1 1",
+        "requested_mask": 2,
+        "sequence": 1,
+        "source": "u:r:ksu:s0",
+        "target": "u:r:servicemanager:s0"
+      },
+      {
+        "allowed": true,
+        "allowed_mask": 67388434,
+        "api": "selinuxfs/access (security_compute_av_flags_raw wire protocol)",
+        "class": "file",
+        "class_index": 6,
+        "flags": 0,
+        "permission": "entrypoint",
+        "permissive_domain": false,
+        "raw_response": "4044412 ffffffff 0 ffffffff 1 0",
+        "requested_mask": 67108864,
+        "sequence": 1,
+        "source": "u:r:servicemanager:s0",
+        "target": "u:object_r:servicemanager_exec:s0"
+      },
+      {
+        "allowed": true,
+        "allowed_mask": 4294967295,
+        "api": "selinuxfs/access (security_compute_av_flags_raw wire protocol)",
+        "class": "file",
+        "class_index": 6,
+        "flags": 1,
+        "permission": "execute",
+        "permissive_domain": true,
+        "raw_response": "ffffffff ffffffff 0 ffffffff 1 1",
+        "requested_mask": 16384,
+        "sequence": 1,
+        "source": "u:r:ksu:s0",
+        "target": "u:object_r:servicemanager_exec:s0"
+      },
+      {
+        "allowed": true,
+        "allowed_mask": 4294967295,
+        "api": "selinuxfs/access (security_compute_av_flags_raw wire protocol)",
+        "class": "file",
+        "class_index": 6,
+        "flags": 1,
+        "permission": "open",
+        "permissive_domain": true,
+        "raw_response": "ffffffff ffffffff 0 ffffffff 1 1",
+        "requested_mask": 262144,
+        "sequence": 1,
+        "source": "u:r:ksu:s0",
+        "target": "u:object_r:servicemanager_exec:s0"
+      },
+      {
+        "allowed": true,
+        "allowed_mask": 4294967295,
+        "api": "selinuxfs/access (security_compute_av_flags_raw wire protocol)",
+        "class": "file",
+        "class_index": 6,
+        "flags": 1,
+        "permission": "read",
+        "permissive_domain": true,
+        "raw_response": "ffffffff ffffffff 0 ffffffff 1 1",
+        "requested_mask": 2,
+        "sequence": 1,
+        "source": "u:r:ksu:s0",
+        "target": "u:object_r:servicemanager_exec:s0"
+      },
+      {
+        "allowed": true,
+        "allowed_mask": 4294967295,
+        "api": "selinuxfs/access (security_compute_av_flags_raw wire protocol)",
+        "class": "file",
+        "class_index": 6,
+        "flags": 1,
+        "permission": "getattr",
+        "permissive_domain": true,
+        "raw_response": "ffffffff ffffffff 0 ffffffff 1 1",
+        "requested_mask": 16,
+        "sequence": 1,
+        "source": "u:r:ksu:s0",
+        "target": "u:object_r:servicemanager_exec:s0"
+      },
+      {
+        "allowed": true,
+        "allowed_mask": 4294967295,
+        "api": "selinuxfs/access (security_compute_av_flags_raw wire protocol)",
+        "class": "file",
+        "class_index": 6,
+        "flags": 1,
+        "permission": "map",
+        "permissive_domain": true,
+        "raw_response": "ffffffff ffffffff 0 ffffffff 1 1",
+        "requested_mask": 1024,
+        "sequence": 1,
+        "source": "u:r:ksu:s0",
+        "target": "u:object_r:servicemanager_exec:s0"
+      }
+    ],
+    "helper": {
+      "automatic_transition": "u:r:ksu:s0",
+      "explicit_target": "u:r:servicemanager:s0",
+      "label": "u:object_r:shell_data_file:s0",
+      "path": "/data/local/tmp/ssal-selinux-identity"
+    },
+    "helper_permissions": [
+      {
+        "allowed": false,
+        "allowed_mask": 0,
+        "api": "selinuxfs/access (security_compute_av_flags_raw wire protocol)",
+        "class": "file",
+        "class_index": 6,
+        "flags": 0,
+        "permission": "entrypoint",
+        "permissive_domain": false,
+        "raw_response": "0 ffffffff 0 ffffffff 1 0",
+        "requested_mask": 67108864,
+        "sequence": 1,
+        "source": "u:r:servicemanager:s0",
+        "target": "u:object_r:shell_data_file:s0"
+      },
+      {
+        "allowed": true,
+        "allowed_mask": 4294967295,
+        "api": "selinuxfs/access (security_compute_av_flags_raw wire protocol)",
+        "class": "file",
+        "class_index": 6,
+        "flags": 1,
+        "permission": "execute",
+        "permissive_domain": true,
+        "raw_response": "ffffffff ffffffff 0 ffffffff 1 1",
+        "requested_mask": 16384,
+        "sequence": 1,
+        "source": "u:r:ksu:s0",
+        "target": "u:object_r:shell_data_file:s0"
+      },
+      {
+        "allowed": true,
+        "allowed_mask": 4294967295,
+        "api": "selinuxfs/access (security_compute_av_flags_raw wire protocol)",
+        "class": "file",
+        "class_index": 6,
+        "flags": 1,
+        "permission": "open",
+        "permissive_domain": true,
+        "raw_response": "ffffffff ffffffff 0 ffffffff 1 1",
+        "requested_mask": 262144,
+        "sequence": 1,
+        "source": "u:r:ksu:s0",
+        "target": "u:object_r:shell_data_file:s0"
+      },
+      {
+        "allowed": true,
+        "allowed_mask": 4294967295,
+        "api": "selinuxfs/access (security_compute_av_flags_raw wire protocol)",
+        "class": "file",
+        "class_index": 6,
+        "flags": 1,
+        "permission": "read",
+        "permissive_domain": true,
+        "raw_response": "ffffffff ffffffff 0 ffffffff 1 1",
+        "requested_mask": 2,
+        "sequence": 1,
+        "source": "u:r:ksu:s0",
+        "target": "u:object_r:shell_data_file:s0"
+      },
+      {
+        "allowed": true,
+        "allowed_mask": 4294967295,
+        "api": "selinuxfs/access (security_compute_av_flags_raw wire protocol)",
+        "class": "file",
+        "class_index": 6,
+        "flags": 1,
+        "permission": "getattr",
+        "permissive_domain": true,
+        "raw_response": "ffffffff ffffffff 0 ffffffff 1 1",
+        "requested_mask": 16,
+        "sequence": 1,
+        "source": "u:r:ksu:s0",
+        "target": "u:object_r:shell_data_file:s0"
+      },
+      {
+        "allowed": true,
+        "allowed_mask": 4294967295,
+        "api": "selinuxfs/access (security_compute_av_flags_raw wire protocol)",
+        "class": "file",
+        "class_index": 6,
+        "flags": 1,
+        "permission": "map",
+        "permissive_domain": true,
+        "raw_response": "ffffffff ffffffff 0 ffffffff 1 1",
+        "requested_mask": 1024,
+        "sequence": 1,
+        "source": "u:r:ksu:s0",
+        "target": "u:object_r:shell_data_file:s0"
+      }
+    ],
+    "host_after": {
+      "1": {
+        "alive": true,
+        "context": "u:r:init:s0",
+        "executable": "/system/bin/init",
+        "name": "init",
+        "start_time": "0"
+      },
+      "1784": {
+        "alive": true,
+        "context": "u:r:zygote:s0",
+        "executable": "/system/bin/app_process64",
+        "name": "zygote64",
+        "start_time": "608"
+      },
+      "2023": {
+        "alive": true,
+        "context": "u:r:surfaceflinger:s0",
+        "executable": "/system/bin/surfaceflinger",
+        "name": "surfaceflinger",
+        "start_time": "650"
+      },
+      "295": {
+        "alive": true,
+        "context": "u:r:vendor_init:s0",
+        "executable": "/system/bin/init",
+        "name": "init",
+        "start_time": "267"
+      },
+      "974": {
+        "alive": true,
+        "context": "u:r:servicemanager:s0",
+        "executable": "/system/bin/servicemanager",
+        "name": "servicemanager",
+        "start_time": "376"
+      }
+    },
+    "host_after_error": null,
+    "host_before": {
+      "1": {
+        "alive": true,
+        "context": "u:r:init:s0",
+        "executable": "/system/bin/init",
+        "name": "init",
+        "start_time": "0"
+      },
+      "1784": {
+        "alive": true,
+        "context": "u:r:zygote:s0",
+        "executable": "/system/bin/app_process64",
+        "name": "zygote64",
+        "start_time": "608"
+      },
+      "2023": {
+        "alive": true,
+        "context": "u:r:surfaceflinger:s0",
+        "executable": "/system/bin/surfaceflinger",
+        "name": "surfaceflinger",
+        "start_time": "650"
+      },
+      "295": {
+        "alive": true,
+        "context": "u:r:vendor_init:s0",
+        "executable": "/system/bin/init",
+        "name": "init",
+        "start_time": "267"
+      },
+      "974": {
+        "alive": true,
+        "context": "u:r:servicemanager:s0",
+        "executable": "/system/bin/servicemanager",
+        "name": "servicemanager",
+        "start_time": "376"
+      }
+    },
+    "host_unchanged": "passed",
+    "parent_namespaces": {
+      "cgroup": "cgroup:[4026531835]",
+      "mnt": "mnt:[4026536365]",
+      "net": "net:[4026531840]",
+      "time": "time:[4026531834]",
+      "time_for_children": "time:[4026531834]",
+      "uts": "uts:[4026531838]"
+    },
+    "pending_child": {
+      "pid": 6838,
+      "reaped": true
+    },
+    "policy_av_sequence_unchanged": true,
+    "policy_hash_error": "Invalid argument (os error 22)",
+    "policy_hash_same": null,
+    "policy_modified": false,
+    "policy_permission_check": "failed",
+    "policy_permission_scope": "kernel_computed_access_vectors; static allow rules not inspected; source permissive does not imply policy enforcement",
+    "policy_sha256": null,
+    "post_exec_identity": "not_run",
+    "servicemanager": "not_run",
+    "setexeccon": "passed",
+    "setexeccon_api": "/proc/thread-self/attr/exec (setexeccon kernel interface); disposable child only",
+    "setexeccon_errno": 0,
+    "source": "u:r:ksu:s0",
+    "source_domain_permissive": true,
+    "target": "u:r:servicemanager:s0",
+    "target_domain_after_query": {
+      "allowed": true,
+      "allowed_mask": 2195325,
+      "api": "selinuxfs/access (security_compute_av_flags_raw wire protocol)",
+      "class": "process",
+      "class_index": 2,
+      "flags": 0,
+      "permission": "getattr",
+      "permissive_domain": false,
+      "raw_response": "217f7d ffffffff 0 ffffffff 1 0",
+      "requested_mask": 65536,
+      "sequence": 1,
+      "source": "u:r:servicemanager:s0",
+      "target": "u:r:servicemanager:s0"
+    },
+    "target_domain_enforcing": true,
+    "target_domain_query": {
+      "allowed": true,
+      "allowed_mask": 2195325,
+      "api": "selinuxfs/access (security_compute_av_flags_raw wire protocol)",
+      "class": "process",
+      "class_index": 2,
+      "flags": 0,
+      "permission": "getattr",
+      "permissive_domain": false,
+      "raw_response": "217f7d ffffffff 0 ffffffff 1 0",
+      "requested_mask": 65536,
+      "sequence": 1,
+      "source": "u:r:servicemanager:s0",
+      "target": "u:r:servicemanager:s0"
+    },
+    "validation_scope": "disposable_helper_explicit_exec_transition"
+  },
+  "resources": [
+    {
+      "cleanup": "passed",
+      "error": null,
+      "scope": "guest_rootfs_mounts"
+    },
+    {
+      "cleanup": "passed",
+      "scope": "system_userdata_mounts_and_loops"
+    }
+  ],
+  "untransitioned_control": {
+    "context": "u:r:ksu:s0",
+    "egid": 0,
+    "euid": 0,
+    "executable": "/data/local/tmp/ssal-selinux-identity",
+    "executable_dev": 65105,
+    "executable_ino": 209133,
+    "gid": 0,
+    "namespaces": {
+      "cgroup": "cgroup:[4026531835]",
+      "mnt": "mnt:[4026532950]",
+      "net": "net:[4026531840]",
+      "time": "time:[4026531834]",
+      "time_for_children": "time:[4026531834]",
+      "uts": "uts:[4026531838]"
+    },
+    "pid": 6849,
+    "protocol": 1,
+    "status": "Name:\tssal-selinux-id\nUmask:\t0022\nState:\tR (running)\nTgid:\t6849\nNgid:\t0\nPid:\t6849\nPPid:\t6848\nTracerPid:\t0\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nFDSize:\t64\nGroups:\t1004 1007 1011 1015 1028 1078 1079 3001 3002 3003 3006 3009 3011 3012 \nKthread:\t0\nVmPeak:\t10774424 kB\nVmSize:\t10774232 kB\nVmLck:\t       0 kB\nVmPin:\t       0 kB\nVmHWM:\t    3244 kB\nVmRSS:\t    3244 kB\nRssAnon:\t     620 kB\nRssFile:\t    2224 kB\nRssShmem:\t     400 kB\nVmData:\t    3084 kB\nVmStk:\t     136 kB\nVmExe:\t     388 kB\nVmLib:\t    2820 kB\nVmPTE:\t     120 kB\nVmSwap:\t       0 kB\nCoreDumping:\t0\nTHP_enabled:\t1\nuntag_mask:\t0xffffffffffffff\nThreads:\t1\nSigQ:\t1/38969\nSigPnd:\t0000000000000000\nShdPnd:\t0000000000000000\nSigBlk:\t0000000080000000\nSigIgn:\t0000002000001000\nSigCgt:\t0000004c400084f8\nCapInh:\t0000000000000000\nCapPrm:\t000001ffffffffff\nCapEff:\t000001ffffffffff\nCapBnd:\t000001ffffffffff\nCapAmb:\t0000000000000000\nNoNewPrivs:\t0\nSeccomp:\t0\nSeccomp_filters:\t0\nSpeculation_Store_Bypass:\tthread vulnerable\nSpeculationIndirectBranch:\tunknown\nCpus_allowed:\tff\nCpus_allowed_list:\t0-7\nMems_allowed:\t1\nMems_allowed_list:\t0\nvoluntary_ctxt_switches:\t0\nnonvoluntary_ctxt_switches:\t2\n",
+    "uid": 0
+  },
+  "post_cleanup_check": [
+    "PROBE_SCRATCH_REMOVED",
+    "Enforcing",
+    "1 295 974 1784 2023",
+    "0f6b0e1c3e4217f685826d6a46ff7150667aa0a5be612c554964bfe3e5b3d39b  /data/adb/modules/ssal/sepolicy.rule"
+  ]
+}
