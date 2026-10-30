@@ -6,12 +6,15 @@ import AdmZip from "adm-zip"
 const entries: { name: string; path: string; mode: number }[] = [
   ...[
     "module.prop",
+    "sepolicy.rule",
     "skip_mount",
     "service.sh",
     "post-fs-data.sh",
     "customize.sh",
     "uninstall.sh",
     "restart.sh",
+    "profiles/mounts/initial.json",
+    "profiles/services/initial.json",
   ].map((name) => ({
     name,
     path: `module/${name}`,

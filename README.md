@@ -2,9 +2,19 @@
 
 KernelSU 모듈과 Android arm64 CLI의 초기 구현입니다. `ssald`가 root 전용 소켓을 제공하며 `ssal doctor`, `ssal status`, `ssal logs`, `ssal add <image_name> <raw-ext4-image>`를 지원합니다. 이미지 이름은 영문 대소문자, 숫자, `_`, `-`로 1~64자까지 지정합니다. 이름별로 이미지를 등록하며 `ssal status`에서 목록과 백그라운드 작업 결과를 확인합니다. 기존 `lineage` 등록은 업데이트 후 그대로 유지됩니다. 원본은 변경하지 않고 복사하며, 재등록 시 기존 userdata는 건드리지 않습니다.
 
-`ssal create IMAGE_NAME [PROFILE_NAME]`은 등록된 이미지의 현재 ID를 고정하고 기기 정보와 프로필별 2 GiB sparse ext4 userdata 이미지를 생성합니다. 이름을 생략하면 사용하지 않는 `profile1`, `profile2` 등을 선택합니다. 기존 프로필은 덮어쓰지 않습니다. 프로필은 `ssal status`에서 확인하고, 데이터와 설정은 `/data/local/ssal/guests/PROFILE_NAME/`에 보존됩니다. 생성에는 기기의 `/system/bin/mke2fs`가 필요합니다.
+`ssal create IMAGE_NAME [PROFILE_NAME]`은 등록된 이미지의 현재 ID를 고정하고 기기 정보와 프로필별 userdata 디렉터리를 생성합니다. 이름을 생략하면 사용하지 않는 `profile1`, `profile2` 등을 선택합니다. 기존 프로필은 덮어쓰지 않습니다. 프로필은 `ssal status`에서 확인하고, 데이터와 설정은 `/data/local/ssal/guests/PROFILE_NAME/`에 보존됩니다. 이전 userdata 이미지 방식의 프로필은 지원하지 않으며 자동 변환하지 않습니다.
 
-현재 이미지 검사는 ext4 매직과 복사 크기 및 SHA-256에 한정됩니다. 파일시스템의 완전성, Android 버전 및 기기 호환성은 확인하지 않습니다. 프로필에 기록한 기기 정보는 감지된 값이며 전환에 필요한 기기 설정은 아직 구현되지 않았습니다. namespace, 게스트 서비스와 hot-switch도 구현되지 않아 `switch`와 `return`은 거부됩니다. 실제 기기에서 검증되지 않았습니다.
+`ssal remove PROFILE_NAME`은 프로필과 그 안의 userdata를 영구적으로 삭제합니다. 연결된 system 이미지와 다른 프로필은 삭제하지 않습니다. 이전 userdata 이미지 방식의 프로필도 삭제할 수 있습니다.
+
+`ssal doctor PROFILE_NAME`은 이미지 해시와 크기, ext4 매직, userdata 디렉터리, 기기 fingerprint 및 사용 가능한 마운트 장치와 기본 마운트 프로필을 확인합니다. `ssal prepare PROFILE_NAME`은 별도 mount namespace에서 userdata 쓰기/읽기와 system RO loop mount를 검사한 뒤, [초기 마운트 프로필](docs/initial-mount-profile.md)에 따라 rootfs, 공유 `/dev`와 전용 소켓·블록 경로, `/proc`·`/sys`, vendor, 게스트 `/mnt`·미디어·data mirror, APEX와 linkerconfig를 구성합니다. APEX 추출·마운트 또는 linkerconfig 생성이 실패하면 준비도 실패합니다. 실제 mountinfo는 명령 결과와 `ssal logs`에 기록하고 작업 종료 시 마운트를 해제합니다. 이미지 해시와 APEX 추출에는 시간과 임시 공간이 필요하며 실제 기기에서는 SELinux 조건을 검증해야 합니다.
+
+모듈의 `sepolicy.rule`은 loop backing 파일용 `ssal_image_file` 타입과 커널 읽기 권한을 정의합니다. 새로 등록하는 system 이미지와 prepare 중 추출하는 APEX payload에 해당 SELinux 라벨을 적용하며, 정책이 로드되지 않거나 라벨 적용에 실패하면 작업도 실패합니다. 기존 system 이미지는 자동으로 변경하지 않으므로 개발 중 초기화 후 다시 등록해야 합니다. 모듈 설치 후 정책이 로드된 상태에서 등록하고, `ssal doctor PROFILE_NAME`에서 라벨을 확인하세요. 이 정책은 게스트 서비스의 SELinux 권한이나 호환성을 보장하지 않습니다.
+
+현재 이미지 검사는 ext4 매직과 복사 크기 및 SHA-256에 한정됩니다. 파일시스템의 완전성, Android 버전 및 기기 호환성은 확인하지 않습니다. 프로필에 기록한 기기 정보는 감지된 값이며 전환에 필요한 기기 설정은 아직 구현되지 않았습니다. 준비용 mount namespace와 마운트 구성은 구현했지만 게스트 서비스와 hot-switch는 구현되지 않아 `switch`와 `return`은 거부됩니다. 준비 성공은 Android 부팅 성공을 의미하지 않으며 실제 기기에서 검증되지 않았습니다.
+
+`prepare`는 linkerconfig 생성 이후 게스트 chroot·별도 자식의 `pivot_root`에서 동적 shell과 경로·userdata 쓰기/읽기를 검사합니다. `/tmp`·`/cache`는 RW tmpfs, `/metadata`·`/config`는 빈 RO tmpfs로 구성합니다. SELinux·fscrypt·VINTF와 Binder/property 공유 상태를 진단하고 정리 후 잔여 mount·세션 loop backing을 확인합니다. 진단 결과는 Android 서비스·FUSE·암호화·HAL 호환성이나 부팅 성공을 보장하지 않습니다.
+
+서비스 실행의 목표와 기동·종료·복구 조건은 [서비스 실행 계약](docs/service-execution-contract.md)에 정의했습니다. prepare는 linkerconfig 구조 요약, 식별자를 노출하지 않는 CE/DE 경로 정책 비교, shell 전용 SELinux 관찰과 VINTF의 `passed/failed/unavailable/error`를 출력하고 서비스별 기동 차단 사유를 확인합니다. 계약 검증은 구현했지만 private property/Binder·HAL 중계·서비스 런처는 아직 없으며 Android 서비스를 시작하지 않습니다.
 
 ## 빌드
 

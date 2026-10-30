@@ -1,0 +1,4 @@
+type ssal_image_file file_type
+typeattribute ssal_image_file data_file_type
+allow kernel ssal_image_file file read
+allow ksu ssal_image_file file { open read write getattr setattr relabelto unlink }

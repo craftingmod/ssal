@@ -1,7 +1,15 @@
 #[cfg(unix)]
+mod guest_mounts;
+#[cfg(unix)]
+mod guest_probe;
+#[cfg(unix)]
+mod prepare;
+#[cfg(unix)]
+mod service_contract;
+#[cfg(unix)]
 mod daemon {
     use sha2::{Digest, Sha256};
-    use ssal::unix::{receive, reply, valid_image_name, ROOT, VERSION};
+    use ssal::unix::{label_image, receive, reply, valid_image_name, ROOT, VERSION};
     use std::fs::{self, File, OpenOptions};
     use std::io::{self, Read, Seek, SeekFrom, Write};
     use std::os::fd::{AsRawFd, OwnedFd};
@@ -41,7 +49,13 @@ mod daemon {
             .unwrap_or_default()
             .as_millis()
     }
-    fn register(root: &Path, fd: OwnedFd, id: &str, image_name: &str) -> io::Result<String> {
+    fn register(
+        root: &Path,
+        fd: OwnedFd,
+        id: &str,
+        image_name: &str,
+        label: impl FnOnce(&File) -> io::Result<()>,
+    ) -> io::Result<String> {
         let mut input = File::from(fd);
         let meta = input.metadata()?;
         if !meta.is_file() || meta.len() < 2048 {
@@ -79,6 +93,7 @@ mod daemon {
                 .create_new(true)
                 .mode(0o600)
                 .open(temp.join("system.img"))?;
+            label(&out)?;
             let mut hash = Sha256::new();
             let mut buf = vec![0; 1024 * 1024];
             let mut size = 0u64;
@@ -150,13 +165,10 @@ mod daemon {
             images.join("\n")
         })
     }
-    const USERDATA_SIZE: u64 = 2 * 1024 * 1024 * 1024;
-
     fn create_profile(
         root: &Path,
         image_name: &str,
         requested: Option<&str>,
-        formatter: &Path,
     ) -> io::Result<String> {
         if !valid_image_name(image_name) || requested.is_some_and(|name| !valid_image_name(name)) {
             return Err(io::Error::new(
@@ -190,35 +202,9 @@ mod daemon {
         let temp = profiles.join(format!(".create-{name}"));
         fs::create_dir(&temp)?;
         let result = (|| {
-            let data = temp.join("userdata.img");
-            let file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&data)?;
-            file.set_len(USERDATA_SIZE)?;
-            file.sync_all()?;
-            drop(file);
-            let output = Command::new(formatter)
-                .args([
-                    "-t",
-                    "ext4",
-                    "-F",
-                    "-b",
-                    "4096",
-                    "-m",
-                    "0",
-                    "-L",
-                    "ssal-data",
-                ])
-                .arg(&data)
-                .output()?;
-            if !output.status.success() {
-                return Err(io::Error::other(format!(
-                    "userdata formatting failed: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
-                )));
-            }
+            let data = temp.join("userdata");
+            fs::create_dir(&data)?;
+            fs::set_permissions(&data, fs::Permissions::from_mode(0o700))?;
             File::open(&data)?.sync_all()?;
             let property = |key: &str| -> Option<String> {
                 let output = Command::new("/system/bin/getprop").arg(key).output().ok()?;
@@ -228,9 +214,10 @@ mod daemon {
                 let value = String::from_utf8(output.stdout).ok()?.trim().to_owned();
                 (!value.is_empty()).then_some(value)
             };
-            let manifest = serde_json::json!({"version": 1, "name": name, "image_name": image_name, "image_id": id,
+            let manifest = serde_json::json!({"version": 2, "name": name, "image_name": image_name, "image_id": id,
+                "mount_profile": super::guest_mounts::PROFILE_NAME,
                 "device": {"product_device": property("ro.product.device"), "product_model": property("ro.product.model"), "build_fingerprint": property("ro.build.fingerprint"), "configuration": null},
-                "userdata": {"path": "userdata.img", "format": "ext4", "size": USERDATA_SIZE}, "compatibility": "unverified"});
+                "userdata": {"path": "userdata", "format": "directory"}, "compatibility": "unverified"});
             atomic(
                 &temp.join("profile.json"),
                 serde_json::to_vec_pretty(&manifest)?.as_slice(),
@@ -238,7 +225,7 @@ mod daemon {
             File::open(&temp)?.sync_all()?;
             fs::rename(&temp, &destination)?;
             File::open(&profiles)?.sync_all()?;
-            Ok(format!("created profile {name} for {image_name} ({id}); userdata: 2 GiB ext4; device compatibility unverified"))
+            Ok(format!("created profile {name} for {image_name} ({id}); userdata: directory; device compatibility unverified"))
         })();
         if result.is_err() {
             let _ = fs::remove_dir_all(&temp);
@@ -264,6 +251,38 @@ mod daemon {
         } else {
             names.join("\n")
         })
+    }
+    fn remove_profile(root: &Path, name: &str) -> io::Result<()> {
+        if !valid_image_name(name) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid profile name",
+            ));
+        }
+        let profiles = root.join("guests");
+        let path = profiles.join(name);
+        if !fs::symlink_metadata(&path)?.is_dir()
+            || !fs::symlink_metadata(path.join("profile.json"))?.is_file()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "not a profile directory",
+            ));
+        }
+        let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
+        let prefix = format!("{}/", path.display());
+        if mountinfo
+            .lines()
+            .filter_map(|line| line.split_whitespace().nth(4))
+            .any(|mount| mount == path.to_string_lossy() || mount.starts_with(&prefix))
+        {
+            return Err(io::Error::other(
+                "profile contains a mount; refusing to remove it",
+            ));
+        }
+        fs::remove_dir_all(&path)?;
+        File::open(profiles)?.sync_all()?;
+        Ok(())
     }
     fn peer_root(s: &UnixStream) -> io::Result<bool> {
         let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
@@ -293,7 +312,29 @@ mod daemon {
         }
         match req.command.as_str() {
             "status" => { let job = fs::read_to_string(root.join("state/last-job.json")).unwrap_or_else(|_| "none".into()); let images = image_list(&root)?; let profiles = profile_list(&root)?; reply(&mut stream, true, format!("HOST_ACTIVE\nimages:\n{images}\nprofiles:\n{profiles}\nlast job: {job}")) }
+            "doctor" if req.profile_name.is_some() => {
+                match super::prepare::check(&root, req.profile_name.as_deref().unwrap()) {
+                    Ok(profile) => reply(&mut stream, true, profile.report),
+                    Err(e) => reply(&mut stream, false, format!("profile check failed: {e}")),
+                }
+            }
             "doctor" => reply(&mut stream, true, format!("daemon and root socket: OK\nmount namespace: {}\nloop control: {}\ndevice profile, Binder, property, HAL and guest services: not implemented; switching unavailable", Path::new("/proc/self/ns/mnt").exists(), Path::new("/dev/loop-control").exists())),
+            "prepare" => {
+                let Some(name) = req.profile_name.as_deref().filter(|name| valid_image_name(name)) else { return reply(&mut stream, false, "invalid profile name"); };
+                let guard = busy.lock().unwrap();
+                if *guard { return reply(&mut stream, false, "another operation is running"); }
+                let result = prepare_session(&root, name);
+                match result { Ok(message) => { log(&root, &message); reply(&mut stream, true, message) }, Err(e) => { let message = format!("prepare failed: {e}"); log(&root, &message); reply(&mut stream, false, message) } }
+            }
+            "remove" => {
+                let Some(name) = req.profile_name.as_deref().filter(|name| valid_image_name(name)) else { return reply(&mut stream, false, "invalid profile name"); };
+                let Ok(guard) = busy.try_lock() else { return reply(&mut stream, false, "another operation is running"); };
+                if *guard { return reply(&mut stream, false, "another operation is running"); }
+                match remove_profile(&root, name) {
+                    Ok(()) => { let message = format!("removed profile {name} and its userdata"); log(&root, &message); reply(&mut stream, true, message) },
+                    Err(e) => reply(&mut stream, false, format!("profile removal failed: {e}")),
+                }
+            }
             "stop-for-restart" => {
                 let guard = busy.lock().unwrap();
                 if *guard { return reply(&mut stream, false, "an operation is running; try again later"); }
@@ -302,13 +343,13 @@ mod daemon {
             }
             "logs" => reply(&mut stream, true, fs::read_to_string(root.join("logs/ssald.log")).unwrap_or_default()),
             "switch" if !req.image_name.as_deref().is_some_and(valid_image_name) => reply(&mut stream, false, "invalid image name"),
-            "switch" | "return" => reply(&mut stream, false, "hot-switch is unavailable: device profile and guest service isolation have not been implemented or validated"),
+            "switch" | "return" => reply(&mut stream, false, super::service_contract::blocked_summary()?),
             "create" => {
                 let Some(image_name) = req.image_name.as_deref().filter(|name| valid_image_name(name)) else { return reply(&mut stream, false, "invalid image name"); };
                 if req.profile_name.as_deref().is_some_and(|name| !valid_image_name(name)) { return reply(&mut stream, false, "invalid profile name"); }
                 let guard = busy.lock().unwrap();
                 if *guard { return reply(&mut stream, false, "another operation is running"); }
-                let result = create_profile(&root, image_name, req.profile_name.as_deref(), Path::new("/system/bin/mke2fs"));
+                let result = create_profile(&root, image_name, req.profile_name.as_deref());
                 match result { Ok(message) => reply(&mut stream, true, message), Err(e) => reply(&mut stream, false, format!("profile creation failed: {e}")) }
             }
             "add" => {
@@ -321,7 +362,7 @@ mod daemon {
                 drop(guard);
                 let job_id = id.clone();
                 std::thread::spawn(move || {
-                    let result = register(&root, fd, &job_id, &image_name);
+                    let result = register(&root, fd, &job_id, &image_name, label_image);
                     let (status, message) = match result { Ok(s) => ("completed", s), Err(e) => ("failed", e.to_string()) };
                     let record = serde_json::json!({"id":job_id,"operation":"add","image_name":image_name,"status":status,"message":message});
                     if let Err(e) = atomic(&journal, record.to_string().as_bytes()) { log(&root, &format!("journal update failed: {e}")); }
@@ -331,6 +372,73 @@ mod daemon {
             }
             _ => reply(&mut stream, false, "unknown command")
         }
+    }
+    fn prepare_session(root: &Path, name: &str) -> io::Result<String> {
+        let profile = super::prepare::check(root, name)?;
+        let base = root
+            .join("mnt")
+            .join(format!("prepare-{}-{}", std::process::id(), now()));
+        fs::create_dir(&base)?;
+        let result = (|| {
+            fs::create_dir(base.join("system"))?;
+            fs::create_dir(base.join("data"))?;
+            let output = Command::new(std::env::current_exe()?)
+                .arg("--prepare-worker")
+                .arg(&profile.system)
+                .arg(&profile.userdata)
+                .arg(&base)
+                .output()?;
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if !output.status.success() {
+                return Err(io::Error::other(format!(
+                    "{}\nworker exited {}\n{stdout}{stderr}",
+                    profile.report, output.status
+                )));
+            }
+            Ok(format!(
+                "{}\n{stdout}prepare complete; worker exited; session-path host mounts checked absent",
+                profile.report
+            ))
+        })();
+        let mut cleanup = Vec::new();
+        // Inspect this namespace explicitly before removing session scratch.
+        // Worker exit alone is not proof that every namespace reference is gone.
+        let host_mounts = fs::read_to_string("/proc/self/mountinfo")?;
+        if host_mounts
+            .lines()
+            .filter_map(|line| line.split_whitespace().nth(4))
+            .any(|path| Path::new(path).starts_with(&base))
+        {
+            return Err(io::Error::other(format!("host namespace still has a mount under {}; scratch cleanup refused; previous result: {result:?}", base.display())));
+        }
+        log(
+            root,
+            "prepare host namespace residual mount check: verified absent for session path",
+        );
+        for scratch in ["rootfs", "apex-cache", "loop-devices"] {
+            let path = base.join(scratch);
+            if let Err(e) = fs::remove_dir_all(&path) {
+                if e.kind() != io::ErrorKind::NotFound {
+                    cleanup.push(format!("{}: {e}", path.display()));
+                }
+            }
+        }
+        for path in [base.join("data"), base.join("system"), base.clone()] {
+            if let Err(e) = fs::remove_dir(&path) {
+                if e.kind() != io::ErrorKind::NotFound {
+                    cleanup.push(format!("{}: {e}", path.display()));
+                }
+            }
+        }
+        if !cleanup.is_empty() {
+            return Err(io::Error::other(format!(
+                "temporary directory cleanup failed: {}; previous result: {:?}",
+                cleanup.join(", "),
+                result
+            )));
+        }
+        result
     }
     pub fn run() -> io::Result<()> {
         if unsafe { libc::geteuid() } != 0 {
@@ -421,32 +529,32 @@ mod daemon {
             fs::create_dir_all(root.join("guests"))?;
             fs::write(root.join("images/id-1/system.img"), b"image")?;
             fs::write(root.join("state/image-refs/lineage"), b"id-1")?;
-            // A fake formatter checks the creation flow without allocating a real filesystem.
-            let formatter = root.join("formatter");
-            fs::write(&formatter, b"#!/bin/sh\nexit 0\n")?;
-            fs::set_permissions(&formatter, fs::Permissions::from_mode(0o700))?;
-            create_profile(&root, "lineage", None, &formatter)?;
-            create_profile(&root, "lineage", None, &formatter)?;
+            create_profile(&root, "lineage", None)?;
+            create_profile(&root, "lineage", None)?;
             let profile: serde_json::Value =
                 serde_json::from_slice(&fs::read(root.join("guests/profile1/profile.json"))?)?;
             assert_eq!(profile["image_id"], "id-1");
+            assert_eq!(profile["userdata"]["format"], "directory");
             assert_eq!(
-                fs::metadata(root.join("guests/profile1/userdata.img"))?.len(),
-                USERDATA_SIZE
+                profile["mount_profile"],
+                super::super::guest_mounts::PROFILE_NAME
             );
+            assert!(root.join("guests/profile1/userdata").is_dir());
             assert!(root.join("guests/profile2/profile.json").exists());
-            assert!(create_profile(&root, "lineage", Some("profile1"), &formatter).is_err());
-            assert!(create_profile(&root, "missing", Some("other"), &formatter).is_err());
-            assert!(create_profile(&root, "lineage", Some("../bad"), &formatter).is_err());
-            assert!(create_profile(
-                &root,
-                "lineage",
-                Some("failed"),
-                Path::new("/no/such/formatter")
-            )
-            .is_err());
-            assert!(!root.join("guests/failed").exists());
-            assert!(!root.join("guests/.create-failed").exists());
+            assert!(create_profile(&root, "lineage", Some("profile1")).is_err());
+            assert!(create_profile(&root, "missing", Some("other")).is_err());
+            assert!(create_profile(&root, "lineage", Some("../bad")).is_err());
+            fs::write(root.join("guests/profile1/userdata/example"), b"data")?;
+            std::os::unix::fs::symlink(
+                root.join("images/id-1"),
+                root.join("guests/profile1/userdata/link"),
+            )?;
+            remove_profile(&root, "profile1")?;
+            assert!(!root.join("guests/profile1").exists());
+            assert!(root.join("guests/profile2/profile.json").exists());
+            assert!(root.join("images/id-1/system.img").exists());
+            assert!(remove_profile(&root, "profile1").is_err());
+            assert!(remove_profile(&root, "../images").is_err());
             fs::remove_dir_all(root)?;
             Ok(())
         }
@@ -474,9 +582,24 @@ mod daemon {
             let mut bytes = vec![0u8; 4096];
             bytes[1080..1082].copy_from_slice(&[0x53, 0xef]);
             fs::write(&source, bytes)?;
-            register(&root, File::open(&source)?.into(), "first", "alpha")?;
-            register(&root, File::open(&source)?.into(), "second", "beta")?;
-            register(&root, File::open(&source)?.into(), "third", "alpha")?;
+            register(&root, File::open(&source)?.into(), "first", "alpha", |_| {
+                Ok(())
+            })?;
+            register(&root, File::open(&source)?.into(), "second", "beta", |_| {
+                Ok(())
+            })?;
+            register(&root, File::open(&source)?.into(), "third", "alpha", |_| {
+                Ok(())
+            })?;
+            assert!(register(
+                &root,
+                File::open(&source)?.into(),
+                "failed",
+                "alpha",
+                |_| Err(io::Error::other("label failed"))
+            )
+            .is_err());
+            assert!(!root.join("images/.tmp-failed").exists());
             assert_eq!(
                 fs::read_to_string(root.join("state/image-refs/alpha"))?,
                 "third"
@@ -502,6 +625,22 @@ mod daemon {
 }
 #[cfg(unix)]
 fn main() {
+    let args: Vec<_> = std::env::args_os().collect();
+    if args.get(1).is_some_and(|arg| arg == "--prepare-worker") {
+        if args.len() != 5 || unsafe { libc::geteuid() } != 0 {
+            eprintln!("invalid prepare worker invocation");
+            std::process::exit(1);
+        }
+        if let Err(e) = prepare::worker(
+            std::path::Path::new(&args[2]),
+            std::path::Path::new(&args[3]),
+            std::path::Path::new(&args[4]),
+        ) {
+            eprintln!("prepare worker: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if let Err(e) = daemon::run() {
         eprintln!("ssald: {e}");
         std::process::exit(1);

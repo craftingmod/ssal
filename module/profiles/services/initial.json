@@ -1,0 +1,65 @@
+{
+  "version": 1,
+  "name": "isolated-userspace-v1",
+  "launch_enabled": false,
+  "supervisor": "explicit-services-no-android-init",
+  "properties": {
+    "mode": "private-area-and-service",
+    "initial_values": "guest-partition-files",
+    "persistent_directory": "/data/property",
+    "host_read_allowlist": [],
+    "host_write_allowlist": [],
+    "forward_ctl": false
+  },
+  "binder": {
+    "framework": "private-context",
+    "host_hal": "per-interface-bridge",
+    "hal_allowlist": [],
+    "register_on_host": false
+  },
+  "selinux": {"permissive": false, "proof": "per-service-transition-and-runtime-domain"},
+  "lifecycle": {
+    "stop": "reverse-dependency-order",
+    "timeout": "term-then-kill-owned-processes",
+    "restore": "journaled-host-changes-only",
+    "failure": "recovery-required",
+    "writes": "quiesce-before-unmount"
+  },
+  "services": [
+    {
+      "name": "property_service", "launch": "exec", "executable": "/run/ssal/property-service", "domain": "u:r:ssal_property:s0",
+      "depends_on": [], "write_paths": ["/dev/__properties__", "/dev/socket", "/data/property"],
+      "requires": ["root_and_userdata", "journal", "execution_spec", "selinux_transition", "private_property_storage", "property_access_policy"]
+    },
+    {
+      "name": "servicemanager", "launch": "exec", "executable": "/system/bin/servicemanager", "domain": "u:r:servicemanager:s0",
+      "depends_on": ["property_service"], "write_paths": [],
+      "requires": ["root_and_userdata", "journal", "execution_spec", "selinux_transition", "properties_ready", "private_framework_binder"]
+    },
+    {
+      "name": "installd", "launch": "exec", "executable": "/system/bin/installd", "domain": "u:r:installd:s0",
+      "depends_on": ["servicemanager"], "write_paths": ["/data/app", "/data/app-staging", "/data/user", "/data/user_de", "/data/misc/profiles", "/data/dalvik-cache"],
+      "requires": ["root_and_userdata", "journal", "execution_spec", "selinux_transition", "properties_ready", "private_framework_binder", "userdata_labels", "userdata_crypto_policy"]
+    },
+    {
+      "name": "artd", "launch": "exec", "executable": "/apex/com.android.art/bin/artd", "domain": "u:r:artd:s0",
+      "depends_on": ["installd"], "write_paths": ["/data/dalvik-cache", "/data/misc/profiles", "/data/app", "/data/user", "/data/user_de"],
+      "requires": ["root_and_userdata", "journal", "execution_spec", "selinux_transition", "properties_ready", "private_framework_binder", "userdata_labels", "userdata_crypto_policy"]
+    },
+    {
+      "name": "vold", "launch": "exec", "executable": "/system/bin/vold", "domain": "u:r:vold:s0",
+      "depends_on": ["servicemanager"], "write_paths": ["/data", "/mnt", "/storage", "/data_mirror"],
+      "requires": ["root_and_userdata", "journal", "execution_spec", "selinux_transition", "properties_ready", "private_framework_binder", "storage_ownership", "userdata_crypto_policy", "guest_metadata_policy"]
+    },
+    {
+      "name": "zygote", "launch": "exec", "executable": "/system/bin/app_process64", "domain": "u:r:zygote:s0",
+      "depends_on": ["artd", "vold"], "write_paths": ["/data", "/dev/socket", "/mnt", "/storage"],
+      "requires": ["root_and_userdata", "journal", "execution_spec", "selinux_transition", "properties_ready", "private_framework_binder", "device_vintf", "hal_bridge", "app_storage_permissions"]
+    },
+    {
+      "name": "system_server", "launch": "zygote-child", "executable": null, "domain": "u:r:system_server:s0",
+      "depends_on": ["zygote"], "write_paths": ["/data", "/mnt", "/storage"],
+      "requires": ["root_and_userdata", "journal", "execution_spec", "selinux_transition", "properties_ready", "private_framework_binder", "device_vintf", "hal_bridge", "app_storage_permissions"]
+    }
+  ]
+}

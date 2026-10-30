@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "name": "initial-shared-dev",
+  "core": {
+    "system": "registered-image-ro",
+    "data": "profile-userdata-rw",
+    "dev": "host-rbind-private",
+    "proc": "fresh-proc",
+    "sys": "fresh-sysfs-ro",
+    "apex": "payload-ext4-ro",
+    "linkerconfig": "guest-generated"
+  },
+  "tmpfs": ["dev/socket", "dev/block", "mnt", "storage", "data_mirror", "apex", "linkerconfig", "run"],
+  "runtime_tmpfs": [
+    {"path": "tmp", "mode": "1777", "uid": 0, "gid": 0, "readonly": false},
+    {"path": "cache", "mode": "0770", "uid": 1000, "gid": 2001, "readonly": false},
+    {"path": "metadata", "mode": "0700", "uid": 0, "gid": 0, "readonly": true},
+    {"path": "config", "mode": "0755", "uid": 0, "gid": 0, "readonly": true}
+  ],
+  "host_readonly": ["vendor", "odm", "vendor_dlkm"],
+  "host_runtime": [
+    {"path": "sys/fs/selinux", "readonly": true},
+    {"path": "sys/fs/cgroup", "readonly": false},
+    {"path": "sys/fs/bpf", "readonly": false}
+  ],
+  "media_views": ["storage/emulated", "mnt/user/0/emulated", "mnt/installer/0/emulated", "mnt/androidwritable/0/emulated"],
+  "patches": [
+    {"source": "services_patched.jar", "target": "system/framework/services.jar"},
+    {"source": "framework_patched.jar", "target": "system/framework/framework.jar"},
+    {"source": "framework-res_patched.apk", "target": "system/framework/framework-res.apk"},
+    {"source": "libaudio_aidl_conversion_common_cpp_patched.so", "target": "system/lib64/libaudio_aidl_conversion_common_cpp.so"},
+    {"source": "libaudioclient_aidl_conversion_patched.so", "target": "system/lib64/libaudioclient_aidl_conversion.so"},
+    {"source": "extservices_permissions", "target": "apex/com.android.extservices/etc/permissions"}
+  ]
+}
