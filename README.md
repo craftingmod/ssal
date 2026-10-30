@@ -1,5 +1,10 @@
 # ssal
 
+SSAL — System Switching Abstraction Layer.
+> The name came first. The acronym came later.
+
+## AGENT
+
 KernelSU 모듈과 Android arm64 CLI의 초기 구현입니다. `ssald`가 root 전용 소켓을 제공하며 `ssal doctor`, `ssal status`, `ssal logs`, `ssal add <image_name> <raw-ext4-image>`를 지원합니다. 이미지 이름은 영문 대소문자, 숫자, `_`, `-`로 1~64자까지 지정합니다. 이름별로 이미지를 등록하며 `ssal status`에서 목록과 백그라운드 작업 결과를 확인합니다. 기존 `lineage` 등록은 업데이트 후 그대로 유지됩니다. 원본은 변경하지 않고 복사하며, 재등록 시 기존 userdata는 건드리지 않습니다.
 
 `ssal create IMAGE_NAME [PROFILE_NAME]`은 등록된 이미지의 현재 ID를 고정하고 기기 정보와 프로필별 userdata 디렉터리를 생성합니다. 이름을 생략하면 사용하지 않는 `profile1`, `profile2` 등을 선택합니다. 기존 프로필은 덮어쓰지 않습니다. 프로필은 `ssal status`에서 확인하고, 데이터와 설정은 `/data/local/ssal/guests/PROFILE_NAME/`에 보존됩니다. 이전 userdata 이미지 방식의 프로필은 지원하지 않으며 자동 변환하지 않습니다.
@@ -33,3 +38,5 @@ bun run setup:windows
 WebUI 소스는 `frontend/`에 있으며 `bun run build:web`으로 `out/webroot/`에 빌드합니다. `bun run package`는 빌드된 바이너리와 WebUI를 모듈 ZIP으로 묶습니다. KernelSU 모듈 WebUI의 버튼으로 데몬을 재시작할 수 있으며, 이미지 등록 중에는 재시작이 거부됩니다.
 
 상세 목표와 남은 단계는 [아키텍처](docs/architecture.md)를 참고하세요.
+
+SELinux 전환 사전 검사는 `ssal probe-selinux-transition PROFILE_NAME`으로 실행합니다. [검사 범위와 기기 결과](docs/selinux-transition-probe.md)를 참고하세요.

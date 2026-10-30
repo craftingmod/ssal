@@ -7,6 +7,8 @@ mod guest_probe;
 #[cfg(unix)]
 mod prepare;
 #[cfg(unix)]
+mod selinux_probe;
+#[cfg(unix)]
 mod service_contract;
 #[cfg(unix)]
 mod daemon {
@@ -321,11 +323,11 @@ mod daemon {
                 }
             }
             "doctor" => reply(&mut stream, true, format!("daemon and root socket: OK\nmount namespace: {}\nloop control: {}\ndevice profile, Binder, property, HAL and guest services: not implemented; switching unavailable", Path::new("/proc/self/ns/mnt").exists(), Path::new("/dev/loop-control").exists())),
-            "prepare" | "probe-binder" => {
+            "prepare" | "probe-binder" | "probe-selinux-transition" => {
                 let Some(name) = req.profile_name.as_deref().filter(|name| valid_image_name(name)) else { return reply(&mut stream, false, "invalid profile name"); };
                 let guard = busy.lock().unwrap();
                 if *guard { return reply(&mut stream, false, "another operation is running"); }
-                let result = prepare_session(&root, name, req.command == "probe-binder");
+                let result = prepare_session(&root, name, &req.command);
                 match result { Ok(message) => { log(&root, &message); reply(&mut stream, true, message) }, Err(e) => { let message = format!("prepare failed: {e}"); log(&root, &message); reply(&mut stream, false, message) } }
             }
             "remove" => {
@@ -375,7 +377,7 @@ mod daemon {
             _ => reply(&mut stream, false, "unknown command")
         }
     }
-    fn prepare_session(root: &Path, name: &str, binder_probe: bool) -> io::Result<String> {
+    fn prepare_session(root: &Path, name: &str, mode: &str) -> io::Result<String> {
         let profile = super::prepare::check(root, name)?;
         let base = root
             .join("mnt")
@@ -385,10 +387,10 @@ mod daemon {
             fs::create_dir(base.join("system"))?;
             fs::create_dir(base.join("data"))?;
             let output = Command::new(std::env::current_exe()?)
-                .arg(if binder_probe {
-                    "--binder-probe-worker"
-                } else {
-                    "--prepare-worker"
+                .arg(match mode {
+                    "probe-binder" => "--binder-probe-worker",
+                    "probe-selinux-transition" => "--selinux-probe-worker",
+                    _ => "--prepare-worker",
                 })
                 .arg(&profile.system)
                 .arg(&profile.userdata)
@@ -632,10 +634,11 @@ mod daemon {
 #[cfg(unix)]
 fn main() {
     let args: Vec<_> = std::env::args_os().collect();
-    if args
-        .get(1)
-        .is_some_and(|arg| arg == "--prepare-worker" || arg == "--binder-probe-worker")
-    {
+    if args.get(1).is_some_and(|arg| {
+        arg == "--prepare-worker"
+            || arg == "--binder-probe-worker"
+            || arg == "--selinux-probe-worker"
+    }) {
         if args.len() != 5 || unsafe { libc::geteuid() } != 0 {
             eprintln!("invalid prepare worker invocation");
             std::process::exit(1);
@@ -644,7 +647,7 @@ fn main() {
             std::path::Path::new(&args[2]),
             std::path::Path::new(&args[3]),
             std::path::Path::new(&args[4]),
-            args[1] == "--binder-probe-worker",
+            args[1].to_str().unwrap_or(""),
         ) {
             eprintln!("prepare worker: {e}");
             std::process::exit(1);

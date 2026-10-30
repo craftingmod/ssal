@@ -771,7 +771,7 @@ pub fn verify(
     userdata: &Path,
     base: &Path,
     loop_nodes: &crate::prepare::LoopNodes,
-    binder_probe: bool,
+    mode: &str,
 ) -> io::Result<()> {
     let profile = profile()?;
     let root = base.join("rootfs");
@@ -937,8 +937,11 @@ pub fn verify(
         linkerconfig(&root)?;
         let probe = crate::guest_probe::verify(&root, userdata)?;
         crate::service_contract::report(&root, &probe)?;
-        if binder_probe {
+        if mode == "--binder-probe-worker" {
             crate::binder_probe::verify(&root)?;
+        }
+        if mode == "--selinux-probe-worker" {
+            crate::selinux_probe::verify(&root)?;
         }
         same_directory(userdata, &root.join("data"))?;
         println!("mount profile: {}\nrootfs: {}\nmedia views: verified against guest /data/media\nshared /dev: Binder/properties/devices shared; sockets and block paths masked\nchroot/pivot_root dynamic shell and userdata write/read: verified\nAPEX activation, guest services, FUSE permissions, SELinux compatibility: NOT validated", profile.name, root.display());

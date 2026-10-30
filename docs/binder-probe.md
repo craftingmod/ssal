@@ -63,4 +63,4 @@ bash scripts/build-binder-probe.sh /src/PATH_TO_GUEST_LIBRARIES
 - private Binder mount 정리와 rootfs 잔여 mount 검사 성공, 세션 loop backing 55개 해제 확인.
 - 호스트 Zygote/SurfaceFlinger의 PID 유지, SELinux Enforcing 유지.
 
-이는 Host registry에 guest 서비스가 보이지 않는다는 Test B의 증명이 아니다. 다음 단계는 새 binderfs 세션에서 guest servicemanager의 실제 도메인·service_contexts·등록/검색/호스트 비노출을 검증하는 것이다. Property 초기화·HAL 중계와 전체 Android 부팅은 그 뒤의 작업이다.
+이는 Host registry에 guest 서비스가 보이지 않는다는 Test B의 증명이 아니다. 다음 단계는 새 binderfs 세션에서 guest servicemanager의 실제 도메인·service_contexts·등록/검색/양방향 비노출을 검증하는 것이다. 구체적인 작업과 Host property 불변성·SELinux 전환·권한 판정·프로세스 정리·독립 결과 기준은 [`probe-servicemanager` 구현 계획](servicemanager-probe-plan.md)에 정의한다. 이 시험 명령은 아직 구현되지 않았으며 운영 서비스의 `launch_enabled=false`는 유지한다. Property 초기화·HAL 중계와 전체 Android 부팅은 그 뒤의 작업이다.

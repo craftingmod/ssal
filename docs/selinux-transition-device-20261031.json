@@ -1,0 +1,96 @@
+{
+  "actual_exec_transition": "not_run",
+  "block_reason": "permissive_source_domain_prevents_enforcing_validation",
+  "boot_id": "22419c4a-6ae5-4533-9c81-ef709df3a058",
+  "child_reaped": true,
+  "decisions": [
+    {
+      "allowed": true,
+      "class": "process",
+      "permission": "setexec",
+      "permissive_domain": true,
+      "sequence": 1,
+      "source": "u:r:ksu:s0",
+      "target": "u:r:ksu:s0"
+    },
+    {
+      "allowed": true,
+      "class": "process",
+      "permission": "transition",
+      "permissive_domain": true,
+      "sequence": 1,
+      "source": "u:r:ksu:s0",
+      "target": "u:r:servicemanager:s0"
+    },
+    {
+      "allowed": true,
+      "class": "file",
+      "permission": "entrypoint",
+      "permissive_domain": false,
+      "sequence": 1,
+      "source": "u:r:servicemanager:s0",
+      "target": "u:object_r:servicemanager_exec:s0"
+    },
+    {
+      "allowed": true,
+      "class": "file",
+      "permission": "execute",
+      "permissive_domain": true,
+      "sequence": 1,
+      "source": "u:r:ksu:s0",
+      "target": "u:object_r:servicemanager_exec:s0"
+    },
+    {
+      "allowed": true,
+      "class": "file",
+      "permission": "open",
+      "permissive_domain": true,
+      "sequence": 1,
+      "source": "u:r:ksu:s0",
+      "target": "u:object_r:servicemanager_exec:s0"
+    },
+    {
+      "allowed": true,
+      "class": "file",
+      "permission": "read",
+      "permissive_domain": true,
+      "sequence": 1,
+      "source": "u:r:ksu:s0",
+      "target": "u:object_r:servicemanager_exec:s0"
+    },
+    {
+      "allowed": true,
+      "class": "file",
+      "permission": "getattr",
+      "permissive_domain": true,
+      "sequence": 1,
+      "source": "u:r:ksu:s0",
+      "target": "u:object_r:servicemanager_exec:s0"
+    },
+    {
+      "allowed": true,
+      "class": "file",
+      "permission": "map",
+      "permissive_domain": true,
+      "sequence": 1,
+      "source": "u:r:ksu:s0",
+      "target": "u:object_r:servicemanager_exec:s0"
+    }
+  ],
+  "entrypoint_label": "u:object_r:servicemanager_exec:s0",
+  "guest_executable": "/data/local/ssal/mnt/selinux-probe-20261031-04/rootfs/system/bin/servicemanager",
+  "guest_security_boundary_verified": false,
+  "pending_exec_errno": 0,
+  "policy_av_sequence_and_parent_unchanged": true,
+  "policy_hash_error": "Invalid argument (os error 22)",
+  "policy_hash_same": null,
+  "policy_modified": false,
+  "policy_sha256": null,
+  "prerequisites": "failed",
+  "queried_permissions_allowed": true,
+  "servicemanager": "not_run",
+  "source": "u:r:ksu:s0",
+  "source_domain_enforcing": false,
+  "target": "u:r:servicemanager:s0",
+  "validation_scope": "policy_prerequisites_and_pending_exec_only"
+}
