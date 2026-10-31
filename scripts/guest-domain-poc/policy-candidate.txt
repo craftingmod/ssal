@@ -1,0 +1,7 @@
+# Review-only conditional delta. Not complete, not verified against current policy,
+# never loaded automatically. Existing Host source AVs remain subject to checking.
+# Shared attributes and their global effects require separate review.
+type ssal_guest_probe domain
+type ssal_guest_probe_exec file_type
+allow ksu ssal_guest_probe process transition
+allow ssal_guest_probe ssal_guest_probe_exec file entrypoint

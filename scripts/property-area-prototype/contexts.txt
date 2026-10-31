@@ -1,0 +1,2 @@
+demo. u:object_r:ssal_demo_prop:s0 prefix string
+demo.only u:object_r:ssal_private_prop:s0 exact string

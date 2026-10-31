@@ -1,0 +1,5 @@
+import {test,expect} from 'bun:test';
+import {compare} from './compare-snapshots.js';
+const snapshot=()=>({captured_at:'2026-10-31T00:00:00Z',boot_id:'boot',fingerprint:'fingerprint',enforce:1,av_sequence:1,policy_sha256:null,host_av:{'host-a':true},processes:Object.fromEntries(['init','servicemanager','zygote64','system_server','surfaceflinger'].map((p,i)=>[p,{pid:i+1,start_time:'1',context:'u:r:x:s0',executable:'/system/x'}]))});
+test('fails closed for incomplete evidence and changed Host process or AV',()=>{const a=snapshot(),b=snapshot(); expect(compare(a,b,'probe').ok).toBe(true); delete b.processes.init; expect(compare(a,b,'probe').ok).toBe(false); const c=snapshot();c.host_av['host-a']=false;expect(compare(a,c,'apply').ok).toBe(false);});
+test('sequence change is expected during apply but not during probe',()=>{const a=snapshot(),b=snapshot();b.av_sequence=2;expect(compare(a,b,'apply').ok).toBe(true);expect(compare(a,b,'probe').ok).toBe(false); expect(compare(a,b,'apply').policy_hash).toBe('unknown');});
