@@ -1,6 +1,6 @@
 # Guest Property Area 오프라인 프로토타입 — 2026-10-31
 
-합성 입력에서 Android 16 r2 AOSP property-info serializer의 exact/prefix 조회와 Bionic `prop_area`의 생성, 최초 값 기록, 파일 재매핑과 읽기가 통과했다. 별도 sentinel 파일은 Guest 기록의 영향을 받지 않았다. **실제 Android Guest의 격리나 Enforcing 동작은 아직 입증되지 않았고, 이 프로토타입은 Property Service가 아니다.** 두 시험은 독립적이다. serializer가 반환한 context로 area를 선택하는 통합 경로는 아직 없다.
+합성 입력에서 Android 16 r2 AOSP property-info serializer가 선택한 context를 기준으로 별도 Bionic `prop_area` 두 개에 값을 기록하고, 재매핑 후 조회하는 통합 시험이 통과했다. exact와 prefix 매칭, 알 수 없는 context 거부, 서로 다른 area의 교차 부재 및 별도 sentinel 불변도 확인했다. **실제 Android Guest의 격리나 Enforcing 동작은 아직 입증되지 않았고, 이 프로토타입은 Property Service가 아니다.** context와 area의 연결은 두 항목을 고정한 시험용 매핑이다.
 
 ## 실행과 범위
 

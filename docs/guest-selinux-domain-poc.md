@@ -1,13 +1,14 @@
 # Guest 전용 SELinux 도메인 PoC — 2026-10-31
 
-> 2026-11-01 승인된 계측 시험을 실기기에서 수행했다. SIGSEGV의 확인된 단계와 증거는 [SIGSEGV 분석](guest-selinux-sigsegv-analysis.md)을 따른다. 아래의 설계·정책 검토 기록에는 시험 전 상태가 남아 있다.
+> 후속 실기기 결과(사용자 제공): ssal_guest_probe Enforcing 전환, PTRACE_EVENT_EXEC, 실제 Child SID u:r:ssal_guest_probe:s0, Bare ELF 종료 코드 42 및 필요한 실행 AV 허용이 확인됐다. 따라서 아래 SIGSEGV 기록은 이전 실패의 역사적 증거이며 현재 전환 차단 조건은 아니다. 현 부팅 정책은 실행 전 읽기 전용으로 재확인하며 정책을 다시 적용하지 않는다.
 
-`ssal_guest_probe`에 대한 정책 후보와 고정 도메인 전환 런처를 유지한다. 기본 실행은 dry-run이다. 승인된 시험에서는 후보의 기존 네 문장만 현재 boot의 live policy에 적용하고 전용 Reporter 파일에 라벨을 설정했다. enforcing exec는 SIGSEGV로 실패했으며 자세한 단계 분석은 [별도 보고서](guest-selinux-sigsegv-analysis.md)에 있다. 정책 조각이 완전하거나 Guest 환경의 격리를 입증한다고 보지 않는다.
+ssal_guest_probe에 대한 정책 후보와 고정 도메인 전환 런처를 유지한다. 기본 실행은 dry-run이다. 이전 승인 시험의 실패 내용은 아래에 보존한다. 이후 전환 성공은 단일 Reporter 실행 증거이며 Guest 자원 격리나 Property Area 동작을 입증하지 않는다. 정책 조각이 완전하다고 보지 않는다.
 
 ## 파일과 실행
 
 - [정책 후보](../scripts/guest-domain-poc/policy-candidate.txt)는 전용 process 타입, 전용 실행 파일 타입과 그 파일의 entrypoint 후보만 담는다. 기존 Host 도메인의 규칙을 수정하는 후보는 포함하지 않는다. 공용 attribute 상속의 전역 영향은 미확인이다.
 - [런처](../src/bin/ssal-guest-domain-poc.rs)는 정책이나 라벨을 설정하지 않는다. 기존 [identity reporter](../src/bin/ssal-selinux-identity.rs)를 exec하고 결과를 확인한다. 서비스, Guest init, Zygote, Framework, Binder, property socket 및 인증 HAL은 실행하지 않는다.
+- Android Property Area live helper는 별도 [`--property-area-live-after-approval`](guest-property-area-live-poc.md) 모드에서만 실행한다. 해당 모드는 KSU child에서 private mount namespace와 tmpfs를 준비한 뒤 helper를 Guest로 전환하며, 정책 allow나 Host 라벨은 적용하지 않는다.
 
 ```sh
 # 해당 플랫폼용으로 빌드한 런처에서 인자 생략 시에도 dry-run
@@ -21,7 +22,7 @@ ssal-guest-domain-poc --dry-run
 ssal-guest-domain-poc --control /path/to/ssal-selinux-identity --sha256 REPORTER_HASH
 ```
 
-Android NDK 및 Rust 빌드에서 런처와 진단 Reporter를 생성했다. `cargo test --locked --bin ssal-guest-domain-poc`의 6개 테스트, Android AArch64 `cargo check` 및 release build가 통과했다. 실기기에서 무전환 대조군은 통과했고 전환군은 `execveat`/ELF 진입 전후 구간에서 SIGSEGV가 재현됐다.
+Android NDK 및 Rust 빌드에서 런처와 진단 Reporter를 생성했다. 최신 Property Area 작업에서 `cargo test --locked --bin ssal-guest-domain-poc`의 9개 테스트, Android AArch64 `cargo check` 및 release build가 통과했다. 아래 SIGSEGV 관측은 당시의 실기기 실패 기록이다.
 
 승인 후 실행 구문은 아래와 같다. `--run-after-approval`은 기술적 실행 가드이며 사용자 승인을 대신하지 않는다. 실제 명령에는 검토한 identity helper의 절대 경로와 승인된 SHA-256을 지정한다. 런처는 열린 파일의 해시를 실행 전후 검사한다. 그 사이의 수정 가능성은 남으므로 helper는 실행 도중 수정되지 않는 전용 파일이어야 한다.
 
@@ -39,7 +40,7 @@ ssal-guest-domain-poc --run-after-approval /절대경로/ssal-selinux-identity -
 
 설치된 `ksud sepolicy check`는 `type ssal_guest_probe domain`, `type ssal_guest_probe_exec file_type`, `allow ssal_guest_probe ssal_guest_probe_exec file entrypoint`, `permissive ssal_guest_probe`, `enforce ssal_guest_probe`를 각각 exit 0으로 파싱했고, 잘못된 문장은 exit 1이었다. 별도로 `allow ksu ssal_guest_probe process transition`의 문법도 확인했으나 Host 도메인 변경 제약 때문에 후보에 넣지 않았다. `check`는 파서 검사이며 타입 생성·attribute 존재·AV·실제 적용의 증거가 아니다.
 
-## 2026-11-01 승인 계측 시험
+## 2026-11-01 이전 승인 계측 시험 — 역사적 결과
 
 승인된 기존 네 정책 문장으로 시험했으며 추가 `allow`나 permissive 설정은 하지 않았다. 동일 런처의 Rust 대조군, 정적 C 대조군, libc 없는 bare ELF 대조군은 KSU context에서 통과했다. 각 전환군은 `setexec_open`과 `setexec_write` errno 0 이후 같은 SIGSEGV를 냈다. 3개 무-runtime ELF probe와 `exit_group(42)` probe로 실패가 Reporter `main` 이후가 아님을 확인했다. fault PC와 backtrace는 crash buffer/tombstone 미생성으로 확인하지 못했다. 전체 기록은 [SIGSEGV 분석 보고서](guest-selinux-sigsegv-analysis.md)에 있다.
 

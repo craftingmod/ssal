@@ -1,0 +1,7 @@
+; Offline analysis candidate only. Do not load as a device policy.
+(type ssal_guest_property_dir)
+(type ssal_guest_property_area)
+(typeattributeset file_type (ssal_guest_property_dir ssal_guest_property_area))
+(typetransition ssal_guest_probe ssal_guest_property_dir file ssal_guest_property_area)
+(allow ssal_guest_probe ssal_guest_property_dir (dir (getattr search write add_name)))
+(allow ssal_guest_probe ssal_guest_property_area (file (create getattr open read write map relabelfrom relabelto)))

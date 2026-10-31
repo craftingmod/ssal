@@ -1,5 +1,7 @@
 # Guest SELinux Identity Reporter SIGSEGV 분석
 
+**상태: 이전 실패의 역사적 분석.** 이후 실기기에서 Enforcing Guest 전환, PTRACE_EVENT_EXEC, 실제 SID u:r:ssal_guest_probe:s0 및 Bare ELF exit 42가 확인됐다는 후속 결과(사용자 제공)가 있다. 따라서 아래 SIGSEGV는 현재 전환의 차단 조건이 아니며, 이 기록은 그 이전 실행의 관측과 원인 미확정 상태를 보존한다.
+
 **결론:** SIGSEGV는 Reporter `main` 이후가 아니라, 성공한 `setexec` 준비 다음 `execveat`/ELF 진입 경로에서 발생한다. libc와 동적 링커가 없는 AArch64 probe도 전환 실행에서 SIGSEGV를 재현했다. 다만 crash buffer와 tombstone에 fault PC가 없어 커널 ELF 로딩과 첫 user instruction 경계 중 어느 주소에서 fault했는지, 정확한 원인은 아직 식별하지 못했다.
 
 ## 실행 결과
@@ -67,6 +69,6 @@ Rust `Command::pre_exec`와 `std::io::Error::last_os_error()` 경로를 제거�
 | libc 없는 context Reporter | `5181715c36e4db47ecf49e28edc545af81cce9cd348b727dd82f25e9c5e05d5c` |
 | `exit_group(42)` ELF | `e64760a5270c15b462e159f896ef7ead685916f5a8d289440aa5434b33bfa2e4` |
 
-## 다음 수정
+## 당시 제안된 후속 조사
 
 현 증거로 Reporter나 SELinux 정책을 수정하지 않는다. 확인된 결함 구간은 `setexec`가 아니라 exec/ELF handoff 단계다. 실제 원인 수정을 정하려면 다음 재현에서 fault PC/backtrace를 확보해야 한다. 이번에는 crash buffer와 tombstone이 비었으므로, fault 주소를 제공하는 기기 측 exec/crash 추적을 추가한 뒤 그 주소를 기준으로 수정한다. 그 전에는 정책 권한을 더하거나 Reporter를 임의 변경하지 않는다.

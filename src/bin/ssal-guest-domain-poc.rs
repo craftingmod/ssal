@@ -1,23 +1,167 @@
 //! Fixed-target transition probe. It never changes SELinux policy or labels.
 const TARGET: &str = "u:r:ssal_guest_probe:s0";
+const KSU: &str = "u:r:ksu:s0";
+const PROPERTY_AREA_CONTEXT: &str = "u:object_r:ssal_guest_property_area:s0";
+const PROPERTY_AREA_DIR_CONTEXT: &str = "u:object_r:ssal_guest_property_dir:s0";
+const PROPERTY_AREA_FS_CONTEXT: &str = "u:object_r:tmpfs:s0";
+const PROC_CONTEXT: &str = "u:object_r:proc:s0";
+const SYSFS_CONTEXT: &str = "u:object_r:sysfs:s0";
+const SELINUXFS_CONTEXT: &str = "u:object_r:selinuxfs:s0";
+#[cfg(unix)]
+const PROPERTY_AREA_PATH: &str = "/dev/__properties__";
+
+#[cfg(unix)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HostPropertySnapshot {
+    mount_namespace: String,
+    dir_dev: u64,
+    dir_ino: u64,
+    mount_id: u32,
+    entries: Vec<HostPropertyEntry>,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HostPropertyEntry {
+    name: String,
+    dev: u64,
+    ino: u64,
+    size: u64,
+    mode: u32,
+    mtime: i64,
+    mtime_nsec: i64,
+    ctime: i64,
+    ctime_nsec: i64,
+    label: String,
+}
+
+fn host_process_kind(pid: u32, comm: &str, argv0: &str, exe: &str) -> Option<&'static str> {
+    if pid == 1 && comm == "init" {
+        Some("init")
+    } else if comm == "system_server" {
+        Some("system_server")
+    } else if comm == "surfaceflinger" {
+        Some("surfaceflinger")
+    } else if comm == "servicemanager" {
+        Some("servicemanager")
+    } else if matches!(
+        (argv0, exe),
+        ("zygote", "/system/bin/app_process32") | ("zygote64", "/system/bin/app_process64")
+    ) {
+        Some("zygote")
+    } else {
+        None
+    }
+}
+
+fn argv0(cmdline: &[u8]) -> Result<&str, std::str::Utf8Error> {
+    std::str::from_utf8(cmdline.split(|&b| b == 0).next().unwrap_or_default())
+}
+
+fn is_aarch64_elf64(header: &[u8]) -> bool {
+    header.len() >= 20
+        && &header[..4] == b"\x7fELF"
+        && header[4] == 2
+        && header[5] == 1
+        && u16::from_le_bytes([header[18], header[19]]) == 183
+}
+
+fn has_executable_mode(mode: u32) -> bool {
+    mode & 0o111 != 0
+}
+
+fn host_process_snapshots_match<T: PartialEq>(before: &[T], after: &[T]) -> bool {
+    before == after
+}
 
 #[derive(Debug, PartialEq)]
 enum Mode<'a> {
     DryRun,
+    HostSnapshot,
     Control { helper: &'a str, sha256: &'a str },
     Run { helper: &'a str, sha256: &'a str },
+    PropertyAreaPreflight { helper: &'a str, sha256: &'a str },
+    PropertyAreaRun { helper: &'a str, sha256: &'a str },
+    ProcOnlyPreflight { helper: &'a str, sha256: &'a str },
+    ProcOnlyRun { helper: &'a str, sha256: &'a str },
     BareControl { helper: &'a str, sha256: &'a str },
     BareRun { helper: &'a str, sha256: &'a str },
     BarePtraceControl { helper: &'a str, sha256: &'a str },
     BarePtraceRun { helper: &'a str, sha256: &'a str },
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ExecutionPlan {
+    transition: bool,
+    identity_report: bool,
+    ptrace: bool,
+    property_area: bool,
+    proc_only: bool,
+    preflight_only: bool,
+}
+
+fn execution_plan<'a>(mode: &Mode<'a>) -> Option<(&'a str, &'a str, ExecutionPlan)> {
+    let (helper, sha256, plan) = match mode {
+        Mode::Control { helper, sha256 } => {
+            (*helper, *sha256, (false, true, false, false, false, false))
+        }
+        Mode::Run { helper, sha256 } => {
+            (*helper, *sha256, (true, true, false, false, false, false))
+        }
+        Mode::PropertyAreaPreflight { helper, sha256 } => {
+            (*helper, *sha256, (true, true, false, true, false, true))
+        }
+        Mode::PropertyAreaRun { helper, sha256 } => {
+            (*helper, *sha256, (true, true, true, true, false, false))
+        }
+        Mode::ProcOnlyPreflight { helper, sha256 } => {
+            (*helper, *sha256, (true, true, true, false, true, true))
+        }
+        Mode::ProcOnlyRun { helper, sha256 } => {
+            (*helper, *sha256, (true, true, true, false, true, false))
+        }
+        Mode::BareControl { helper, sha256 } => {
+            (*helper, *sha256, (false, false, false, false, false, false))
+        }
+        Mode::BareRun { helper, sha256 } => {
+            (*helper, *sha256, (true, false, false, false, false, false))
+        }
+        Mode::BarePtraceControl { helper, sha256 } => {
+            (*helper, *sha256, (false, false, true, false, false, false))
+        }
+        Mode::BarePtraceRun { helper, sha256 } => {
+            (*helper, *sha256, (true, false, true, false, false, false))
+        }
+        Mode::DryRun | Mode::HostSnapshot => return None,
+    };
+    Some((
+        helper,
+        sha256,
+        ExecutionPlan {
+            transition: plan.0,
+            identity_report: plan.1,
+            ptrace: plan.2,
+            property_area: plan.3,
+            proc_only: plan.4,
+            preflight_only: plan.5,
+        },
+    ))
+}
+
 fn parse_args(args: &[String]) -> Result<Mode<'_>, &'static str> {
     if args.is_empty() || args == ["--dry-run"] {
         return Ok(Mode::DryRun);
     }
+    if args == ["--host-snapshot"] {
+        return Ok(Mode::HostSnapshot);
+    }
     if args.len() == 4
         && [
             "--run-after-approval",
+            "--property-area-preflight",
+            "--property-area-live-after-approval",
+            "--proc-only-preflight",
+            "--proc-only-after-approval",
             "--control",
             "--bare-transition",
             "--bare-control",
@@ -36,6 +180,22 @@ fn parse_args(args: &[String]) -> Result<Mode<'_>, &'static str> {
                 sha256: &args[3],
             },
             "--run-after-approval" => Mode::Run {
+                helper: &args[1],
+                sha256: &args[3],
+            },
+            "--property-area-preflight" => Mode::PropertyAreaPreflight {
+                helper: &args[1],
+                sha256: &args[3],
+            },
+            "--property-area-live-after-approval" => Mode::PropertyAreaRun {
+                helper: &args[1],
+                sha256: &args[3],
+            },
+            "--proc-only-preflight" => Mode::ProcOnlyPreflight {
+                helper: &args[1],
+                sha256: &args[3],
+            },
+            "--proc-only-after-approval" => Mode::ProcOnlyRun {
                 helper: &args[1],
                 sha256: &args[3],
             },
@@ -58,11 +218,71 @@ fn parse_args(args: &[String]) -> Result<Mode<'_>, &'static str> {
         };
         return Ok(mode);
     }
-    Err("usage: --control|--run-after-approval|--bare-control|--bare-transition|--bare-ptrace-control|--bare-ptrace-transition /path --sha256 HASH")
+    Err("usage: --dry-run | --host-snapshot | --control|--run-after-approval|--property-area-preflight|--property-area-live-after-approval|--proc-only-preflight|--proc-only-after-approval|--bare-control|--bare-transition|--bare-ptrace-control|--bare-ptrace-transition /path --sha256 HASH")
 }
 #[cfg(any(unix, test))]
 fn target_state_allowed(permissive: bool) -> bool {
     !permissive
+}
+
+type AvRequest<'a> = (&'a str, &'a str, &'static str, &'static str, bool);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AvStatus {
+    Allowed,
+    Denied,
+    QueryError,
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+#[derive(Debug)]
+struct AvQuery {
+    status: AvStatus,
+    permissive: Option<bool>,
+    sequence: Option<u32>,
+    query_errno: Option<i32>,
+    permission_bit: Option<u32>,
+    allowed_mask: Option<u32>,
+    raw_response: Option<String>,
+}
+
+fn record_required_issue(issues: &mut Vec<String>, request: AvRequest<'_>, query: &AvQuery) {
+    let (source, target, class, permission, required) = request;
+    if required {
+        match query.status {
+            AvStatus::Allowed => {}
+            AvStatus::Denied => issues.push(format!(
+                "{source} {target} {class}:{permission} decision=DENIED"
+            )),
+            AvStatus::QueryError => issues.push(format!(
+                "{source} {target} {class}:{permission} decision=QUERY_ERROR query_errno={}",
+                query
+                    .query_errno
+                    .map_or_else(|| "none".into(), |errno| errno.to_string())
+            )),
+        }
+    }
+}
+
+fn required_av_block_message(issues: &[String]) -> Option<String> {
+    (!issues.is_empty()).then(|| {
+        format!(
+            "required AV blocked before child creation: {}",
+            issues.join(", ")
+        )
+    })
+}
+
+#[cfg(unix)]
+fn record_av_crosscheck(name: &str, expected: AvStatus, query: &AvQuery) {
+    println!(
+        "AV_CROSSCHECK name={name} expected={expected:?} actual={:?} match={} permission_bit={} allowed_mask={} raw_response={:?}",
+        query.status,
+        query.status == expected,
+        query.permission_bit.map_or_else(|| "unknown".into(), |bit| format!("0x{bit:x}")),
+        query.allowed_mask.map_or_else(|| "unknown".into(), |mask| format!("0x{mask:x}")),
+        query.raw_response
+    );
 }
 
 #[cfg(any(unix, test))]
@@ -71,9 +291,8 @@ fn write_access_request<W: std::io::Write>(
     source: &str,
     target: &str,
     index: u32,
-    mask: u32,
 ) -> std::io::Result<()> {
-    let request = format!("{source} {target} {index} {mask:x}");
+    let request = format!("{source} {target} {index}");
     let n = writer.write(request.as_bytes())?;
     if n != request.len() {
         return Err(std::io::Error::new(
@@ -82,6 +301,242 @@ fn write_access_request<W: std::io::Write>(
         ));
     }
     Ok(())
+}
+
+fn parse_access_response(
+    response: &str,
+    permission_bit: u32,
+) -> std::io::Result<(bool, bool, u32, u32)> {
+    let fields: Vec<_> = response.split_whitespace().collect();
+    if fields.len() != 6 {
+        return Err(std::io::Error::other("invalid AV response field count"));
+    }
+    let hex = |value: &str| u32::from_str_radix(value, 16).map_err(std::io::Error::other);
+    let allowed_mask = hex(fields[0])?;
+    if hex(fields[1])? & permission_bit != permission_bit {
+        return Err(std::io::Error::other("undecided AV"));
+    }
+    let flags = hex(fields[5])?;
+    let sequence = fields[4].parse().map_err(std::io::Error::other)?;
+    Ok((
+        allowed_mask & permission_bit == permission_bit,
+        flags & 1 != 0,
+        sequence,
+        allowed_mask,
+    ))
+}
+
+fn expected_property_creation_context(response: &str) -> bool {
+    response.trim_end_matches('\0').trim_end_matches('\n') == PROPERTY_AREA_CONTEXT
+}
+
+fn property_area_av_requests<'a>(
+    root: &'a str,
+    dev: &'a str,
+    mountpoint: &'a str,
+) -> Vec<AvRequest<'a>> {
+    let tmpfs = PROPERTY_AREA_FS_CONTEXT;
+    let area = PROPERTY_AREA_CONTEXT;
+    let dir = PROPERTY_AREA_DIR_CONTEXT;
+    vec![
+        (KSU, root, "dir", "search", false),
+        (KSU, dev, "dir", "search", false),
+        (KSU, root, "dir", "mounton", false),
+        (KSU, KSU, "capability", "sys_admin", false),
+        (KSU, tmpfs, "filesystem", "relabelfrom", false),
+        (KSU, tmpfs, "filesystem", "relabelto", false),
+        (KSU, mountpoint, "dir", "mounton", false),
+        (KSU, tmpfs, "filesystem", "mount", false),
+        (TARGET, root, "dir", "search", true),
+        (TARGET, dev, "dir", "search", true),
+        (TARGET, SYSFS_CONTEXT, "dir", "search", true),
+        (TARGET, SELINUXFS_CONTEXT, "dir", "search", true),
+        (TARGET, SELINUXFS_CONTEXT, "file", "open", true),
+        (TARGET, SELINUXFS_CONTEXT, "file", "read", true),
+        (TARGET, dir, "dir", "search", true),
+        (TARGET, dir, "dir", "write", true),
+        (TARGET, dir, "dir", "add_name", true),
+        (TARGET, dir, "dir", "getattr", true),
+        (TARGET, area, "file", "create", true),
+        (TARGET, area, "file", "relabelfrom", true),
+        (TARGET, area, "file", "relabelto", true),
+        (TARGET, area, "file", "open", true),
+        (TARGET, area, "file", "read", true),
+        (TARGET, area, "file", "write", true),
+        (TARGET, area, "file", "map", true),
+        (TARGET, area, "file", "getattr", true),
+        (dir, tmpfs, "filesystem", "associate", true),
+        (area, tmpfs, "filesystem", "associate", true),
+        (KSU, PROC_CONTEXT, "dir", "search", false),
+        (KSU, TARGET, "dir", "search", false),
+        (KSU, TARGET, "file", "open", false),
+        (KSU, TARGET, "file", "read", false),
+        (KSU, TARGET, "process", "getattr", false),
+        (TARGET, PROC_CONTEXT, "dir", "search", true),
+        (TARGET, PROC_CONTEXT, "filesystem", "getattr", true),
+        (TARGET, PROC_CONTEXT, "lnk_file", "read", false),
+        (TARGET, TARGET, "dir", "search", true),
+        (TARGET, TARGET, "dir", "open", false),
+        (TARGET, TARGET, "dir", "read", false),
+        (TARGET, TARGET, "lnk_file", "read", true),
+        (TARGET, TARGET, "file", "open", true),
+        (TARGET, TARGET, "file", "read", true),
+        (TARGET, TARGET, "file", "getattr", false),
+        (TARGET, KSU, "fd", "use", true),
+        (TARGET, KSU, "fifo_file", "getattr", true),
+        (
+            TARGET,
+            "u:object_r:null_device:s0",
+            "chr_file",
+            "getattr",
+            true,
+        ),
+        (
+            TARGET,
+            "u:object_r:ssal_guest_probe_exec:s0",
+            "file",
+            "getattr",
+            true,
+        ),
+    ]
+}
+
+#[cfg(unix)]
+fn transition_av_requests<'a>(source: &'a str, helper_label: &'a str) -> Vec<AvRequest<'a>> {
+    let mut requests = vec![
+        (source, source, "process", "setexec", true),
+        (source, TARGET, "process", "transition", true),
+        (TARGET, helper_label, "file", "entrypoint", true),
+    ];
+    requests.extend(
+        ["open", "read", "getattr", "execute", "map"]
+            .into_iter()
+            .map(|permission| (source, helper_label, "file", permission, true)),
+    );
+    requests
+}
+
+fn proc_only_av_requests() -> Vec<AvRequest<'static>> {
+    [
+        (TARGET, PROC_CONTEXT, "dir", "search", false),
+        (TARGET, PROC_CONTEXT, "lnk_file", "read", false),
+        (TARGET, TARGET, "dir", "search", false),
+        (TARGET, TARGET, "file", "open", false),
+        (TARGET, TARGET, "file", "read", false),
+        (TARGET, TARGET, "file", "getattr", false),
+    ]
+    .into()
+}
+
+fn proc_failure_class(
+    selinux_avc_confirmed: bool,
+    dac_confirmed: bool,
+    path_resolution_confirmed: bool,
+) -> &'static str {
+    if selinux_avc_confirmed {
+        "SELINUX_DENIAL_CONFIRMED"
+    } else if dac_confirmed {
+        "DAC_DENIAL_CONFIRMED"
+    } else if path_resolution_confirmed {
+        "PATH_RESOLUTION_FAILURE"
+    } else {
+        "UNDETERMINED"
+    }
+}
+
+fn avc_confirms_proc_denial(log: &str, pid: u32) -> bool {
+    let expected_pid = format!("pid={pid}");
+    let expected_sid = format!("scontext={TARGET}");
+    log.lines().any(|line| {
+        let body = line.split_once(';').map_or(line, |(_, body)| body);
+        let fields: Vec<_> = body.split_whitespace().collect();
+        let has = |field: &str| fields.contains(&field);
+        let denied = body
+            .split_once("avc: denied {")
+            .and_then(|(_, tail)| tail.split_once('}'))
+            .is_some_and(|(permissions, _)| {
+                permissions
+                    .split_whitespace()
+                    .any(|permission| matches!(permission, "search" | "open" | "read" | "getattr"))
+            });
+        has(&expected_pid)
+            && has(&expected_sid)
+            && has("permissive=0")
+            && denied
+            && (has("tclass=dir") || has("tclass=file") || has("tclass=lnk_file"))
+    })
+}
+
+fn parent_exec_valid(
+    expected_sid: &str,
+    process_sid: Option<&str>,
+    task_sid: Option<&str>,
+    process_attr_label: Option<&str>,
+    task_attr_label: Option<&str>,
+    starttime_before: Option<u64>,
+    starttime_after: Option<u64>,
+    expected_exe: (u64, u64),
+    actual_exe: Option<(u64, u64)>,
+    expected_mount_namespace: Option<&str>,
+    actual_mount_namespace: Option<&str>,
+    global_enforcing: bool,
+    target_permissive: Option<bool>,
+) -> bool {
+    process_sid == Some(expected_sid)
+        && task_sid == Some(expected_sid)
+        && process_attr_label.is_some_and(|label| !label.is_empty())
+        && task_attr_label.is_some_and(|label| !label.is_empty())
+        && process_attr_label == task_attr_label
+        && starttime_before.is_some()
+        && starttime_before == starttime_after
+        && actual_exe == Some(expected_exe)
+        && actual_mount_namespace.is_some()
+        && expected_mount_namespace
+            .map_or(true, |expected| actual_mount_namespace == Some(expected))
+        && global_enforcing
+        && (expected_sid != TARGET || target_permissive == Some(false))
+}
+
+fn proc_report_valid(report: &serde_json::Value, pid: u32) -> bool {
+    let Some(results) = report["proc_only"]["results"].as_array() else {
+        return false;
+    };
+    let Some(components) = report["proc_only"]["components"].as_array() else {
+        return false;
+    };
+    if report["protocol"] != 1
+        || report["pid"] != pid
+        || report["proc_only"]["status"] != "complete"
+        || results.len() != 3
+        || components.len() != 11
+    {
+        return false;
+    }
+    results.iter().enumerate().all(|(index, result)| {
+        let path = result["requested_path"].as_str().unwrap_or_default();
+        let expected = match index {
+            0 => path == "/proc/thread-self/attr/current",
+            1 => path == "/proc/self/attr/current",
+            2 => path.starts_with("/proc/self/task/") && path.ends_with("/attr/current"),
+            _ => false,
+        };
+        expected
+            && result["open_errno"].as_i64().is_some()
+            && result["read_errno"].as_i64().is_some()
+            && result["close_errno"].as_i64().is_some()
+    }) && components.iter().all(|component| {
+        component["requested_path"].as_str().is_some()
+            && component["stat_errno"].as_i64().is_some()
+            && component["readlink_errno"].as_i64().is_some()
+    }) && components.iter().all(|component| {
+        component["requested_path"].as_str().is_some()
+            && component["stat_errno"].as_i64().is_some()
+            && component["readlink_errno"].as_i64().is_some()
+    }) && components.iter().all(|component| {
+        component["requested_path"].as_str().is_some()
+            && component["stat_errno"].as_i64().is_some()
+            && component["readlink_errno"].as_i64().is_some()
+    }) && report["proc_only"]["first_open_errno"] == results[0]["open_errno"]
 }
 
 const TRACE_CHILD: u32 = 1;
@@ -97,6 +552,9 @@ const TRACE_REPORTER_MAIN: u32 = 10;
 const TRACE_STDIN_DUP: u32 = 11;
 const TRACE_PTRACE_TRACEME: u32 = 12;
 const TRACE_PTRACE_STOP: u32 = 13;
+const TRACE_MOUNT_NS_UNSHARE: u32 = 14;
+const TRACE_MOUNT_PRIVATE: u32 = 15;
+const TRACE_MOUNT_TMPFS: u32 = 16;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -120,6 +578,9 @@ fn trace_stage_name(stage: u32) -> &'static str {
         TRACE_REPORTER_MAIN => "reporter_main",
         TRACE_PTRACE_TRACEME => "ptrace_traceme",
         TRACE_PTRACE_STOP => "ptrace_initial_stop",
+        TRACE_MOUNT_NS_UNSHARE => "mount_namespace_unshare",
+        TRACE_MOUNT_PRIVATE => "mount_propagation_private",
+        TRACE_MOUNT_TMPFS => "mount_property_tmpfs",
         _ => "unknown",
     }
 }
@@ -134,6 +595,8 @@ fn trace_syscall_name(stage: u32) -> &'static str {
         TRACE_SETEXEC_WRITE => "write",
         TRACE_PTRACE_TRACEME => "ptrace",
         TRACE_PTRACE_STOP => "kill",
+        TRACE_MOUNT_NS_UNSHARE => "unshare",
+        TRACE_MOUNT_PRIVATE | TRACE_MOUNT_TMPFS => "mount",
         TRACE_EXECVEAT_RETURNED => "execveat",
         _ => "none",
     }
@@ -171,11 +634,31 @@ fn decode_siginfo(raw: &[u8; 128]) -> (i32, u64) {
     )
 }
 
+fn proc_stat_starttime(stat: &str) -> Option<u64> {
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match parse_args(&args) {
         Ok(Mode::DryRun) => {
             println!("dry-run: target={TARGET}; policy=unchanged; exec=not_run; default=enforcing; diagnostic=off");
+            return;
+        }
+        Ok(Mode::HostSnapshot) => {
+            #[cfg(unix)]
+            if let Err(e) = unix::print_host_snapshot() {
+                eprintln!("blocked or failed: {e}");
+                std::process::exit(1);
+            }
+            #[cfg(not(unix))]
+            std::process::exit(2);
+            #[cfg(unix)]
             return;
         }
         Err(e) => {
@@ -185,6 +668,10 @@ fn main() {
         Ok(
             Mode::Control { .. }
             | Mode::Run { .. }
+            | Mode::PropertyAreaPreflight { .. }
+            | Mode::PropertyAreaRun { .. }
+            | Mode::ProcOnlyPreflight { .. }
+            | Mode::ProcOnlyRun { .. }
             | Mode::BareControl { .. }
             | Mode::BareRun { .. }
             | Mode::BarePtraceControl { .. }
@@ -206,77 +693,492 @@ fn main() {
 #[cfg(unix)]
 mod unix {
     use super::{
-        bare_exit_probe_succeeded, bare_output_matches_context, decode_siginfo,
-        decode_trace_events, parse_args, ptrace_wait_stop, target_state_allowed, trace_stage_name,
-        trace_syscall_name, write_access_request, Mode, TraceEvent, TARGET, TRACE_CHILD,
-        TRACE_EXECVEAT_ENTERED, TRACE_EXECVEAT_RETURNED, TRACE_FD_FLAGS, TRACE_PTRACE_STOP,
+        argv0, avc_confirms_proc_denial, bare_exit_probe_succeeded, bare_output_matches_context,
+        decode_siginfo, decode_trace_events, execution_plan, expected_property_creation_context,
+        has_executable_mode, host_process_kind, host_process_snapshots_match, is_aarch64_elf64,
+        parent_exec_valid, parse_access_response, parse_args, proc_failure_class,
+        proc_only_av_requests, proc_report_valid, proc_stat_starttime, property_area_av_requests,
+        ptrace_wait_stop, record_av_crosscheck, record_required_issue, required_av_block_message,
+        target_state_allowed, trace_stage_name, trace_syscall_name, transition_av_requests,
+        write_access_request, AvQuery, AvStatus, ExecutionPlan, HostPropertyEntry,
+        HostPropertySnapshot, TraceEvent, KSU, PROPERTY_AREA_CONTEXT, PROPERTY_AREA_DIR_CONTEXT,
+        PROPERTY_AREA_FS_CONTEXT, PROPERTY_AREA_PATH, SELINUXFS_CONTEXT, SYSFS_CONTEXT, TARGET,
+        TRACE_CHILD, TRACE_EXECVEAT_ENTERED, TRACE_EXECVEAT_RETURNED, TRACE_FD_FLAGS,
+        TRACE_MOUNT_NS_UNSHARE, TRACE_MOUNT_PRIVATE, TRACE_MOUNT_TMPFS, TRACE_PTRACE_STOP,
         TRACE_PTRACE_TRACEME, TRACE_REPORTER_MAIN, TRACE_SETEXEC_OPEN, TRACE_SETEXEC_WRITE,
         TRACE_STDERR, TRACE_STDIN_DUP, TRACE_STDIN_OPEN, TRACE_STDOUT,
     };
     use std::{
         ffi::CString,
         fs::{self, File, OpenOptions},
-        io::{self, Read},
+        io::{self, Read, Seek, SeekFrom, Write},
         os::{
             fd::{AsRawFd, FromRawFd},
-            unix::fs::{FileExt, MetadataExt},
+            unix::fs::{FileExt, MetadataExt, OpenOptionsExt},
         },
         time::{Duration, Instant},
     };
 
-    const PTRACE_TRACEME: libc::c_int = 0;
-    const PTRACE_CONT: libc::c_int = 7;
-    const PTRACE_SETOPTIONS: libc::c_int = 0x4200;
-    const PTRACE_GETSIGINFO: libc::c_int = 0x4202;
-    const PTRACE_GETREGSET: libc::c_int = 0x4204;
+    #[cfg(target_os = "android")]
+    type PtraceRequest = libc::c_int;
+    #[cfg(not(target_os = "android"))]
+    type PtraceRequest = libc::c_uint;
+
+    const PTRACE_TRACEME: PtraceRequest = 0;
+    const PTRACE_CONT: PtraceRequest = 7;
+    const PTRACE_SETOPTIONS: PtraceRequest = 0x4200;
+    const PTRACE_GETSIGINFO: PtraceRequest = 0x4202;
+    #[cfg(target_arch = "aarch64")]
+    const PTRACE_GETREGSET: PtraceRequest = 0x4204;
     const PTRACE_O_TRACEEXEC: usize = 0x10;
     const PTRACE_EVENT_EXEC: u32 = 4;
+    const PTRACE_O_TRACEEXIT: usize = 0x40;
+    const PTRACE_EVENT_EXIT: u32 = 6;
+    #[cfg(target_arch = "aarch64")]
     const NT_PRSTATUS: usize = 1;
 
     fn read(path: &str) -> io::Result<String> {
         Ok(fs::read_to_string(path)?.trim_matches('\0').trim().into())
+    }
+    fn fd_mount_id(file: &File) -> io::Result<u32> {
+        let info = fs::read_to_string(format!("/proc/self/fdinfo/{}", file.as_raw_fd()))?;
+        info.lines()
+            .find_map(|line| line.strip_prefix("mnt_id:").map(str::trim))
+            .ok_or_else(|| io::Error::other("fdinfo has no mnt_id"))?
+            .parse()
+            .map_err(io::Error::other)
+    }
+    fn host_property_snapshot() -> io::Result<HostPropertySnapshot> {
+        let mount_namespace = fs::read_link("/proc/thread-self/ns/mnt")?
+            .to_string_lossy()
+            .into_owned();
+        let directory = File::open(PROPERTY_AREA_PATH).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!(
+                    "openat {PROPERTY_AREA_PATH} errno={:?}: {e}",
+                    e.raw_os_error()
+                ),
+            )
+        })?;
+        let metadata = directory.metadata()?;
+        let mut entries = Vec::new();
+        for entry in fs::read_dir(PROPERTY_AREA_PATH)? {
+            let entry = entry?;
+            let entry_metadata = fs::symlink_metadata(entry.path())?;
+            let file_label = if entry_metadata.is_file() && !entry_metadata.file_type().is_symlink()
+            {
+                label(&File::open(entry.path())?)?
+            } else {
+                "not_regular_file".to_owned()
+            };
+            entries.push(HostPropertyEntry {
+                name: entry.file_name().to_string_lossy().into_owned(),
+                dev: entry_metadata.dev(),
+                ino: entry_metadata.ino(),
+                size: entry_metadata.size(),
+                mode: entry_metadata.mode(),
+                mtime: entry_metadata.mtime(),
+                mtime_nsec: entry_metadata.mtime_nsec(),
+                ctime: entry_metadata.ctime(),
+                ctime_nsec: entry_metadata.ctime_nsec(),
+                label: file_label,
+            });
+        }
+        entries.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(HostPropertySnapshot {
+            mount_namespace,
+            dir_dev: metadata.dev(),
+            dir_ino: metadata.ino(),
+            mount_id: fd_mount_id(&directory)?,
+            entries,
+        })
+    }
+    type HostProcess = (String, u32, u64, String, String);
+
+    fn host_process_snapshot() -> io::Result<Vec<HostProcess>> {
+        let mut processes = Vec::new();
+        let mut zygote_names = Vec::new();
+        for entry in fs::read_dir("/proc")? {
+            let entry = entry?;
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|s| s.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let process_dir = entry.path();
+            let comm = fs::read_to_string(process_dir.join("comm"))
+                .unwrap_or_default()
+                .trim()
+                .to_owned();
+            let candidate = matches!(
+                comm.as_str(),
+                "app_process" | "app_process32" | "app_process64" | "main" | "zygote" | "zygote64"
+            );
+            let cmdline = if candidate {
+                fs::read(process_dir.join("cmdline"))?
+            } else {
+                Vec::new()
+            };
+            let argv0 = argv0(&cmdline).map_err(io::Error::other)?;
+            let zygote_candidate = matches!(argv0, "zygote" | "zygote64")
+                || matches!(comm.as_str(), "zygote" | "zygote64");
+            let exe = if zygote_candidate || host_process_kind(pid, &comm, "", "").is_some() {
+                fs::read_link(process_dir.join("exe"))?
+                    .to_string_lossy()
+                    .into_owned()
+            } else {
+                String::new()
+            };
+            let kind = host_process_kind(pid, &comm, argv0, &exe);
+            if zygote_candidate && kind != Some("zygote") {
+                return Err(io::Error::other(format!(
+                    "ambiguous zygote pid={pid} comm={comm} argv0={argv0} exe={exe}"
+                )));
+            }
+            if let Some(kind) = kind {
+                if kind == "zygote" {
+                    if zygote_names.contains(&argv0.to_owned()) {
+                        return Err(io::Error::other(format!(
+                            "ambiguous duplicate zygote argv0={argv0}"
+                        )));
+                    }
+                    zygote_names.push(argv0.to_owned());
+                }
+                let stat = fs::read_to_string(process_dir.join("stat"))?;
+                let starttime = stat
+                    .rsplit_once(')')
+                    .and_then(|(_, fields)| fields.split_whitespace().nth(19))
+                    .ok_or_else(|| io::Error::other(format!("invalid stat pid={pid}")))?
+                    .parse()
+                    .map_err(io::Error::other)?;
+                let context = fs::read_to_string(process_dir.join("attr/current"))?
+                    .trim_matches('\0')
+                    .trim()
+                    .to_owned();
+                if context.is_empty() {
+                    return Err(io::Error::other(format!("empty SELinux context pid={pid}")));
+                }
+                processes.push((kind.to_owned(), pid, starttime, context, exe));
+            }
+        }
+        processes.sort();
+        // shortcut: checks five stable Android core process names; extend if this device reports different names.
+        for required in [
+            "init",
+            "zygote",
+            "system_server",
+            "surfaceflinger",
+            "servicemanager",
+        ] {
+            if !processes.iter().any(|(kind, ..)| kind == required) {
+                return Err(io::Error::other(format!(
+                    "Host process snapshot missing {required}"
+                )));
+            }
+        }
+        Ok(processes)
+    }
+    pub fn print_host_snapshot() -> io::Result<()> {
+        println!("host_processes={:?}", host_process_snapshot()?);
+        println!("host_property={:?}", host_property_snapshot()?);
+        Ok(())
+    }
+    fn validate_context(context: &str) -> io::Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .open("/sys/fs/selinux/context")
+            .map_err(|e| io::Error::new(e.kind(), format!("openat selinuxfs/context: {e}")))?;
+        let mut request = context.as_bytes().to_vec();
+        request.push(0);
+        let written = file
+            .write(&request)
+            .map_err(|e| io::Error::new(e.kind(), format!("validate context {context}: {e}")))?;
+        if written != request.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "short SELinux context validation request",
+            ));
+        }
+        Ok(())
+    }
+    fn property_area_preflight(
+        sequence: &mut Option<u32>,
+        required_issues: &mut Vec<String>,
+    ) -> io::Result<(HostPropertySnapshot, Vec<HostProcess>)> {
+        validate_context(PROPERTY_AREA_DIR_CONTEXT)?;
+        validate_context(PROPERTY_AREA_CONTEXT)?;
+        validate_context(PROPERTY_AREA_FS_CONTEXT)?;
+        if label(&File::open("/dev/null")?)? != "u:object_r:null_device:s0" {
+            return Err(io::Error::other("unexpected /dev/null label"));
+        }
+        for (path, expected) in [
+            ("/sys", SYSFS_CONTEXT),
+            ("/sys/fs", SYSFS_CONTEXT),
+            ("/sys/fs/selinux", SELINUXFS_CONTEXT),
+            ("/sys/fs/selinux/enforce", SELINUXFS_CONTEXT),
+        ] {
+            if label(&File::open(path)?)? != expected {
+                return Err(io::Error::other(format!("unexpected label for {path}")));
+            }
+        }
+        let class: u32 = read("/sys/fs/selinux/class/file/index")?
+            .parse()
+            .map_err(io::Error::other)?;
+        let mut create = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/sys/fs/selinux/create")?;
+        write_access_request(&mut create, TARGET, PROPERTY_AREA_DIR_CONTEXT, class)?;
+        let mut created = String::new();
+        create.read_to_string(&mut created)?;
+        println!("property_file_creation_context={created:?}");
+        if !expected_property_creation_context(&created) {
+            return Err(io::Error::other(
+                "unexpected property file creation context",
+            ));
+        }
+        let host = host_property_snapshot()?;
+        let processes = host_process_snapshot()?;
+        let mountpoint = File::open(PROPERTY_AREA_PATH)?;
+        let mountpoint_label = label(&mountpoint)
+            .map_err(|e| io::Error::new(e.kind(), format!("fgetxattr /dev/__properties__: {e}")))?;
+        let root_label = label(&File::open("/")?)?;
+        let dev_label = label(&File::open("/dev")?)?;
+        println!(
+            "host_mount_namespace={} host_property_dir_dev={} host_property_dir_ino={} host_mount_id={} property_mountpoint_label={mountpoint_label}",
+            host.mount_namespace, host.dir_dev, host.dir_ino, host.mount_id
+        );
+        println!("host_processes_before={processes:?}");
+        for request @ (source, target, class, permission, required) in
+            property_area_av_requests(&root_label, &dev_label, &mountpoint_label)
+        {
+            let query = decision(
+                source,
+                target,
+                class,
+                permission,
+                if required { "required" } else { "reference" },
+            );
+            if source == TARGET
+                && target == PROPERTY_AREA_FS_CONTEXT
+                && class == "file"
+                && permission == "write"
+            {
+                record_av_crosscheck("guest_tmpfs_file_write", AvStatus::Denied, &query);
+            }
+            record_required_issue(required_issues, request, &query);
+            if let Some(seq) = query.sequence {
+                if sequence.replace(seq).is_some_and(|old| old != seq) {
+                    return Err(io::Error::other(
+                        "policy sequence changed during property-area AV checks",
+                    ));
+                }
+            }
+        }
+        let ksu_query = decision(KSU, KSU, "process", "getattr", "reference");
+        if let Some(seq) = ksu_query.sequence {
+            if sequence.replace(seq).is_some_and(|old| old != seq) {
+                return Err(io::Error::other(
+                    "policy sequence changed during KSU mode check",
+                ));
+            }
+        }
+        println!(
+            "ksu_permissive={}",
+            ksu_query
+                .permissive
+                .map_or_else(|| "unknown".into(), |value| value.to_string())
+        );
+        Ok((host, processes))
+    }
+
+    fn proc_only_preflight(
+        sequence: &mut Option<u32>,
+        required_issues: &mut Vec<String>,
+    ) -> io::Result<(HostPropertySnapshot, Vec<HostProcess>)> {
+        let host = host_property_snapshot()?;
+        let processes = host_process_snapshot()?;
+        println!(
+            "proc_only_host_mount_namespace={} host_property_dir_dev={} host_property_dir_ino={} host_mount_id={} property_entries={:?}",
+            host.mount_namespace, host.dir_dev, host.dir_ino, host.mount_id, host.entries
+        );
+        println!("host_processes_before={processes:?}");
+
+        for request @ (av_source, target, class, permission, required) in proc_only_av_requests() {
+            let query = decision(
+                av_source,
+                target,
+                class,
+                permission,
+                if required { "required" } else { "diagnostic" },
+            );
+            record_required_issue(required_issues, request, &query);
+            if let Some(seq) = query.sequence {
+                if sequence.replace(seq).is_some_and(|old| old != seq) {
+                    return Err(io::Error::other(
+                        "policy sequence changed during Proc-Only AV checks",
+                    ));
+                }
+            }
+        }
+
+        let property_write = decision(
+            TARGET,
+            PROPERTY_AREA_FS_CONTEXT,
+            "file",
+            "write",
+            "calibration_reference",
+        );
+        record_av_crosscheck("guest_tmpfs_file_write", AvStatus::Denied, &property_write);
+        if let Some(seq) = property_write.sequence {
+            if sequence.replace(seq).is_some_and(|old| old != seq) {
+                return Err(io::Error::other(
+                    "policy sequence changed during AV calibration",
+                ));
+            }
+        }
+
+        let target_state = decision(TARGET, TARGET, "process", "getattr", "reference");
+        if target_state.permissive != Some(false) {
+            return Err(io::Error::other(
+                "Guest domain permissive state is unknown or nonzero",
+            ));
+        }
+        if let Some(seq) = target_state.sequence {
+            if sequence.replace(seq).is_some_and(|old| old != seq) {
+                return Err(io::Error::other(
+                    "policy sequence changed during Guest state check",
+                ));
+            }
+        }
+        Ok((host, processes))
     }
     fn decision(
         source: &str,
         target: &str,
         class: &str,
         permission: &str,
-    ) -> io::Result<(bool, bool, u32)> {
-        let base = format!("/sys/fs/selinux/class/{class}");
-        let idx: u32 = read(&format!("{base}/index"))?
-            .parse()
-            .map_err(io::Error::other)?;
-        let bit: u32 = read(&format!("{base}/perms/{permission}"))?
-            .parse()
-            .map_err(io::Error::other)?;
-        let mask = bit
-            .checked_sub(1)
-            .and_then(|b| 1u32.checked_shl(b))
-            .ok_or_else(|| io::Error::other("invalid permission bit"))?;
-        let mut f = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open("/sys/fs/selinux/access")?;
-        write_access_request(&mut f, source, target, idx, mask)?;
-        let mut s = String::new();
-        f.read_to_string(&mut s)?;
-        let a: Vec<_> = s.split_whitespace().collect();
-        if a.len() != 6 {
-            return Err(io::Error::other("invalid AV response"));
+        requirement: &str,
+    ) -> AvQuery {
+        let mut permission_bit = None;
+        let mut allowed_mask = None;
+        let mut raw_response = String::new();
+        let result = (|| -> io::Result<(bool, bool, u32)> {
+            let base = format!("/sys/fs/selinux/class/{class}");
+            let idx: u32 = read(&format!("{base}/index"))?
+                .parse()
+                .map_err(io::Error::other)?;
+            let bit: u32 = read(&format!("{base}/perms/{permission}"))?
+                .parse()
+                .map_err(io::Error::other)?;
+            let mask = bit
+                .checked_sub(1)
+                .and_then(|b| 1u32.checked_shl(b))
+                .ok_or_else(|| io::Error::other("invalid permission bit"))?;
+            permission_bit = Some(mask);
+            let mut f = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("/sys/fs/selinux/access")?;
+            write_access_request(&mut f, source, target, idx)?;
+            f.read_to_string(&mut raw_response)?;
+            let (allowed, permissive, sequence, mask) = parse_access_response(&raw_response, mask)?;
+            allowed_mask = Some(mask);
+            Ok((allowed, permissive, sequence))
+        })();
+
+        match result {
+            Ok((allowed, permissive, sequence)) => {
+                let status = if allowed {
+                    AvStatus::Allowed
+                } else {
+                    AvStatus::Denied
+                };
+                let decision = if allowed { "ALLOWED" } else { "DENIED" };
+                println!(
+                    "AV source_context={source} target_context={target} class={class} permission={permission} permission_bit={} allowed_mask={} decision={decision} requirement={requirement} query_errno=0 policy_sequence={sequence} raw_response={raw_response:?}",
+                    permission_bit.map_or_else(|| "unknown".into(), |bit| format!("0x{bit:x}")),
+                    allowed_mask.map_or_else(|| "unknown".into(), |mask| format!("0x{mask:x}")),
+                );
+                AvQuery {
+                    status,
+                    permissive: Some(permissive),
+                    sequence: Some(sequence),
+                    query_errno: None,
+                    permission_bit,
+                    allowed_mask,
+                    raw_response: Some(raw_response),
+                }
+            }
+            Err(error) => {
+                let query_errno = error.raw_os_error();
+                println!(
+                    "AV source_context={source} target_context={target} class={class} permission={permission} permission_bit={} allowed_mask={} decision=QUERY_ERROR requirement={requirement} query_errno={} policy_sequence=unknown raw_response={raw_response:?} parse_error={error}",
+                    permission_bit.map_or_else(|| "unknown".into(), |bit| format!("0x{bit:x}")),
+                    allowed_mask.map_or_else(|| "unknown".into(), |mask| format!("0x{mask:x}")),
+                    query_errno.map_or_else(|| "none".into(), |errno| errno.to_string()),
+                );
+                AvQuery {
+                    status: AvStatus::QueryError,
+                    permissive: None,
+                    sequence: None,
+                    query_errno,
+                    permission_bit,
+                    allowed_mask,
+                    raw_response: Some(raw_response),
+                }
+            }
         }
-        let hex = |x: &str| u32::from_str_radix(x, 16).map_err(io::Error::other);
-        let allowed = hex(a[0])?;
-        if hex(a[1])? & mask != mask {
-            return Err(io::Error::other("undecided AV"));
-        }
-        let flags = hex(a[5])?;
-        let seq = a[4].parse().map_err(io::Error::other)?;
-        println!(
-            "AV {source} {target} {class}:{permission} allowed={} flags={flags} sequence={seq}",
-            allowed & mask == mask
-        );
-        Ok((allowed & mask == mask, flags & 1 != 0, seq))
     }
+
+    fn kernel_log_cursor() -> Option<File> {
+        let result = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open("/dev/kmsg")
+            .and_then(|mut file| {
+                file.seek(SeekFrom::End(0))?;
+                Ok(file)
+            });
+        match result {
+            Ok(file) => Some(file),
+            Err(error) => {
+                println!(
+                    "proc_avc_capture=unavailable syscall=openat path=/dev/kmsg errno={:?} error={error}",
+                    error.raw_os_error()
+                );
+                None
+            }
+        }
+    }
+
+    fn read_kernel_log_updates(file: &mut File) -> io::Result<(String, bool)> {
+        let mut output = Vec::new();
+        let mut record = [0u8; 8192];
+        let mut overrun = false;
+        loop {
+            match file.read(&mut record) {
+                Ok(0) => break,
+                Ok(size) => {
+                    output.extend_from_slice(&record[..size]);
+                    if output.len() >= 1024 * 1024 {
+                        break;
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) if error.raw_os_error() == Some(libc::EPIPE) => overrun = true,
+                Err(error) => return Err(error),
+            }
+            if overrun {
+                break;
+            }
+        }
+        Ok((String::from_utf8_lossy(&output).into_owned(), overrun))
+    }
+
     fn label(f: &File) -> io::Result<String> {
         let mut b = [0u8; 512];
         let n = unsafe {
@@ -313,6 +1215,19 @@ mod unix {
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect())
+    }
+
+    fn verify_aarch64_executable(file: &File, metadata: &fs::Metadata) -> io::Result<()> {
+        let mut header = [0u8; 20];
+        if file.read_at(&mut header, 0)? != header.len() || !is_aarch64_elf64(&header) {
+            return Err(io::Error::other(
+                "expected an ELF64 little-endian AArch64 file",
+            ));
+        }
+        if !has_executable_mode(metadata.mode()) {
+            return Err(io::Error::other("ELF has no executable mode bit"));
+        }
+        Ok(())
     }
 
     fn pipe_pair() -> io::Result<(File, File)> {
@@ -360,13 +1275,44 @@ mod unix {
         libc::_exit(126)
     }
 
+    unsafe fn prepare_property_mount(trace_fd: i32) {
+        if libc::unshare(libc::CLONE_NEWNS) != 0 {
+            child_fail(trace_fd, TRACE_MOUNT_NS_UNSHARE, errno());
+        }
+        record(trace_fd, TRACE_MOUNT_NS_UNSHARE, 0);
+        if libc::mount(
+            std::ptr::null(),
+            c"/".as_ptr(),
+            std::ptr::null(),
+            (libc::MS_REC | libc::MS_PRIVATE) as libc::c_ulong,
+            std::ptr::null(),
+        ) != 0
+        {
+            child_fail(trace_fd, TRACE_MOUNT_PRIVATE, errno());
+        }
+        record(trace_fd, TRACE_MOUNT_PRIVATE, 0);
+        if libc::mount(
+            c"tmpfs".as_ptr(),
+            c"/dev/__properties__".as_ptr(),
+            c"tmpfs".as_ptr(),
+            (libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC) as libc::c_ulong,
+            c"size=1m,mode=0700,uid=0,gid=0,fscontext=u:object_r:tmpfs:s0,rootcontext=u:object_r:ssal_guest_property_dir:s0"
+                .as_ptr()
+                .cast(),
+        ) != 0
+        {
+            child_fail(trace_fd, TRACE_MOUNT_TMPFS, errno());
+        }
+        record(trace_fd, TRACE_MOUNT_TMPFS, 0);
+    }
+
     unsafe fn child_exec(
         helper_fd: i32,
         argv0: *const libc::c_char,
         env: *const *const libc::c_char,
         transition: bool,
         ptrace: bool,
-        fds: &[i32],
+        property_area: bool,
         stdout_read: i32,
         stdout_write: i32,
         stderr_read: i32,
@@ -403,21 +1349,9 @@ mod unix {
         }
         record(trace_write, TRACE_STDERR, 0);
 
-        for &fd in fds {
-            if fd <= libc::STDERR_FILENO || fd == trace_write {
-                continue;
-            }
-            let flags = libc::fcntl(fd, libc::F_GETFD);
-            if flags < 0 {
-                let error = errno();
-                if error == libc::EBADF {
-                    continue;
-                }
-                child_fail(trace_write, TRACE_FD_FLAGS, error);
-            }
-            if libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) < 0 {
-                child_fail(trace_write, TRACE_FD_FLAGS, errno());
-            }
+        // Mark the entire table, including descriptors absent from a procfs snapshot.
+        if libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 4u32) < 0 {
+            child_fail(trace_write, TRACE_FD_FLAGS, errno());
         }
         let trace_flags = libc::fcntl(trace_write, libc::F_GETFD);
         if trace_flags < 0
@@ -426,6 +1360,10 @@ mod unix {
             child_fail(trace_write, TRACE_FD_FLAGS, errno());
         }
         record(trace_write, TRACE_FD_FLAGS, 0);
+
+        if property_area {
+            prepare_property_mount(trace_write);
+        }
 
         if transition {
             let fd = libc::open(
@@ -492,7 +1430,7 @@ mod unix {
     }
 
     fn ptrace_request(
-        request: libc::c_int,
+        request: PtraceRequest,
         pid: libc::pid_t,
         addr: *mut libc::c_void,
         data: *mut libc::c_void,
@@ -554,17 +1492,387 @@ mod unix {
         ))
     }
 
+    fn proc_error(syscall: &str, path: &str, error: io::Error) -> String {
+        format!(
+            "syscall={syscall} pathname={path} errno={} error={error}",
+            error
+                .raw_os_error()
+                .map_or_else(|| "none".into(), |errno| errno.to_string())
+        )
+    }
+
+    fn proc_text(path: &str) -> Result<String, String> {
+        let mut file = File::open(path).map_err(|error| proc_error("openat", path, error))?;
+        let mut value = String::new();
+        file.read_to_string(&mut value)
+            .map_err(|error| proc_error("read", path, error))?;
+        Ok(value.trim_matches('\0').trim().to_owned())
+    }
+
+    fn proc_link(path: &str) -> Result<String, String> {
+        fs::read_link(path)
+            .map(|target| target.to_string_lossy().into_owned())
+            .map_err(|error| proc_error("readlinkat", path, error))
+    }
+
+    fn proc_file_context(path: &str) -> Result<String, String> {
+        let file = File::open(path).map_err(|error| proc_error("openat", path, error))?;
+        label(&file).map_err(|error| proc_error("fgetxattr", path, error))
+    }
+
+    fn proc_starttime(pid: libc::pid_t) -> Result<u64, String> {
+        let path = format!("/proc/{pid}/stat");
+        let stat = proc_text(&path)?;
+        proc_stat_starttime(&stat).ok_or_else(|| {
+            format!("syscall=parse_proc_stat pathname={path} errno=none error=invalid starttime")
+        })
+    }
+
+    fn proc_executable_identity(pid: libc::pid_t) -> Result<(u64, u64), String> {
+        let path = format!("/proc/{pid}/exe");
+        let file = File::open(&path).map_err(|error| proc_error("openat", &path, error))?;
+        let metadata = file
+            .metadata()
+            .map_err(|error| proc_error("fstat", &path, error))?;
+        Ok((metadata.dev(), metadata.ino()))
+    }
+
+    fn observation_field<T: std::fmt::Debug>(name: &str, value: Result<T, String>) -> String {
+        match value {
+            Ok(value) => format!("{name}={value:?}"),
+            Err(error) => format!("{name}_error={error:?}"),
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct FdIdentity {
+        device: u64,
+        inode: u64,
+        mode: u32,
+        rdev: u64,
+        mount_id: u32,
+        flags: u32,
+    }
+
+    fn fdinfo_number(info: &str, key: &str, radix: u32) -> io::Result<u32> {
+        let mut values = info.lines().filter_map(|line| line.strip_prefix(key));
+        let value = values
+            .next()
+            .ok_or_else(|| io::Error::other("missing fdinfo field"))?;
+        let number = u32::from_str_radix(value.trim(), radix).map_err(io::Error::other)?;
+        if values.next().is_some() {
+            return Err(io::Error::other("duplicate fdinfo field"));
+        }
+        Ok(number)
+    }
+
+    fn fd_identity(pid: u32, fd: i32) -> io::Result<FdIdentity> {
+        // stat follows the proc magic link without opening pipes/devices in the parent.
+        let metadata = fs::metadata(format!("/proc/{pid}/fd/{fd}"))?;
+        let info = fs::read_to_string(format!("/proc/{pid}/fdinfo/{fd}"))?;
+        let mount_id = fdinfo_number(&info, "mnt_id:", 10)?;
+        if mount_id == 0 {
+            return Err(io::Error::other("invalid FD mount ID"));
+        }
+        Ok(FdIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            mode: metadata.mode(),
+            rdev: metadata.rdev(),
+            mount_id,
+            flags: fdinfo_number(&info, "flags:", 8)? & !(libc::O_CLOEXEC as u32),
+        })
+    }
+
+    struct FdGuard {
+        expected: Vec<(i32, FdIdentity)>,
+        host_mount_id: u32,
+        host_objects: Vec<(u64, u64)>,
+    }
+
+    fn verify_child_fds(pid: u32, guard: &FdGuard) -> io::Result<()> {
+        let mut actual = Vec::new();
+        // This enumeration FD belongs to the parent, never to the stopped child.
+        for entry in fs::read_dir(format!("/proc/{pid}/fd"))? {
+            let name = entry?.file_name();
+            let fd = name
+                .to_str()
+                .and_then(|name| name.parse::<i32>().ok())
+                .filter(|fd| *fd >= 0)
+                .ok_or_else(|| io::Error::other("invalid child FD entry"))?;
+            let identity = fd_identity(pid, fd)?;
+            let path = fs::read_link(format!("/proc/{pid}/fd/{fd}"))?;
+            println!("parent_fd pid={pid} fd={fd} identity={identity:?} target={path:?} shares_host_mount={}", identity.mount_id == guard.host_mount_id);
+            if guard
+                .host_objects
+                .contains(&(identity.device, identity.inode))
+                || path.starts_with(PROPERTY_AREA_PATH)
+            {
+                return Err(io::Error::other(
+                    "Host property FD inherited; child was not resumed",
+                ));
+            }
+            actual.push((fd, identity));
+        }
+        actual.sort_by_key(|(fd, _)| *fd);
+        let mut expected = guard.expected.clone();
+        expected.sort_by_key(|(fd, _)| *fd);
+        if actual != expected {
+            return Err(io::Error::other(format!(
+                "child FD whitelist mismatch: expected={expected:?} actual={actual:?}"
+            )));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod fd_tests {
+        use super::*;
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+
+        #[test]
+        fn fdinfo_is_strict_and_flags_are_octal() {
+            assert_eq!(
+                fdinfo_number("flags:\t0100002\n", "flags:", 8).unwrap(),
+                0o100002
+            );
+            for info in [
+                "",
+                "mnt_id: x",
+                "mnt_id: 1\nmnt_id: 2",
+                "mnt_id: 4294967296",
+            ] {
+                assert!(fdinfo_number(info, "mnt_id:", 10).is_err());
+            }
+        }
+
+        #[test]
+        fn ptrace_exit_stop_keeps_fd_table_available() {
+            let null = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("/dev/null")
+                .unwrap();
+            let identity = fd_identity(std::process::id(), null.as_raw_fd()).unwrap();
+            let guard = FdGuard {
+                expected: (0..=2).map(|fd| (fd, identity.clone())).collect(),
+                host_mount_id: u32::MAX,
+                host_objects: Vec::new(),
+            };
+            let mut command = Command::new("/bin/true");
+            command
+                .stdin(Stdio::from(null.try_clone().unwrap()))
+                .stdout(Stdio::from(null.try_clone().unwrap()))
+                .stderr(Stdio::from(null.try_clone().unwrap()));
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 4u32) < 0
+                        || libc::ptrace(
+                            PTRACE_TRACEME,
+                            0,
+                            std::ptr::null_mut::<libc::c_void>(),
+                            std::ptr::null_mut::<libc::c_void>(),
+                        ) < 0
+                    {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let mut child = command.spawn().unwrap();
+            let pid = child.id() as i32;
+            let mut status = 0;
+            let result = (|| -> io::Result<()> {
+                if unsafe { libc::waitpid(pid, &mut status, 0) } != pid || !libc::WIFSTOPPED(status)
+                {
+                    return Err(io::Error::other("missing exec stop"));
+                }
+                verify_child_fds(pid as u32, &guard)?;
+                ptrace_request(
+                    PTRACE_SETOPTIONS,
+                    pid,
+                    std::ptr::null_mut(),
+                    PTRACE_O_TRACEEXIT as *mut libc::c_void,
+                )?;
+                ptrace_request(PTRACE_CONT, pid, std::ptr::null_mut(), std::ptr::null_mut())?;
+                if unsafe { libc::waitpid(pid, &mut status, 0) } != pid
+                    || ptrace_wait_stop(status) != Some((libc::SIGTRAP, PTRACE_EVENT_EXIT))
+                {
+                    return Err(io::Error::other("missing exit stop"));
+                }
+                verify_child_fds(pid as u32, &guard)?;
+                ptrace_request(PTRACE_CONT, pid, std::ptr::null_mut(), std::ptr::null_mut())?;
+                Ok(())
+            })();
+            if result.is_err() {
+                child.kill().unwrap();
+            }
+            child.wait().unwrap();
+            result.unwrap();
+        }
+
+        #[test]
+        fn stopped_child_fd_guard_rejects_leaks_and_identity_mismatches() {
+            let null = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("/dev/null")
+                .unwrap();
+            let identity = fd_identity(std::process::id(), null.as_raw_fd()).unwrap();
+            let mut guard = FdGuard {
+                expected: (0..=2).map(|fd| (fd, identity.clone())).collect(),
+                host_mount_id: u32::MAX,
+                host_objects: Vec::new(),
+            };
+            for leak in [false, true] {
+                let mut child = Command::new("/bin/sh")
+                    .args([
+                        "-c",
+                        if leak {
+                            "exec 9</dev/null; kill -STOP $$; exit 0"
+                        } else {
+                            "kill -STOP $$; exit 0"
+                        },
+                    ])
+                    .stdin(Stdio::from(null.try_clone().unwrap()))
+                    .stdout(Stdio::from(null.try_clone().unwrap()))
+                    .stderr(Stdio::from(null.try_clone().unwrap()))
+                    .spawn()
+                    .unwrap();
+                let pid = child.id();
+                let mut status = 0;
+                assert_eq!(
+                    unsafe { libc::waitpid(pid as i32, &mut status, libc::WUNTRACED) },
+                    pid as i32
+                );
+                let result = (|| -> io::Result<()> {
+                    if !libc::WIFSTOPPED(status) {
+                        return Err(io::Error::other("fixture did not stop"));
+                    }
+                    assert_eq!(verify_child_fds(pid, &guard).is_ok(), !leak);
+                    if !leak {
+                        guard.expected[0].1.flags ^= libc::O_NONBLOCK as u32;
+                        assert!(verify_child_fds(pid, &guard).is_err());
+                        guard.expected[0].1.flags ^= libc::O_NONBLOCK as u32;
+                        guard.host_mount_id = identity.mount_id;
+                        assert!(verify_child_fds(pid, &guard).is_ok());
+                        guard.host_mount_id = u32::MAX;
+                        // A different mount ID must not hide a bind alias of the Host device.
+                        guard.host_objects.push((identity.device, identity.inode));
+                        assert!(verify_child_fds(pid, &guard).is_err());
+                        guard.host_objects.clear();
+                        let missing = guard.expected.pop().unwrap();
+                        assert!(verify_child_fds(pid, &guard).is_err());
+                        guard.expected.push(missing);
+                    }
+                    Ok(())
+                })();
+                child.kill().unwrap();
+                child.wait().unwrap();
+                result.unwrap();
+                assert!(verify_child_fds(pid, &guard).is_err());
+            }
+        }
+    }
+
+    struct ExecStopGuard<'a> {
+        expected_context: &'a str,
+        expected_exe: (u64, u64),
+        expected_mount_namespace: Option<&'a str>,
+        expected_sequence: Option<u32>,
+        fds: Option<&'a FdGuard>,
+        post_fd_verified: std::cell::Cell<bool>,
+    }
+
+    fn observe_exec_stop(
+        pid: libc::pid_t,
+        starttime_before: u64,
+        guard: &ExecStopGuard<'_>,
+    ) -> io::Result<()> {
+        let tid = pid;
+        let process_attr = format!("/proc/{pid}/attr/current");
+        let task_attr = format!("/proc/{pid}/task/{tid}/attr/current");
+        let starttime = proc_starttime(pid);
+        let executable = proc_link(&format!("/proc/{pid}/exe"));
+        let executable_identity = proc_executable_identity(pid);
+        let mount_namespace = proc_link(&format!("/proc/{pid}/ns/mnt"));
+        let process_context = proc_text(&process_attr);
+        let process_attr_label = proc_file_context(&process_attr);
+        let task_context = proc_text(&task_attr);
+        let task_attr_label = proc_file_context(&task_attr);
+        let global_enforcing = read("/sys/fs/selinux/enforce").is_ok_and(|value| value == "1");
+        let target_permissive = if guard.expected_context == TARGET {
+            let state = decision(TARGET, TARGET, "process", "getattr", "reference");
+            if state.sequence == guard.expected_sequence {
+                state.permissive
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        println!(
+            "ptrace_exec_observation pid={pid} tid={tid} starttime_before={starttime_before} global_enforcing={global_enforcing} target_permissive={target_permissive:?} {} {} {} {} {} {} {} {}",
+            observation_field("starttime", starttime.clone()),
+            observation_field("executable", executable),
+            observation_field("executable_dev_ino", executable_identity.clone()),
+            observation_field("mount_namespace", mount_namespace.clone()),
+            observation_field("process_context", process_context.clone()),
+            observation_field("process_attr_file_context", process_attr_label.clone()),
+            observation_field("task_context", task_context.clone()),
+            observation_field("task_attr_file_context", task_attr_label.clone()),
+        );
+        let starttime_after = starttime.ok();
+        let process_sid = process_context.ok();
+        let process_label = process_attr_label.ok();
+        let task_sid = task_context.ok();
+        let task_label = task_attr_label.ok();
+        let actual_exe = executable_identity.ok();
+        let actual_namespace = mount_namespace.ok();
+        if !parent_exec_valid(
+            guard.expected_context,
+            process_sid.as_deref(),
+            task_sid.as_deref(),
+            process_label.as_deref(),
+            task_label.as_deref(),
+            Some(starttime_before),
+            starttime_after,
+            guard.expected_exe,
+            actual_exe,
+            guard.expected_mount_namespace,
+            actual_namespace.as_deref(),
+            global_enforcing,
+            target_permissive,
+        ) {
+            return Err(io::Error::other(
+                "parent-side PTRACE_EVENT_EXEC validation failed; child was not resumed",
+            ));
+        }
+        if let Some(fds) = guard.fds {
+            let exe_label =
+                proc_file_context(&format!("/proc/{pid}/exe")).map_err(io::Error::other)?;
+            if exe_label != "u:object_r:ssal_guest_probe_exec:s0" {
+                return Err(io::Error::other("unexpected exec-stop executable label"));
+            }
+            verify_child_fds(pid as u32, fds)?;
+            println!("inherited_fd_isolation=PASS scope=ptrace_exec_stop");
+        }
+        Ok(())
+    }
+
     fn wait_ptraced(
         pid: libc::pid_t,
         deadline: Instant,
+        guard: &ExecStopGuard<'_>,
     ) -> io::Result<(i32, bool, bool)> {
         let mut status = 0;
         let mut options_set = false;
         let mut exec_event = false;
+        let mut starttime_before = None;
         loop {
-            let result = unsafe {
-                libc::waitpid(pid, &mut status, libc::WNOHANG | libc::WUNTRACED)
-            };
+            let result =
+                unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG | libc::WUNTRACED) };
             if result == pid {
                 let Some((signal, event)) = ptrace_wait_stop(status) else {
                     return Ok((status, false, exec_event));
@@ -576,11 +1884,25 @@ mod unix {
                             "unexpected initial ptrace stop: signal={signal} event={event}"
                         )));
                     }
+                    starttime_before = match proc_starttime(pid) {
+                        Ok(starttime) => Some(starttime),
+                        Err(error) => {
+                            stop_and_reap(pid, &mut status);
+                            return Err(io::Error::other(format!(
+                                "cannot identify child before exec: {error}"
+                            )));
+                        }
+                    };
                     if let Err(error) = ptrace_request(
                         PTRACE_SETOPTIONS,
                         pid,
                         std::ptr::null_mut(),
-                        PTRACE_O_TRACEEXEC as *mut libc::c_void,
+                        (PTRACE_O_TRACEEXEC
+                            | if guard.fds.is_some() {
+                                PTRACE_O_TRACEEXIT
+                            } else {
+                                0
+                            }) as *mut libc::c_void,
                     ) {
                         stop_and_reap(pid, &mut status);
                         return Err(io::Error::other(format!(
@@ -588,12 +1910,9 @@ mod unix {
                         )));
                     }
                     options_set = true;
-                    if let Err(error) = ptrace_request(
-                        PTRACE_CONT,
-                        pid,
-                        std::ptr::null_mut(),
-                        std::ptr::null_mut(),
-                    ) {
+                    if let Err(error) =
+                        ptrace_request(PTRACE_CONT, pid, std::ptr::null_mut(), std::ptr::null_mut())
+                    {
                         stop_and_reap(pid, &mut status);
                         return Err(io::Error::other(format!("PTRACE_CONT: {error}")));
                     }
@@ -602,19 +1921,40 @@ mod unix {
 
                 if event == PTRACE_EVENT_EXEC {
                     exec_event = true;
-                    let context = match read(&format!("/proc/{pid}/attr/current")) {
-                        Ok(context) => format!("context={context}"),
-                        Err(error) => format!("context_read_error={error}"),
+                    let Some(starttime_before) = starttime_before else {
+                        stop_and_reap(pid, &mut status);
+                        return Err(io::Error::other(
+                            "child starttime was not captured before exec",
+                        ));
                     };
-                    match read_aarch64_pc(pid) {
-                        Ok(pc) => println!("ptrace_event=EXEC pid={pid} pc=0x{pc:x} {context}"),
-                        Err(error) => println!("ptrace_event=EXEC pid={pid} getregset=failed error={error} {context}"),
+                    if let Err(error) = observe_exec_stop(pid, starttime_before, guard) {
+                        stop_and_reap(pid, &mut status);
+                        return Err(error);
                     }
+                    match read_aarch64_pc(pid) {
+                        Ok(pc) => println!("ptrace_event=EXEC pid={pid} pc=0x{pc:x}"),
+                        Err(error) => {
+                            println!("ptrace_event=EXEC pid={pid} getregset=failed error={error}")
+                        }
+                    }
+                } else if event == PTRACE_EVENT_EXIT && exec_event && guard.fds.is_some() {
+                    if guard.post_fd_verified.get() {
+                        stop_and_reap(pid, &mut status);
+                        return Err(io::Error::other("duplicate property FD checkpoint"));
+                    }
+                    if let Err(error) = verify_child_fds(pid as u32, guard.fds.unwrap()) {
+                        stop_and_reap(pid, &mut status);
+                        return Err(error);
+                    }
+                    guard.post_fd_verified.set(true);
+                    println!("property_fd_checkpoint=PASS scope=ptrace_exit_stop");
                 } else if signal == libc::SIGSEGV {
                     println!("ptrace_signal=SIGSEGV pid={pid}");
                     match read_siginfo(pid) {
                         Ok((si_code, fault_addr)) => {
-                            println!("ptrace_siginfo si_code={si_code} fault_addr=0x{fault_addr:x}");
+                            println!(
+                                "ptrace_siginfo si_code={si_code} fault_addr=0x{fault_addr:x}"
+                            );
                         }
                         Err(error) => println!("ptrace_getsiginfo=failed error={error}"),
                     }
@@ -657,20 +1997,17 @@ mod unix {
     }
 
     pub fn run(args: &[String]) -> io::Result<()> {
-        let (helper_path, sha256, transition, identity_report, ptrace) =
-            match parse_args(args).map_err(io::Error::other)? {
-                Mode::Control { helper, sha256 } => (helper, sha256, false, true, false),
-                Mode::Run { helper, sha256 } => (helper, sha256, true, true, false),
-                Mode::BareControl { helper, sha256 } => (helper, sha256, false, false, false),
-                Mode::BareRun { helper, sha256 } => (helper, sha256, true, false, false),
-                Mode::BarePtraceControl { helper, sha256 } => {
-                    (helper, sha256, false, false, true)
-                }
-                Mode::BarePtraceRun { helper, sha256 } => {
-                    (helper, sha256, true, false, true)
-                }
-                Mode::DryRun => return Err(io::Error::other("dry-run cannot execute")),
-            };
+        let mode = parse_args(args).map_err(io::Error::other)?;
+        let (helper_path, sha256, plan) = execution_plan(&mode)
+            .ok_or_else(|| io::Error::other("read-only mode cannot execute"))?;
+        let ExecutionPlan {
+            transition,
+            identity_report,
+            ptrace,
+            property_area,
+            proc_only,
+            preflight_only,
+        } = plan;
         if read("/sys/fs/selinux/enforce")? != "1" {
             return Err(io::Error::other("global Enforcing required"));
         }
@@ -678,15 +2015,32 @@ mod unix {
         if source != "u:r:ksu:s0" {
             return Err(io::Error::other("expected ksu source"));
         }
+        let launcher = File::open("/proc/self/exe")?;
+        let launcher_meta = launcher.metadata()?;
+        verify_aarch64_executable(&launcher, &launcher_meta)?;
+        println!(
+            "launcher_path={:?} launcher_context={} launcher_sha256={} launcher_mode=0{:o} launcher_elf=ELF64_AArch64",
+            fs::read_link("/proc/self/exe")?,
+            label(&launcher)?,
+            file_hash(&launcher)?,
+            launcher_meta.mode() & 0o7777
+        );
         let helper = File::open(helper_path)?;
         let meta = helper.metadata()?;
         if !meta.is_file() {
             return Err(io::Error::other("helper must be a regular file"));
         }
+        verify_aarch64_executable(&helper, &meta)?;
+        println!(
+            "helper_path={helper_path:?} helper_context={} helper_mode=0{:o} helper_elf=ELF64_AArch64",
+            label(&helper)?,
+            meta.mode() & 0o7777
+        );
         if file_hash(&helper)? != sha256.to_ascii_lowercase() {
             return Err(io::Error::other("helper SHA-256 mismatch"));
         }
         let mut sequence = None;
+        let mut required_issues = Vec::new();
         let permissive = if transition {
             let file_label = label(&helper)?;
             if file_label != "u:object_r:ssal_guest_probe_exec:s0" {
@@ -694,44 +2048,116 @@ mod unix {
                     "unexpected helper label: {file_label}"
                 )));
             }
-            let mut checks = vec![
-                (source.as_str(), source.as_str(), "process", "setexec"),
-                (source.as_str(), TARGET, "process", "transition"),
-                (TARGET, file_label.as_str(), "file", "entrypoint"),
-            ];
-            for permission in ["open", "read", "getattr", "execute", "map"] {
-                checks.push((&source, &file_label, "file", permission));
-            }
-            for (s, t, class, permission) in checks {
-                let (allowed, _, seq) = decision(s, t, class, permission)?;
-                if !allowed {
-                    return Err(io::Error::other("required AV denied"));
+            println!(
+                "helper_context={} known_successful_guest_context=u:object_r:ssal_guest_probe_exec:s0 helper_context_match=true",
+                file_label
+            );
+            for request @ (s, t, class, permission, _) in
+                transition_av_requests(&source, &file_label)
+            {
+                let query = decision(s, t, class, permission, "required");
+                if class == "file" && permission == "execute" {
+                    record_av_crosscheck("known_guest_helper_execute", AvStatus::Allowed, &query);
                 }
+                record_required_issue(&mut required_issues, request, &query);
+                if let Some(seq) = query.sequence {
+                    if sequence.replace(seq).is_some_and(|old| old != seq) {
+                        return Err(io::Error::other("policy sequence changed"));
+                    }
+                }
+            }
+            let target_state = decision(TARGET, TARGET, "process", "getattr", "reference");
+            if let Some(seq) = target_state.sequence {
                 if sequence.replace(seq).is_some_and(|old| old != seq) {
                     return Err(io::Error::other("policy sequence changed"));
                 }
             }
-            let (_, permissive, seq) = decision(TARGET, TARGET, "process", "getattr")?;
-            if Some(seq) != sequence || !target_state_allowed(permissive) {
-                return Err(io::Error::other(
-                    "target permissive or policy sequence changed",
-                ));
+            let permissive = target_state
+                .permissive
+                .ok_or_else(|| io::Error::other("target Enforcing state query failed"))?;
+            if !target_state_allowed(permissive) {
+                return Err(io::Error::other("target domain is permissive"));
             }
             Some(permissive)
         } else {
             None
         };
+        let (host_property_before, host_processes_before) = if property_area {
+            let (host, processes) = property_area_preflight(&mut sequence, &mut required_issues)?;
+            let after = decision(TARGET, TARGET, "process", "getattr", "reference");
+            if let Some(seq) = after.sequence {
+                if sequence.replace(seq).is_some_and(|old| old != seq) {
+                    return Err(io::Error::other(
+                        "policy sequence changed during property-area checks",
+                    ));
+                }
+            }
+            if after.permissive != permissive {
+                return Err(io::Error::other(
+                    "target Enforcing state query failed or changed during property-area checks",
+                ));
+            }
+            (Some(host), Some(processes))
+        } else if proc_only {
+            let (host, processes) = proc_only_preflight(&mut sequence, &mut required_issues)?;
+            let after = decision(TARGET, TARGET, "process", "getattr", "reference");
+            if let Some(seq) = after.sequence {
+                if sequence.replace(seq).is_some_and(|old| old != seq) {
+                    return Err(io::Error::other(
+                        "policy sequence changed during Proc-Only preflight",
+                    ));
+                }
+            }
+            if after.permissive != permissive {
+                return Err(io::Error::other(
+                    "target Enforcing state query failed or changed during Proc-Only preflight",
+                ));
+            }
+            (Some(host), Some(processes))
+        } else {
+            (None, None)
+        };
+        if let Some(message) = required_av_block_message(&required_issues) {
+            return Err(io::Error::other(message));
+        }
         println!(
-            "mode={}; transition={}; reporter={}; helper_dev={} helper_ino={}",
-            if transition { "transition" } else { "control" },
+            "mode={}; transition={}; reporter={}; property_area_live_poc={}; proc_only={}; helper_dev={} helper_ino={}",
+            if proc_only && preflight_only { "proc-only-preflight" } else if proc_only { "proc-only" } else if preflight_only { "property-area-preflight" } else if property_area { "property-area-live" } else if transition { "transition" } else { "control" },
             if transition { "requested" } else { "not_run" },
             if identity_report { "identity" } else { "bare" },
+            if preflight_only { "read_only" } else if property_area { "approved" } else { "not_run" },
+            if proc_only { "enabled" } else { "not_run" },
             meta.dev(),
             meta.ino()
         );
-        if transition {
-            // AV queries cannot prove the label of future procfs entries.
-            println!("reporter_paths=/proc/self/exe,/proc/self/ns,/proc/self/attr/current,/proc/self/status; target_proc_labels=unknown_before_exec");
+        if transition && !preflight_only {
+            println!("reporter_paths=/proc/self/exe,/proc/self/ns,/proc/self/attr/current,/proc/self/status; proc_attr_label=observed_at_ptrace_exec_stop");
+        }
+
+        if preflight_only {
+            let host_after = host_property_snapshot()?;
+            let processes_after = host_process_snapshot()?;
+            let host_path_unchanged = host_property_before.as_ref() == Some(&host_after);
+            let host_processes_unchanged = host_processes_before
+                .as_ref()
+                .is_some_and(|before| host_process_snapshots_match(before, &processes_after));
+            println!(
+                "host_path_unchanged={host_path_unchanged} host_property_files_unchanged={host_path_unchanged} host_property_file_contents=not_checked host_processes_unchanged={host_processes_unchanged}"
+            );
+            if !host_path_unchanged || !host_processes_unchanged {
+                return Err(io::Error::other(
+                    "read-only preflight Host identity changed during its snapshot",
+                ));
+            }
+            println!(
+                "PASS: read-only preflight; child=not_created; mount=not_attempted; mode={}",
+                if proc_only {
+                    "proc-only"
+                } else {
+                    "property-area"
+                }
+            );
+            return Ok(());
         }
 
         let argv0 = CString::new(helper_path.as_bytes()).map_err(io::Error::other)?;
@@ -740,11 +2166,69 @@ mod unix {
         let (trace_read, trace_write) = pipe_pair()?;
         let stage_env = CString::new(format!("SSAL_STAGE_FD={}", trace_write.as_raw_fd()))
             .map_err(io::Error::other)?;
-        let env = [stage_env.as_ptr(), std::ptr::null()];
-        let fds: Vec<i32> = fs::read_dir("/proc/self/fd")?
-            .filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
-            .filter(|&n| n > 2)
-            .collect();
+        let approved_env = CString::new("SSAL_PROPERTY_AREA_APPROVED=1").unwrap();
+        let proc_only_env = CString::new("SSAL_PROC_ONLY=1").unwrap();
+        let property_env = host_property_before
+            .as_ref()
+            .map(|host| -> io::Result<Vec<CString>> {
+                Ok(vec![
+                    CString::new(format!("SSAL_HOST_MNT_NS={}", host.mount_namespace))
+                        .map_err(io::Error::other)?,
+                    CString::new(format!("SSAL_HOST_DIR_DEV={}", host.dir_dev))
+                        .map_err(io::Error::other)?,
+                    CString::new(format!("SSAL_HOST_DIR_INO={}", host.dir_ino))
+                        .map_err(io::Error::other)?,
+                    CString::new(format!("SSAL_HOST_MOUNT_ID={}", host.mount_id))
+                        .map_err(io::Error::other)?,
+                ])
+            })
+            .transpose()
+            .map_err(io::Error::other)?;
+        let mut env = vec![stage_env.as_ptr()];
+        if property_area {
+            env.push(approved_env.as_ptr());
+            env.extend(
+                property_env
+                    .as_ref()
+                    .expect("property-area run has Host snapshot")
+                    .iter()
+                    .map(|value| value.as_ptr()),
+            );
+        }
+        if proc_only {
+            env.push(proc_only_env.as_ptr());
+        }
+        env.push(std::ptr::null());
+        let mut kmsg_cursor = if proc_only { kernel_log_cursor() } else { None };
+        let null_input = File::open("/dev/null")?;
+        let fd_guard = if property_area {
+            Some(FdGuard {
+                expected: vec![
+                    (0, fd_identity(std::process::id(), null_input.as_raw_fd())?),
+                    (
+                        1,
+                        fd_identity(std::process::id(), stdout_write.as_raw_fd())?,
+                    ),
+                    (
+                        2,
+                        fd_identity(std::process::id(), stderr_write.as_raw_fd())?,
+                    ),
+                    (
+                        trace_write.as_raw_fd(),
+                        fd_identity(std::process::id(), trace_write.as_raw_fd())?,
+                    ),
+                ],
+                host_mount_id: host_property_before.as_ref().unwrap().mount_id,
+                host_objects: {
+                    let host = host_property_before.as_ref().unwrap();
+                    std::iter::once((host.dir_dev, host.dir_ino))
+                        .chain(host.entries.iter().map(|entry| (entry.dev, entry.ino)))
+                        .collect()
+                },
+            })
+        } else {
+            None
+        };
         let pid = unsafe { libc::fork() };
         if pid < 0 {
             let error = io::Error::last_os_error();
@@ -762,7 +2246,7 @@ mod unix {
                     env.as_ptr(),
                     transition,
                     ptrace,
-                    &fds,
+                    property_area,
                     stdout_read.as_raw_fd(),
                     stdout_write.as_raw_fd(),
                     stderr_read.as_raw_fd(),
@@ -778,8 +2262,47 @@ mod unix {
         println!("child_pid={pid}; fork=ok");
         let deadline = Instant::now() + Duration::from_secs(3);
         let mut status = 0;
+        let expected_context = if transition { TARGET } else { source.as_str() };
+        let expected_mount_namespace = if proc_only {
+            host_property_before
+                .as_ref()
+                .map(|host| host.mount_namespace.as_str())
+        } else {
+            None
+        };
+        let exec_guard = ExecStopGuard {
+            expected_context,
+            expected_exe: (meta.dev(), meta.ino()),
+            expected_mount_namespace,
+            expected_sequence: sequence,
+            fds: fd_guard.as_ref(),
+            post_fd_verified: std::cell::Cell::new(false),
+        };
         let (status, timed_out, exec_event_seen) = if ptrace {
-            wait_ptraced(pid, deadline)?
+            match wait_ptraced(pid, deadline, &exec_guard) {
+                Ok(result) => result,
+                Err(error) => {
+                    // wait_ptraced kills and reaps on failure; still report Host checks.
+                    if let Some(before) = &host_property_before {
+                        println!(
+                            "host_path_unchanged={} host_property_file_contents=not_checked",
+                            host_property_snapshot().is_ok_and(|after| *before == after)
+                        );
+                    }
+                    if let Some(before) = &host_processes_before {
+                        println!(
+                            "host_processes_unchanged={}",
+                            host_process_snapshot()
+                                .is_ok_and(|after| host_process_snapshots_match(before, &after))
+                        );
+                    }
+                    println!(
+                        "global_enforcing_after={} namespace_cleanup=UNVERIFIED",
+                        read("/sys/fs/selinux/enforce").is_ok_and(|value| value == "1")
+                    );
+                    return Err(error);
+                }
+            }
         } else {
             let mut timed_out = false;
             loop {
@@ -807,6 +2330,46 @@ mod unix {
             (status, timed_out, false)
         };
         println!("child_wait_status=0x{status:04x}; timed_out={timed_out}");
+        let (host_path_unchanged, host_processes_unchanged) = if let Some(host_before) =
+            &host_property_before
+        {
+            let path_unchanged = match host_property_snapshot() {
+                Ok(host_after) => {
+                    let unchanged = host_before == &host_after;
+                    println!(
+                            "host_mount_namespace_after={} host_property_dir_dev_after={} host_property_dir_ino_after={} host_mount_id_after={} host_property_entries_after={} host_path_unchanged={unchanged} host_property_files_unchanged={unchanged} host_property_file_contents=not_checked",
+                            host_after.mount_namespace,
+                            host_after.dir_dev,
+                            host_after.dir_ino,
+                            host_after.mount_id,
+                            host_after.entries.len()
+                        );
+                    unchanged
+                }
+                Err(error) => {
+                    println!("host_path_check=failed error={error}");
+                    false
+                }
+            };
+            let processes_unchanged = match host_process_snapshot() {
+                Ok(processes_after) => {
+                    let unchanged = host_processes_before.as_ref().is_some_and(|before| {
+                        host_process_snapshots_match(before, &processes_after)
+                    });
+                    println!(
+                            "host_processes_after={processes_after:?} host_processes_unchanged={unchanged}"
+                        );
+                    unchanged
+                }
+                Err(error) => {
+                    println!("host_process_check=failed error={error}");
+                    false
+                }
+            };
+            (path_unchanged, processes_unchanged)
+        } else {
+            (true, true)
+        };
         if ptrace {
             println!(
                 "ptrace_exec_event={}",
@@ -833,11 +2396,24 @@ mod unix {
             if reporter_main { "seen" } else { "not_seen" }
         );
 
+        let (kernel_log, kmsg_overrun, kmsg_readable) = match kmsg_cursor.as_mut() {
+            Some(cursor) => match read_kernel_log_updates(cursor) {
+                Ok((log, overrun)) => {
+                    println!("proc_avc_capture=available overrun={overrun}");
+                    (log, overrun, true)
+                }
+                Err(error) => {
+                    println!("proc_avc_capture=read_failed error={error}");
+                    (String::new(), false, false)
+                }
+            },
+            None => (String::new(), false, false),
+        };
+
         let mut output = String::new();
         stdout_read.take(16384).read_to_string(&mut output)?;
-        let expected_context = if transition { TARGET } else { source.as_str() };
         let reporter_valid = if identity_report {
-            let identity: serde_json::Value = match serde_json::from_str(&output) {
+            let mut identity: serde_json::Value = match serde_json::from_str(&output) {
                 Ok(identity) => identity,
                 Err(error) => {
                     let stderr = String::from_utf8_lossy(&collect_pipe(stderr_read)?).into_owned();
@@ -851,12 +2427,85 @@ mod unix {
                     )));
                 }
             };
+            let proc_identity_valid = if proc_only {
+                let avc_confirmed = avc_confirms_proc_denial(&kernel_log, pid as u32);
+                let path_failure = identity["proc_only"]["path_resolution_failure"]
+                    .as_bool()
+                    .unwrap_or(false);
+                let failed = identity["proc_only"]["results"]
+                    .as_array()
+                    .is_some_and(|results| {
+                        results.iter().any(|result| {
+                            result["open_succeeded"] == false || result["read_succeeded"] == false
+                        })
+                    });
+                let failure_class = if failed {
+                    proc_failure_class(avc_confirmed, false, path_failure)
+                } else {
+                    "NO_FAILURE"
+                };
+                let matching_avcs = kernel_log
+                    .lines()
+                    .filter(|line| avc_confirms_proc_denial(line, pid as u32))
+                    .collect::<Vec<_>>();
+                println!(
+                    "proc_failure_class={failure_class} selinux_avc_confirmed={avc_confirmed} dac_denial_confirmed=false avc_log_available={kmsg_readable} avc_log_overrun={kmsg_overrun} matching_avc={matching_avcs:?}"
+                );
+                identity["proc_only"]["failure_class"] =
+                    serde_json::Value::String(failure_class.to_owned());
+                identity["proc_only"]["selinux_avc_confirmed"] =
+                    serde_json::Value::Bool(avc_confirmed);
+                identity["proc_only"]["dac_denial_confirmed"] = serde_json::Value::Bool(false);
+                identity["proc_only"]["avc_log_available"] = serde_json::Value::Bool(kmsg_readable);
+                proc_report_valid(&identity, pid as u32)
+            } else {
+                true
+            };
+            if property_area {
+                // This field is parent evidence, never a claim trusted from Guest JSON.
+                identity["property_area_live_poc"]["host_fd_separated"] =
+                    serde_json::Value::Bool(exec_event_seen && exec_guard.post_fd_verified.get());
+                identity["property_area_live_poc"]["host_fd_scope"] =
+                    serde_json::Value::String("exec_and_exit_stop".into());
+            }
             println!("child={identity}");
-            identity["protocol"] == 1
+            let identity_valid = identity["protocol"] == 1
                 && identity["pid"] == pid as u32
-                && identity["context"] == expected_context
-                && identity["executable_dev"] == meta.dev()
-                && identity["executable_ino"] == meta.ino()
+                && if proc_only {
+                    proc_identity_valid
+                } else {
+                    identity["context"] == expected_context
+                        && identity["executable_dev"] == meta.dev()
+                        && identity["executable_ino"] == meta.ino()
+                };
+            identity_valid
+                && (!property_area || {
+                    let area = &identity["property_area_live_poc"];
+                    let host = host_property_before.as_ref().unwrap();
+                    area["status"] == "passed"
+                        && area["mount_namespace_before"] == host.mount_namespace
+                        && area["mount_namespace_after"] != host.mount_namespace
+                        && area["host_dir_dev"] == host.dir_dev
+                        && area["host_dir_ino"] == host.dir_ino
+                        && area["host_mount_id"] == host.mount_id
+                        && area["area_size"] == 128 * 1024
+                        && area["property_label"] == PROPERTY_AREA_CONTEXT
+                        && area["property"] == "ssal.guest.poc"
+                        && area["value"] == "guest-area-ok"
+                        && area["fsetxattr_attempted"] == true
+                        && area["fsetxattr_succeeded"] == true
+                        && area["fsetxattr_errno"] == 0
+                        && area["writer_mapped"] == true
+                        && area["property_added"] == true
+                        && area["reader_mapped"] == true
+                        && area["property_found"] == true
+                        && area["readonly_value_match"] == true
+                        && area["separate_mapping"] == true
+                        && area["host_area_separated"] == true
+                        && area["host_fd_separated"] == true
+                        && exec_guard.post_fd_verified.get()
+                        && area["cleanup"] == "namespace_teardown_after_child_exit"
+                })
         } else {
             let exit_probe = bare_exit_probe_succeeded(status, &output);
             let entered = exit_probe || bare_output_matches_context(&output, expected_context);
@@ -873,18 +2522,27 @@ mod unix {
         };
         let status_valid = (status & 0x7f == 0 && (status >> 8) & 0xff == 0)
             || bare_exit_probe_succeeded(status, &output);
-        let valid = status_valid && !timed_out && reporter_valid;
+        let valid = status_valid
+            && !timed_out
+            && reporter_valid
+            && (!identity_report || reporter_main)
+            && (!proc_only || exec_event_seen);
         let enforcing_after = read("/sys/fs/selinux/enforce")? == "1";
         let state_matches = if transition {
-            let (_, after, after_seq) = decision(TARGET, TARGET, "process", "getattr")?;
-            Some(after) == permissive && Some(after_seq) == sequence
+            let after = decision(TARGET, TARGET, "process", "getattr", "reference");
+            after.permissive == permissive && after.sequence == sequence
         } else {
             true
         };
         let stderr = String::from_utf8_lossy(&collect_pipe(stderr_read)?).into_owned();
+        if !stderr.is_empty() {
+            println!("child_stderr={stderr:?}");
+        }
         if !valid
             || !enforcing_after
             || !state_matches
+            || !host_path_unchanged
+            || !host_processes_unchanged
             || file_hash(&helper)? != sha256.to_ascii_lowercase()
         {
             if status & 0x7f != 0 || timed_out {
@@ -898,11 +2556,13 @@ mod unix {
                 )));
             }
             return Err(io::Error::other(
-                "identity, process status, or post-exec policy state mismatch",
+                format!("identity, process status, property-area result, or post-exec policy state mismatch; child_stderr={stderr:?}"),
             ));
         }
         if transition {
-            if identity_report {
+            if property_area {
+                println!("PASS: independent Enforcing Guest Property Area created; Bionic write, separate read-only mapping, labels, inode/mount separation, Host processes and Enforcing verified; cleanup=namespace_teardown_after_child_exit");
+            } else if identity_report {
                 println!("PASS: child reaped; actual target SID confirmed; global Enforcing retained; target_permissive={}", permissive.unwrap_or(false));
             } else if bare_exit_probe_succeeded(status, &output) {
                 println!(
@@ -951,13 +2611,13 @@ mod tests {
             chunks: vec![],
             short: false,
         };
-        write_access_request(&mut good, "u:r:ksu:s0", "u:r:ksu:s0", 1, 0x20000).unwrap();
-        assert_eq!(good.chunks, vec![b"u:r:ksu:s0 u:r:ksu:s0 1 20000".to_vec()]);
+        write_access_request(&mut good, "u:r:ksu:s0", "u:r:ksu:s0", 1).unwrap();
+        assert_eq!(good.chunks, vec![b"u:r:ksu:s0 u:r:ksu:s0 1".to_vec()]);
         let mut short = Writer {
             chunks: vec![],
             short: true,
         };
-        assert!(write_access_request(&mut short, "a", "b", 1, 2).is_err());
+        assert!(write_access_request(&mut short, "a", "b", 1).is_err());
         assert_eq!(short.chunks.len(), 1);
     }
     #[test]
@@ -970,10 +2630,502 @@ mod tests {
             &["--run-after-approval", "--diagnostic-permissive"][..],
             &["--run-after-approval", "/x", "--sha256", "abc"][..],
             &["--run-after-approval", "/x"][..],
+            &["--property-area-preflight", "/x"][..],
+            &["--property-area-live-after-approval", "/x"][..],
+            &["--proc-only-preflight", "/x"][..],
+            &["--proc-only-after-approval", "/x"][..],
             &["--dry-run", "x"][..],
         ] {
             assert!(parse_args(&args(a)).is_err());
         }
+    }
+
+    #[test]
+    fn property_area_mode_has_an_explicit_gate_and_exact_av_scope() {
+        let hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        assert_eq!(
+            parse_args(&args(&[
+                "--property-area-live-after-approval",
+                "/area-poc",
+                "--sha256",
+                hash
+            ])),
+            Ok(Mode::PropertyAreaRun {
+                helper: "/area-poc",
+                sha256: hash
+            })
+        );
+        let requests = property_area_av_requests(
+            "u:object_r:rootfs:s0",
+            "u:object_r:device:s0",
+            "u:object_r:properties_device:s0",
+        );
+        assert_eq!(requests.len(), 47);
+        assert!(requests.contains(&(KSU, "u:object_r:rootfs:s0", "dir", "search", false)));
+        assert!(requests.contains(&(KSU, "u:object_r:device:s0", "dir", "search", false)));
+        assert!(requests.contains(&(KSU, KSU, "capability", "sys_admin", false)));
+        assert!(requests.contains(&(
+            KSU,
+            PROPERTY_AREA_FS_CONTEXT,
+            "filesystem",
+            "relabelfrom",
+            false
+        )));
+        assert!(requests.contains(&(
+            KSU,
+            PROPERTY_AREA_FS_CONTEXT,
+            "filesystem",
+            "relabelto",
+            false
+        )));
+        assert!(requests.contains(&(KSU, PROPERTY_AREA_FS_CONTEXT, "filesystem", "mount", false)));
+        assert!(requests.contains(&(KSU, "u:object_r:rootfs:s0", "dir", "mounton", false)));
+        assert!(requests.contains(&(
+            KSU,
+            "u:object_r:properties_device:s0",
+            "dir",
+            "mounton",
+            false
+        )));
+        assert!(requests.contains(&(
+            PROPERTY_AREA_CONTEXT,
+            PROPERTY_AREA_FS_CONTEXT,
+            "filesystem",
+            "associate",
+            true
+        )));
+        assert!(requests.contains(&(TARGET, PROPERTY_AREA_CONTEXT, "file", "map", true)));
+        assert!(requests.contains(&(TARGET, PROPERTY_AREA_DIR_CONTEXT, "dir", "write", true)));
+        assert!(requests.contains(&(
+            PROPERTY_AREA_DIR_CONTEXT,
+            PROPERTY_AREA_FS_CONTEXT,
+            "filesystem",
+            "associate",
+            true
+        )));
+        assert!(!requests
+            .iter()
+            .any(|(source, target, class, permission, _)| {
+                *source == TARGET
+                    && *target == PROPERTY_AREA_FS_CONTEXT
+                    && matches!(
+                        (*class, *permission),
+                        ("dir", "write") | ("file", "create" | "write")
+                    )
+            }));
+        assert!(requests.contains(&(TARGET, PROC_CONTEXT, "lnk_file", "read", false)));
+        assert!(requests.contains(&(KSU, TARGET, "process", "getattr", false)));
+        assert!(requests.contains(&(KSU, TARGET, "file", "open", false)));
+        assert!(requests.contains(&(TARGET, TARGET, "file", "open", true)));
+        assert!(requests.contains(&(TARGET, TARGET, "file", "read", true)));
+        assert!(requests.contains(&(TARGET, TARGET, "dir", "open", false)));
+        assert!(requests.contains(&(TARGET, TARGET, "dir", "read", false)));
+        assert!(requests.contains(&(TARGET, PROC_CONTEXT, "filesystem", "getattr", true)));
+        assert!(requests.contains(&(TARGET, TARGET, "lnk_file", "read", true)));
+        assert!(requests.contains(&(TARGET, KSU, "fd", "use", true)));
+        assert!(requests.contains(&(TARGET, SYSFS_CONTEXT, "dir", "search", true)));
+        assert!(requests.contains(&(TARGET, SELINUXFS_CONTEXT, "dir", "search", true)));
+        assert!(requests.contains(&(TARGET, SELINUXFS_CONTEXT, "file", "open", true)));
+        assert!(requests.contains(&(TARGET, SELINUXFS_CONTEXT, "file", "read", true)));
+        assert!(requests.contains(&(TARGET, KSU, "fifo_file", "getattr", true)));
+        assert!(requests.contains(&(
+            TARGET,
+            "u:object_r:null_device:s0",
+            "chr_file",
+            "getattr",
+            true
+        )));
+        assert!(requests.contains(&(
+            TARGET,
+            "u:object_r:ssal_guest_probe_exec:s0",
+            "file",
+            "getattr",
+            true
+        )));
+        assert!(!requests.iter().any(|(source, _, class, permission, _)| {
+            *source == TARGET
+                && ((*class == "capability" && *permission == "sys_admin")
+                    || (*class == "filesystem" && *permission == "mount"))
+        }));
+        assert!(requests.iter().all(|(_, _, class, permission, _)| {
+            matches!(
+                *class,
+                "capability"
+                    | "dir"
+                    | "file"
+                    | "filesystem"
+                    | "lnk_file"
+                    | "process"
+                    | "fd"
+                    | "fifo_file"
+                    | "chr_file"
+            ) && !(*class == "file" && *permission == "execute")
+        }));
+    }
+
+    #[test]
+    fn property_area_preflight_requires_an_explicit_helper_hash() {
+        let hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        assert_eq!(
+            parse_args(&args(&[
+                "--property-area-preflight",
+                "/area-poc",
+                "--sha256",
+                hash
+            ])),
+            Ok(Mode::PropertyAreaPreflight {
+                helper: "/area-poc",
+                sha256: hash
+            })
+        );
+    }
+
+    #[test]
+    fn property_creation_context_requires_the_dedicated_label() {
+        assert!(expected_property_creation_context(PROPERTY_AREA_CONTEXT));
+        assert!(expected_property_creation_context(&format!(
+            "{PROPERTY_AREA_CONTEXT}\0"
+        )));
+        assert!(!expected_property_creation_context(
+            PROPERTY_AREA_FS_CONTEXT
+        ));
+        assert!(!expected_property_creation_context(""));
+        assert!(!expected_property_creation_context(&format!(
+            "{PROPERTY_AREA_CONTEXT}x"
+        )));
+    }
+
+    #[test]
+    fn proc_only_modes_are_mount_free_and_separately_approved() {
+        let hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let preflight_args = args(&["--proc-only-preflight", "/proc-helper", "--sha256", hash]);
+        let preflight = parse_args(&preflight_args).unwrap();
+        let (_, _, preflight_plan) = execution_plan(&preflight).unwrap();
+        assert_eq!(
+            preflight_plan,
+            ExecutionPlan {
+                transition: true,
+                identity_report: true,
+                ptrace: true,
+                property_area: false,
+                proc_only: true,
+                preflight_only: true,
+            }
+        );
+
+        let approved_args = args(&[
+            "--proc-only-after-approval",
+            "/proc-helper",
+            "--sha256",
+            hash,
+        ]);
+        let approved = parse_args(&approved_args).unwrap();
+        let (_, _, approved_plan) = execution_plan(&approved).unwrap();
+        assert_eq!(
+            approved_plan,
+            ExecutionPlan {
+                transition: true,
+                identity_report: true,
+                ptrace: true,
+                property_area: false,
+                proc_only: true,
+                preflight_only: false,
+            }
+        );
+        assert!(!approved_plan.property_area);
+    }
+
+    #[test]
+    fn proc_only_av_scope_never_gates_on_property_denials_but_live_still_does() {
+        let proc_requests = proc_only_av_requests();
+        assert!(proc_requests.iter().all(|(_, _, _, _, required)| !required));
+        assert!(proc_requests.contains(&(TARGET, PROC_CONTEXT, "dir", "search", false)));
+        assert!(proc_requests.contains(&(TARGET, TARGET, "file", "open", false)));
+        assert!(!proc_requests.iter().any(|(_, _, class, permission, _)| {
+            *class == "filesystem" || *permission == "create" || *permission == "write"
+        }));
+
+        let denied = AvQuery {
+            status: AvStatus::Denied,
+            permissive: Some(false),
+            sequence: Some(7),
+            query_errno: None,
+            permission_bit: Some(2),
+            allowed_mask: Some(0),
+            raw_response: Some("0 3 0 0 7 0".into()),
+        };
+        let mut issues = Vec::new();
+        record_required_issue(
+            &mut issues,
+            (TARGET, PROPERTY_AREA_FS_CONTEXT, "file", "write", false),
+            &denied,
+        );
+        assert_eq!(required_av_block_message(&issues), None);
+        record_required_issue(
+            &mut issues,
+            (TARGET, PROPERTY_AREA_FS_CONTEXT, "file", "write", true),
+            &denied,
+        );
+        assert!(required_av_block_message(&issues).is_some());
+    }
+
+    #[test]
+    fn selinux_access_response_uses_allowed_mask_and_preserves_query_errors() {
+        assert_eq!(
+            parse_access_response("7 7 0 0 19 0", 0x4).unwrap(),
+            (true, false, 19, 7)
+        );
+        assert_eq!(
+            parse_access_response("3 7 0 0 19 0", 0x4).unwrap(),
+            (false, false, 19, 3)
+        );
+        assert!(parse_access_response("0 0 0 0", 0x1).is_err());
+        assert!(parse_access_response("0 0 0 0 19 0", 0x1).is_err());
+    }
+
+    #[test]
+    fn proc_report_keeps_paths_and_initial_errno_independent() {
+        let report = serde_json::json!({
+            "protocol": 1,
+            "pid": 44,
+            "proc_only": {
+                "status": "complete",
+                "first_open_errno": 13,
+                "results": [
+                    {"requested_path":"/proc/thread-self/attr/current", "open_errno":13, "read_errno":-1, "close_errno":-1},
+                    {"requested_path":"/proc/self/attr/current", "open_errno":0, "read_errno":0, "close_errno":0},
+                    {"requested_path":"/proc/self/task/44/attr/current", "open_errno":2, "read_errno":-1, "close_errno":-1}
+                ],
+                "components": [
+                    {"requested_path":"/proc", "stat_errno":0, "readlink_errno":-1},
+                    {"requested_path":"/proc/thread-self", "stat_errno":0, "readlink_errno":0},
+                    {"requested_path":"/proc/thread-self/attr", "stat_errno":0, "readlink_errno":-1},
+                    {"requested_path":"/proc/thread-self/attr/current", "stat_errno":0, "readlink_errno":-1},
+                    {"requested_path":"/proc/self", "stat_errno":0, "readlink_errno":0},
+                    {"requested_path":"/proc/self/attr", "stat_errno":0, "readlink_errno":-1},
+                    {"requested_path":"/proc/self/attr/current", "stat_errno":0, "readlink_errno":-1},
+                    {"requested_path":"/proc/self/task", "stat_errno":0, "readlink_errno":-1},
+                    {"requested_path":"/proc/self/task/44", "stat_errno":0, "readlink_errno":-1},
+                    {"requested_path":"/proc/self/task/44/attr", "stat_errno":0, "readlink_errno":-1},
+                    {"requested_path":"/proc/self/task/44/attr/current", "stat_errno":0, "readlink_errno":-1}
+                ]
+            }
+        });
+        assert!(proc_report_valid(&report, 44));
+        let mut overwritten = report.clone();
+        overwritten["proc_only"]["first_open_errno"] = serde_json::json!(0);
+        assert!(!proc_report_valid(&overwritten, 44));
+        assert_eq!(
+            proc_failure_class(false, false, true),
+            "PATH_RESOLUTION_FAILURE"
+        );
+        assert_eq!(
+            proc_failure_class(true, false, false),
+            "SELINUX_DENIAL_CONFIRMED"
+        );
+        assert_eq!(
+            proc_failure_class(false, true, false),
+            "DAC_DENIAL_CONFIRMED"
+        );
+        assert_eq!(proc_failure_class(false, false, false), "UNDETERMINED");
+    }
+
+    #[test]
+    fn staged_helper_must_be_executable_aarch64_elf64() {
+        let mut header = [0u8; 20];
+        header[..4].copy_from_slice(b"\x7fELF");
+        header[4] = 2;
+        header[5] = 1;
+        header[18..20].copy_from_slice(&183u16.to_le_bytes());
+        assert!(is_aarch64_elf64(&header));
+        header[5] = 2;
+        assert!(!is_aarch64_elf64(&header));
+        assert!(has_executable_mode(0o755));
+        assert!(!has_executable_mode(0o644));
+    }
+
+    #[test]
+    fn parent_exec_validation_rejects_sid_mismatch_and_allows_same_mount_namespace() {
+        let valid = parent_exec_valid(
+            TARGET,
+            Some(TARGET),
+            Some(TARGET),
+            Some("u:object_r:proc_attr:s0"),
+            Some("u:object_r:proc_attr:s0"),
+            Some(500),
+            Some(500),
+            (8, 9),
+            Some((8, 9)),
+            Some("mnt:[4026531840]"),
+            Some("mnt:[4026531840]"),
+            true,
+            Some(false),
+        );
+        assert!(valid);
+        assert!(!parent_exec_valid(
+            TARGET,
+            Some(TARGET),
+            Some("u:r:ksu:s0"),
+            Some("u:object_r:proc_attr:s0"),
+            Some("u:object_r:proc_attr:s0"),
+            Some(500),
+            Some(500),
+            (8, 9),
+            Some((8, 9)),
+            Some("mnt:[4026531840]"),
+            Some("mnt:[4026531840]"),
+            true,
+            Some(false),
+        ));
+        assert!(!parent_exec_valid(
+            TARGET,
+            Some(TARGET),
+            Some(TARGET),
+            Some("u:object_r:proc_attr:s0"),
+            Some("u:object_r:proc_attr:s0"),
+            Some(500),
+            Some(500),
+            (8, 9),
+            Some((8, 9)),
+            None,
+            Some("mnt:[4026531840]"),
+            true,
+            Some(true),
+        ));
+    }
+
+    #[test]
+    fn avc_correlation_requires_child_sid_permission_and_enforcing_mode() {
+        let line = "6,400,1,-;avc: denied { open } for pid=44 comm=ssal-probe name=current dev=proc ino=1 scontext=u:r:ssal_guest_probe:s0 tcontext=u:object_r:proc:s0 tclass=file permissive=0";
+        assert!(avc_confirms_proc_denial(line, 44));
+        assert!(!avc_confirms_proc_denial(line, 45));
+        assert!(!avc_confirms_proc_denial(
+            &line.replace("permissive=0", "permissive=1"),
+            44
+        ));
+        assert!(!avc_confirms_proc_denial(
+            &line.replace("open", "write"),
+            44
+        ));
+    }
+
+    #[test]
+    fn host_process_snapshot_comparison_includes_every_identity_field() {
+        let before = vec![(
+            "zygote",
+            1765,
+            627,
+            "u:r:zygote:s0",
+            "/system/bin/app_process64",
+        )];
+        assert!(host_process_snapshots_match(&before, &before.clone()));
+        let mut after = before.clone();
+        after[0].2 += 1;
+        assert!(!host_process_snapshots_match(&before, &after));
+        after = before.clone();
+        after[0].3 = "u:r:other:s0";
+        assert!(!host_process_snapshots_match(&before, &after));
+    }
+
+    #[test]
+    fn required_av_denials_and_query_errors_block_but_references_do_not() {
+        let mut issues = Vec::new();
+        let allowed = AvQuery {
+            status: AvStatus::Allowed,
+            permissive: Some(false),
+            sequence: Some(1),
+            query_errno: None,
+            permission_bit: Some(1),
+            allowed_mask: Some(1),
+            raw_response: Some("1 1 0 0 1 0".into()),
+        };
+        record_required_issue(
+            &mut issues,
+            (TARGET, PROPERTY_AREA_FS_CONTEXT, "dir", "search", true),
+            &allowed,
+        );
+        let denied = AvQuery {
+            status: AvStatus::Denied,
+            permissive: Some(false),
+            sequence: Some(1),
+            query_errno: None,
+            permission_bit: Some(1),
+            allowed_mask: Some(0),
+            raw_response: Some("0 1 0 0 1 0".into()),
+        };
+        record_required_issue(
+            &mut issues,
+            (TARGET, PROPERTY_AREA_FS_CONTEXT, "dir", "write", true),
+            &denied,
+        );
+        let query_error = AvQuery {
+            status: AvStatus::QueryError,
+            permissive: None,
+            sequence: None,
+            query_errno: Some(libc::EINVAL),
+            permission_bit: Some(1),
+            allowed_mask: None,
+            raw_response: Some("bad response".into()),
+        };
+        record_required_issue(
+            &mut issues,
+            (TARGET, PROPERTY_AREA_FS_CONTEXT, "dir", "add_name", true),
+            &query_error,
+        );
+        record_required_issue(
+            &mut issues,
+            (TARGET, TARGET, "process", "getattr", false),
+            &denied,
+        );
+        record_required_issue(
+            &mut issues,
+            (TARGET, TARGET, "process", "getattr", false),
+            &query_error,
+        );
+        assert_eq!(
+            required_av_block_message(&issues).as_deref(),
+            Some("required AV blocked before child creation: u:r:ssal_guest_probe:s0 u:object_r:tmpfs:s0 dir:write decision=DENIED, u:r:ssal_guest_probe:s0 u:object_r:tmpfs:s0 dir:add_name decision=QUERY_ERROR query_errno=22")
+        );
+        assert_eq!(required_av_block_message(&[]), None);
+    }
+
+    #[test]
+    fn host_process_snapshot_only_selects_known_android_core_processes() {
+        assert_eq!(argv0(b"zygote64\0--zygote\0"), Ok("zygote64"));
+        assert_eq!(host_process_kind(1, "init", "", ""), Some("init"));
+        assert_eq!(
+            host_process_kind(55, "system_server", "", ""),
+            Some("system_server")
+        );
+        assert_eq!(
+            host_process_kind(88, "app_process64", "zygote64", "/system/bin/app_process64"),
+            Some("zygote")
+        );
+        assert_eq!(
+            host_process_kind(89, "main", "zygote64", "/system/bin/app_process64"),
+            Some("zygote")
+        );
+        assert_eq!(
+            host_process_kind(99, "surfaceflinger", "", ""),
+            Some("surfaceflinger")
+        );
+        assert_eq!(
+            host_process_kind(100, "main", "zygote64", "/system/bin/other"),
+            None
+        );
+        assert_eq!(
+            host_process_kind(100, "main", "other", "/system/bin/app_process64"),
+            None
+        );
+    }
+
+    #[test]
+    fn proc_starttime_parser_handles_spaces_and_parentheses_in_comm() {
+        let mut fields = vec!["0"; 20];
+        fields[0] = "S";
+        fields[19] = "627";
+        let stat = format!("15448 (main ) worker) {}", fields.join(" "));
+        assert_eq!(proc_stat_starttime(&stat), Some(627));
     }
 
     #[test]

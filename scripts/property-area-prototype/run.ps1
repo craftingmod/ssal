@@ -48,7 +48,7 @@ if($LASTEXITCODE -ne 0) { throw 'serializer build failed' }
 $lines=& "$root/serializer.exe" scripts/property-area-prototype/queries.txt scripts/property-area-prototype/contexts.txt
 if($LASTEXITCODE -ne 0 -or ($lines -join "`n") -notmatch 'BUILD_OK' -or ($lines -join "`n") -notmatch "LOOKUP`tdemo.only`tu:object_r:ssal_private_prop:s0`tstring" -or ($lines -join "`n") -notmatch "LOOKUP`tdemo.name`tu:object_r:ssal_demo_prop:s0`tstring") { throw 'synthetic serializer test failed' }
 Write-Host 'PASS: synthetic context serializer and exact/prefix lookup'
-$cmd='"'+$vc+'" >nul && clang-cl /nologo /EHsc /std:c++17 /I'+$root+'\include /Fo'+$root+'\ /Fe'+$root+'\prototype.exe scripts\property-area-prototype\harness.cpp scripts\property-area-prototype\adapter.cpp '+$root+'\area-port.cpp '+$root+'\source\prop_info.cpp'
+$cmd='"'+$vc+'" >nul && clang-cl /nologo /EHsc /std:c++17 /D_CRT_SECURE_NO_WARNINGS /FIcstring /I'+$root+'\include /I'+$core+'\libpropertyinfoserializer\include /I'+$core+'\libpropertyinfoparser\include /Fo'+$root+'\ /Fe'+$root+'\prototype.exe scripts\property-area-prototype\harness.cpp scripts\property-area-prototype\adapter.cpp '+$root+'\area-port.cpp '+$root+'\source\prop_info.cpp '+$core+'\libpropertyinfoserializer\property_info_file.cpp '+$core+'\libpropertyinfoserializer\property_info_serializer.cpp '+$core+'\libpropertyinfoserializer\trie_builder.cpp '+$core+'\libpropertyinfoserializer\trie_serializer.cpp '+$root+'\parser-port.cpp'
 cmd /c $cmd
 if($LASTEXITCODE -ne 0) { throw 'build failed' }
 $test=Join-Path $PWD "$root/test-$([guid]::NewGuid())"

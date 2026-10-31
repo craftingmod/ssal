@@ -33,6 +33,12 @@ bun run setup:windows
 ./scripts/dev.ps1 build
 ```
 
+개별 Cargo 명령은 실행 중인 개발 컨테이너에서 사용할 수 있습니다.
+
+```powershell
+wslc exec --workdir /src ssal-dev cargo test --locked --lib
+```
+
 결과는 `out/ssal-module.zip`과 `out/bin/`에 생성됩니다. 설치 후 root 셸에서 `export PATH="/data/adb/modules/ssal/bin:$PATH"`를 실행하면 해당 셸에서 `ssal`을 사용할 수 있습니다. 또는 `/data/adb/modules/ssal/bin/ssal`을 직접 실행합니다. 사용자 이미지와 상태는 모듈 업데이트 및 제거 시 보존됩니다. 빌더 이미지를 다시 빌드하고 기존 `ssal-dev`를 교체하려면 `bun run update:windows`를 실행합니다. 기존 컨테이너가 실행 중이면 중지한 뒤 삭제하고 새 컨테이너를 생성합니다. 다른 작업공간이나 이미지에 연결된 동명의 컨테이너는 교체하지 않습니다.
 
 WebUI 소스는 `frontend/`에 있으며 `bun run build:web`으로 `out/webroot/`에 빌드합니다. `bun run package`는 빌드된 바이너리와 WebUI를 모듈 ZIP으로 묶습니다. KernelSU 모듈 WebUI의 버튼으로 데몬을 재시작할 수 있으며, 이미지 등록 중에는 재시작이 거부됩니다.

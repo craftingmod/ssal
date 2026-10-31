@@ -1,5 +1,7 @@
 # Guest SELinux exec SIGSEGV 추적
 
+**후속 상태(사용자 제공):** 이후 실기기에서 Guest Enforcing 전환, PTRACE_EVENT_EXEC, 실제 Child SID u:r:ssal_guest_probe:s0 및 Bare ELF exit 42가 확인됐다. 이 문서의 SIGSEGV는 앞선 Ptrace 시험의 역사적 결과이며 현재 전환 차단 조건이 아니다. 현재 부팅 AV는 Property Area 런처가 실행 전에 읽기 전용으로 재확인한다.
+
 ## 상태
 
 Ptrace 진단 모드와 사용법을 런처에 추가했다. Windows Native 셸에서 `cargo`를 찾지 않고, 실제 Cargo가 실행되는 WSLC `ssal-dev`에서 Android AArch64 release 빌드를 완료했다. 결과 ELF는 `out/bin/ssal-guest-domain-poc-ptrace`이며 SHA-256은 `153834e8c053692630383e07be829ba06d923ccea376f536765366bc9135685e`, 크기는 676056 bytes다.
