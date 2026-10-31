@@ -220,6 +220,8 @@ mod daemon {
             };
             let manifest = serde_json::json!({"version": 2, "name": name, "image_name": image_name, "image_id": id,
                 "mount_profile": super::guest_mounts::PROFILE_NAME,
+                "guest_lock_compat": ssal::guest_lock_compat::Config::default(),
+                "guest_lock_compat_creation": {"version": 1, "userdata_state": "empty-at-creation", "application_phase": "before-first-service", "migration_allowed": false},
                 "device": {"product_device": property("ro.product.device"), "product_model": property("ro.product.model"), "build_fingerprint": property("ro.build.fingerprint"), "configuration": null},
                 "userdata": {"path": "userdata", "format": "directory"}, "compatibility": "unverified"});
             atomic(
@@ -547,6 +549,13 @@ mod daemon {
                 serde_json::from_slice(&fs::read(root.join("guests/profile1/profile.json"))?)?;
             assert_eq!(profile["image_id"], "id-1");
             assert_eq!(profile["userdata"]["format"], "directory");
+            assert_eq!(profile["guest_lock_compat"]["enabled"], false);
+            assert_eq!(profile["guest_lock_compat"]["require_fresh_userdata"], true);
+            assert_eq!(profile["guest_lock_compat_creation"]["version"], 1);
+            assert_eq!(
+                profile["guest_lock_compat_creation"]["migration_allowed"],
+                false
+            );
             assert_eq!(
                 profile["mount_profile"],
                 super::super::guest_mounts::PROFILE_NAME

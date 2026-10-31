@@ -1,6 +1,9 @@
 //! Initial boot mount layout. No guest service is started by this module.
 use serde::Deserialize;
-use std::collections::VecDeque;
+pub(crate) use ssal::namespace_mounts::guest_path;
+#[cfg(test)]
+use ssal::namespace_mounts::require_private_mounts;
+use ssal::namespace_mounts::{inject_compat_file, mount, Mounts};
 use std::ffi::CString;
 use std::fs::{self, File};
 use std::io;
@@ -9,6 +12,10 @@ use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
+
+fn cpath(path: &Path) -> io::Result<CString> {
+    CString::new(path.as_os_str().as_bytes()).map_err(|_| io::Error::other("invalid mount path"))
+}
 
 const PROFILE: &str = include_str!("../module/profiles/mounts/initial.json");
 pub const PROFILE_NAME: &str = "initial-shared-dev";
@@ -101,144 +108,6 @@ pub fn description() -> io::Result<String> {
     Ok(format!("mount profile: {} (built-in v{})\nrootfs: composed system RO, profile userdata RW, private mnt/storage/data_mirror\nruntime: tmp/cache RW tmpfs; metadata/config empty RO tmpfs; no host metadata/configfs\ndevices: shared host /dev, isolated socket/block paths; Binder/properties/cgroups/BPF shared\nAPEX: guest/vendor payload ext4 RO; guest linkerconfig required\nprepare requires chroot/pivot_root shell and profile write/read checks\nguest services, FUSE access control, VINTF and SELinux compatibility: not certified\n{services}", p.name, p.version))
 }
 
-fn cpath(path: &Path) -> io::Result<CString> {
-    CString::new(path.as_os_str().as_bytes()).map_err(|_| io::Error::other("invalid mount path"))
-}
-
-fn mount(
-    source: &Path,
-    target: &Path,
-    kind: Option<&str>,
-    flags: libc::c_ulong,
-    options: &str,
-) -> io::Result<()> {
-    let source = cpath(source)?;
-    let target_c = cpath(target)?;
-    let kind = kind
-        .map(CString::new)
-        .transpose()
-        .map_err(io::Error::other)?;
-    let options = CString::new(options).map_err(io::Error::other)?;
-    if unsafe {
-        libc::mount(
-            source.as_ptr(),
-            target_c.as_ptr(),
-            kind.as_ref().map_or(std::ptr::null(), |k| k.as_ptr()),
-            flags,
-            options.as_ptr().cast(),
-        )
-    } != 0
-    {
-        return Err(io::Error::other(format!(
-            "mount {}: {}",
-            target.display(),
-            io::Error::last_os_error()
-        )));
-    }
-    Ok(())
-}
-
-struct Mounts {
-    paths: Vec<PathBuf>,
-    loops: Vec<File>,
-}
-
-impl Mounts {
-    fn new() -> Self {
-        Self {
-            paths: Vec::new(),
-            loops: Vec::new(),
-        }
-    }
-
-    fn attach(
-        &mut self,
-        source: &Path,
-        target: &Path,
-        kind: Option<&str>,
-        flags: libc::c_ulong,
-        options: &str,
-    ) -> io::Result<()> {
-        mount(source, target, kind, flags, options)?;
-        self.paths.push(target.to_owned());
-        Ok(())
-    }
-
-    fn bind(
-        &mut self,
-        source: &Path,
-        target: &Path,
-        readonly: bool,
-        recursive: bool,
-    ) -> io::Result<()> {
-        self.attach(
-            source,
-            target,
-            None,
-            libc::MS_BIND | if recursive { libc::MS_REC } else { 0 },
-            "",
-        )?;
-        if recursive {
-            // rbind creates child mounts too; each must be released before /dev.
-            let info = fs::read_to_string("/proc/self/mountinfo")?;
-            let mut children: Vec<PathBuf> = info
-                .lines()
-                .filter_map(|line| line.split_whitespace().nth(4))
-                .map(PathBuf::from)
-                .filter(|path| path != target && path.starts_with(target))
-                .collect();
-            children.sort_by_key(|path| path.components().count());
-            self.paths.extend(children);
-        }
-        if readonly {
-            mount(
-                Path::new("none"),
-                target,
-                None,
-                libc::MS_BIND
-                    | libc::MS_REMOUNT
-                    | libc::MS_RDONLY
-                    | libc::MS_NOSUID
-                    | libc::MS_NODEV,
-                "",
-            )?;
-        }
-        Ok(())
-    }
-
-    fn tmpfs(&mut self, target: &Path, mode: u32) -> io::Result<()> {
-        self.attach(
-            Path::new("tmpfs"),
-            target,
-            Some("tmpfs"),
-            libc::MS_NOSUID | libc::MS_NODEV,
-            &format!("mode={mode:o}"),
-        )
-    }
-
-    fn cleanup(&mut self) -> io::Result<()> {
-        let mut failures = Vec::new();
-        while let Some(path) = self.paths.pop() {
-            if unsafe { libc::umount2(cpath(&path)?.as_ptr(), 0) } != 0 {
-                failures.push(format!(
-                    "{}: {}",
-                    path.display(),
-                    io::Error::last_os_error()
-                ));
-            }
-        }
-        if failures.is_empty() {
-            self.loops.clear();
-            Ok(())
-        } else {
-            Err(io::Error::other(format!(
-                "guest mount cleanup failed: {}",
-                failures.join("; ")
-            )))
-        }
-    }
-}
-
 // Reject symlinks at every directory component, including persistent userdata.
 pub(crate) fn directory(root: &Path, relative_path: &str, mode: u32) -> io::Result<PathBuf> {
     if !relative(relative_path) {
@@ -283,52 +152,6 @@ fn same_directory(source: &Path, target: &Path) -> io::Result<()> {
         )));
     }
     Ok(())
-}
-
-// Resolve absolute Android symlinks against the guest root, not the worker's
-// still-active host root. canonicalize(root.join(...)) would escape to the host.
-pub(crate) fn guest_path(root: &Path, path: &str) -> io::Result<PathBuf> {
-    if !relative(path) {
-        return Err(io::Error::other("invalid guest path"));
-    }
-    let mut pending: VecDeque<_> = Path::new(path)
-        .components()
-        .map(|p| p.as_os_str().to_owned())
-        .collect();
-    let mut resolved = PathBuf::new();
-    let mut links = 0;
-    while let Some(part) = pending.pop_front() {
-        if part == "." {
-            continue;
-        }
-        if part == ".." {
-            resolved.pop();
-            continue;
-        }
-        let candidate = root.join(&resolved).join(&part);
-        let meta = fs::symlink_metadata(&candidate)?;
-        if meta.is_symlink() {
-            links += 1;
-            if links > 40 {
-                return Err(io::Error::other("guest symlink loop"));
-            }
-            let link = fs::read_link(candidate)?;
-            if link.is_absolute() {
-                resolved.clear();
-            }
-            let parts: Vec<_> = link
-                .components()
-                .filter(|p| !matches!(p, Component::RootDir))
-                .map(|p| p.as_os_str().to_owned())
-                .collect();
-            for part in parts.into_iter().rev() {
-                pending.push_front(part);
-            }
-        } else {
-            resolved.push(part);
-        }
-    }
-    Ok(root.join(resolved))
 }
 
 fn compose_system(mounts: &mut Mounts, system: &Path, root: &Path) -> io::Result<()> {
@@ -379,6 +202,39 @@ fn compose_system(mounts: &mut Mounts, system: &Path, root: &Path) -> io::Result
             File::create(&target)?;
             mounts.bind(&entry.path(), &target, true, false)?;
         }
+    }
+    Ok(())
+}
+
+fn prepare_lock_compat(mounts: &mut Mounts, root: &Path, userdata: &Path) -> io::Result<()> {
+    let profile_path = userdata
+        .parent()
+        .ok_or_else(|| io::Error::other("profile parent missing"))?
+        .join("profile.json");
+    let profile: serde_json::Value = serde_json::from_slice(&fs::read(profile_path)?)?;
+    let config = ssal::guest_lock_compat::Config::from_profile(&profile)?;
+    // This stage is offline-only until the recorded runtime blockers are resolved.
+    config.runtime_gate()?;
+    let plan = config.plan(
+        profile["guest_lock_compat_creation"]["version"] == 1,
+        if config.enabled {
+            fs::read_dir(userdata)?.next().is_none()
+        } else {
+            false
+        },
+    )?;
+    for entry in plan {
+        // Only the built-in XML is certified as a mount input at present. RRO
+        // remains a separate blocked result, never silently skipped.
+        let bytes = match entry.target {
+            ssal::guest_lock_compat::XML_TARGET => ssal::guest_lock_compat::XML.as_bytes(),
+            _ => {
+                return Err(io::Error::other(
+                    "Weaver RRO idmap/immutable activation not certified",
+                ))
+            }
+        };
+        inject_compat_file(mounts, root, &entry, bytes)?;
     }
     Ok(())
 }
@@ -782,6 +638,7 @@ pub fn verify(
     let result = (|| {
         mounts.tmpfs(&root, 0o755)?;
         compose_system(&mut mounts, system, &root)?;
+        prepare_lock_compat(&mut mounts, &root, userdata)?;
         for name in ["product", "system_ext"] {
             if root.join(name).symlink_metadata().is_err()
                 && guest_path(&root, &format!("system/{name}")).is_ok()
@@ -1004,6 +861,59 @@ pub fn verify(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_propagation_requires_complete_mountinfo() {
+        let private = "1 0 0:1 / / rw - tmpfs tmpfs rw\n";
+        assert!(require_private_mounts(private).is_ok());
+        for input in [
+            "",
+            "invalid",
+            "1 0 0:1 / / rw shared:1 - tmpfs tmpfs rw",
+            "1 0 0:1 / / rw master:1 - tmpfs tmpfs rw",
+            "1 0 0:1 / / rw unbindable - tmpfs tmpfs rw",
+        ] {
+            assert!(require_private_mounts(input).is_err());
+        }
+    }
+
+    #[test]
+    fn compat_collisions_abort_before_mount_and_preserve_originals() -> io::Result<()> {
+        let root =
+            std::env::temp_dir().join(format!("ssal-compat-collision-{}", std::process::id()));
+        fs::create_dir(&root)?;
+        let result = (|| -> io::Result<()> {
+            let parent = directory(&root, "system/etc/sysconfig", 0o755)?;
+            let target = parent.join("ssal-lockscreen.xml");
+            let config = ssal::guest_lock_compat::Config {
+                enabled: true,
+                disable_weaver_on_unsecured_users: false,
+                ..Default::default()
+            };
+            let plan = config.plan(true, true)?;
+            let before = fs::read_to_string("/proc/self/mountinfo")?;
+            let mut mounts = Mounts::new();
+            for _ in 0..2 {
+                fs::write(&target, b"original")?;
+                let error =
+                    inject_compat_file(&mut mounts, &root, &plan[0], b"replacement").unwrap_err();
+                assert_eq!(error.to_string(), "compatibility target collision");
+                assert_eq!(fs::read(&target)?, b"original");
+                fs::remove_file(&target)?;
+                symlink("missing", &target)?;
+                let error =
+                    inject_compat_file(&mut mounts, &root, &plan[0], b"replacement").unwrap_err();
+                assert_eq!(error.to_string(), "compatibility target collision");
+                fs::remove_file(&target)?;
+            }
+            assert!(mounts.paths.is_empty());
+            mounts.cleanup()?;
+            assert_eq!(before, fs::read_to_string("/proc/self/mountinfo")?);
+            Ok(())
+        })();
+        fs::remove_dir_all(root)?;
+        result
+    }
 
     #[test]
     fn finds_runtime_linkerconfig_and_legacy_system_fallback() -> io::Result<()> {

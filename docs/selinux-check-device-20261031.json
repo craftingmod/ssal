@@ -1,0 +1,357 @@
+{
+  "schema": 1,
+  "date": "2026-10-31",
+  "timezone": "Asia/Seoul",
+  "overall": "blocked",
+  "raw_report": "out/selinux-check/2026-10-30T21-06-36-556Z-feba58ef/report.json",
+  "raw_report_sha256": "09a1f520d3a425e94cf1e514d905e6f6a9ed51001d97bfc1e5532b4d8094e0dd",
+  "run": {
+    "time_utc": "2026-10-30T21:07:21.201Z",
+    "profile": "profile1",
+    "tools": "checkpolicy\t3.4-1+b2\nm4\t1.4.19-3\nsecilc\t3.4-1\nsetools\t4.4.1-2",
+    "helper_sha256": "f269b6a667800f996f9d4eda53fb566ee995f76f112ee0f1e0e98e54656ee1aa",
+    "helper_source_sha256": "5fcb0dd325bb97ac25e019091f16142fa466dd86511792a7b22453d6c18f1add",
+    "controller_source_sha256": "370136b1b6e4f2b7418561d2d9cdd38179c9f06469539060a3469b74d67f2b4b",
+    "analyzer_source_sha256": "89fff158aa3a4df6287cfdbae5f35ae8e209b810233fa975a62a15d216ca36f2",
+    "android_compiler": "9c461376dd50f0a8f69709a1bc33fea31c05ab5a78364943b65775fd83b0ad70  /system/bin/secilc",
+    "image_sha256_verified": "7b9ba62e8b48b6e40432be949ae0858a8971175c79502550e74691222d3889ff"
+  },
+  "guest_build": {
+    "ro.build.fingerprint": "google/lineage_arm64_bvN4/generic_arm64:16/BP4A.251205.006/eng.andrew:userdebug/release-keys",
+    "ro.build.version.sdk": "36",
+    "ro.build.version.sdk_full": "36.1",
+    "ro.build.version.release": "16",
+    "ro.build.date.utc": "1779626072"
+  },
+  "vendor_policy_api": "202404",
+  "live_summary": {
+    "contexts": 2686,
+    "valid": 2649,
+    "access_queries": 2615,
+    "allowed": 1162,
+    "denied": 1408,
+    "errors": 45
+  },
+  "invalid_contexts": [
+    {
+      "kind": "context",
+      "label": "u:object_r:adbroot_data_file:s0",
+      "valid": false,
+      "errno": 22
+    },
+    {
+      "kind": "context",
+      "label": "u:object_r:adbroot_exec:s0",
+      "valid": false,
+      "errno": 22
+    },
+    {
+      "kind": "context",
+      "label": "u:object_r:adbroot_service:s0",
+      "valid": false,
+      "errno": 22
+    },
+    {
+      "kind": "context",
+      "label": "u:object_r:ashmem_compat_memfd_context_file:s0",
+      "valid": false,
+      "errno": 22
+    },
+    {
+      "kind": "context",
+      "label": "u:object_r:custom_version_prop:s0",
+      "valid": false,
+      "errno": 22
+    },
+    {
+      "kind": "context",
+      "label": "u:object_r:dmd_device:s0",
+      "valid": false,
+      "errno": 22
+    },
+    {
+      "kind": "context",
+      "label": "u:object_r:fingerprint_hidl_service:s0",
+      "valid": false,
+      "errno": 22
+    },
+    {
+      "kind": "context",
+      "label": "u:object_r:gatekeeper_vendor_data_file:s0",
+      "valid": false,
+      "errno": 22
+    },
+    {
+      "kind": "context",
+      "label": "u:object_r:hal_audio_sysbta_exec:s0",
+      "valid": false,
+      "errno": 22
+    },
+    {
+      "kind": "context",
+      "label": "u:object_r:hal_fingerprint_oppo_compat_exec:s0",
+      "valid": false,
+      "errno": 22
+    },
+    {
+      "kind": "context",
+      "label": "u:object_r:legal_url_prop:s0",
+      "valid": false,
+      "errno": 22
+    },
+    {
+      "kind": "context",
+      "label": "u:object_r:lineage_globalactions_service:s0",
+      "valid": false,
+      "errno": 22
+    },
+    {
+      "kind": "context",
+      "label": "u:object_r:lineage_hardware_service:s0",
+      "valid": false,
+      "errno": 22
+    },
+    {
+      "kind": "context",
+      "label": "u:object_r:lineage_health_interface_service:s0",
+      "valid": false,
+      "errno": 22
+    },
+    {
+      "kind": "context",
+      "label": "u:object_r:lineage_livedisplay_service:s0",
+      "valid": false,
+      "errno": 22
+    },
+    {
+      "kind": "context",
+      "label": "u:object_r:lineage_profile_service:s0",
+      "valid": false,
+      "errno": 22
+    },
+    {
+      "kind": "context",
+      "label": "u:object_r:lineage_trust_service:s0",
+      "valid": false,
+      "errno": 22
+    },
+    {
+      "kind": "context",
+      "label": "u:object_r:mkfs_exec:s0",
+      "valid": false,
+      "errno": 22
+    },
+    {
+      "kind": "context",
+      "label": "u:object_r:native_binder_stats_prop:s0",
+      "valid": false,
+      "errno": 22
+    },
+    {
+      "kind": "context",
+      "label": "u:object_r:odm_cast_prop:s0",
+      "valid": false,
+      "errno": 22
+    },
+    {
+      "kind": "context",
+      "label": "u:object_r:persist_sysui_builder_extras_prop:s0",
+      "valid": false,
+      "errno": 22
+    },
+    {
+      "kind": "context",
+      "label": "u:object_r:persist_sysui_ranking_update_prop:s0",
+      "valid": false,
+      "errno": 22
+    },
+    {
+      "kind": "context",
+      "label": "u:object_r:phhsu_exec:s0",
+      "valid": false,
+      "errno": 22
+    },
+    {
+      "kind": "context",
+      "label": "u:object_r:qcrilam_service:s0",
+      "valid": false,
+      "errno": 22
+    },
+    {
+      "kind": "context",
+      "label": "u:object_r:recovery_update_prop:s0",
+      "valid": false,
+      "errno": 22
+    },
+    {
+      "kind": "context",
+      "label": "u:object_r:sf_hs_mode_prop:s0",
+      "valid": false,
+      "errno": 22
+    },
+    {
+      "kind": "context",
+      "label": "u:object_r:smcinvoke_device:s0",
+      "valid": false,
+      "errno": 22
+    },
+    {
+      "kind": "context",
+      "label": "u:object_r:teecd_data_file:s0",
+      "valid": false,
+      "errno": 22
+    },
+    {
+      "kind": "context",
+      "label": "u:object_r:usb_uvc_config_prop:s0",
+      "valid": false,
+      "errno": 22
+    },
+    {
+      "kind": "context",
+      "label": "u:object_r:vendor_hwc_prop:s0",
+      "valid": false,
+      "errno": 22
+    },
+    {
+      "kind": "context",
+      "label": "u:object_r:vendor_persist_nfc_prop:s0",
+      "valid": false,
+      "errno": 22
+    },
+    {
+      "kind": "context",
+      "label": "u:object_r:vndk_detect_exec:s0",
+      "valid": false,
+      "errno": 22
+    },
+    {
+      "kind": "context",
+      "label": "u:object_r:xtra_control_prop:s0",
+      "valid": false,
+      "errno": 22
+    },
+    {
+      "kind": "context",
+      "label": "u:r:mediashell_app:s0",
+      "valid": false,
+      "errno": 22
+    },
+    {
+      "kind": "context",
+      "label": "u:r:qcrilam_app:s0",
+      "valid": false,
+      "errno": 22
+    },
+    {
+      "kind": "context",
+      "label": "u:r:ssal_property:s0",
+      "valid": false,
+      "errno": 22
+    },
+    {
+      "kind": "context",
+      "label": "u:r:updater_app:s0",
+      "valid": false,
+      "errno": 22
+    }
+  ],
+  "states": [
+    {
+      "kind": "state",
+      "enforce": "1",
+      "kernel_max_policy_version": "33",
+      "controller_context": "u:r:ksu:s0",
+      "state_errno": [
+        0,
+        0,
+        0
+      ],
+      "policy_read_errno": 22
+    },
+    {
+      "kind": "state",
+      "enforce": "1",
+      "kernel_max_policy_version": "33",
+      "controller_context": "u:r:ksu:s0",
+      "state_errno": [
+        0,
+        0,
+        0
+      ],
+      "policy_read_errno": 22
+    }
+  ],
+  "sequence_values": [
+    1
+  ],
+  "observations": {
+    "host-observation": {
+      "equal": true,
+      "before_sha256": "cbf7f8cd2346caf68aad192c95967337ee988a54f9dbae5af3d834151b12c2cb",
+      "after_sha256": "cbf7f8cd2346caf68aad192c95967337ee988a54f9dbae5af3d834151b12c2cb"
+    }
+  },
+  "cleanup": {
+    "scratch_removed": true,
+    "stderr": ""
+  },
+  "genfs_conflicts": [
+    {
+      "filesystem": "iso9660",
+      "target": "/",
+      "rules": [
+        {
+          "path": "/src/out/selinux-check/2026-10-30T21-06-36-556Z-feba58ef/guest/system_ext/etc/selinux/system_ext_sepolicy.cil",
+          "line": 1,
+          "context": "(u object_r iso9660 ((s0) (s0)))"
+        },
+        {
+          "path": "/src/out/selinux-check/2026-10-30T21-06-36-556Z-feba58ef/host/vendor/etc/selinux/vendor_sepolicy.cil",
+          "line": 76,
+          "context": "(u object_r vfat ((s0) (s0)))"
+        }
+      ]
+    },
+    {
+      "filesystem": "udf",
+      "target": "/",
+      "rules": [
+        {
+          "path": "/src/out/selinux-check/2026-10-30T21-06-36-556Z-feba58ef/guest/system_ext/etc/selinux/system_ext_sepolicy.cil",
+          "line": 6,
+          "context": "(u object_r udf ((s0) (s0)))"
+        },
+        {
+          "path": "/src/out/selinux-check/2026-10-30T21-06-36-556Z-feba58ef/host/vendor/etc/selinux/vendor_sepolicy.cil",
+          "line": 1390,
+          "context": "(u object_r vfat ((s0) (s0)))"
+        }
+      ]
+    }
+  ],
+  "host_reconstructed_policy": {
+    "path": "/src/out/selinux-check/2026-10-30T21-06-36-556Z-feba58ef/host_reconstructed.init.policy",
+    "sha256": "de17ca4fee28d0ad0c89289a81eed203f0af35aab78a004d1e368da2b19d2107",
+    "version": 33,
+    "type_count": 4983,
+    "allow_count": 127434,
+    "permissive_domains": []
+  },
+  "host_strict_compile_exit": 255,
+  "guest_compile": {
+    "strict": {
+      "exit_code": 255,
+      "stderr": "Problems processing genfscon rules\nFailed post db handling\nPost process failed\nFailed to compile cildb: -1\n",
+      "neverallow_check": true
+    },
+    "init": {
+      "exit_code": 255,
+      "stderr": "Problems processing genfscon rules\nFailed post db handling\nPost process failed\nFailed to compile cildb: -1\n",
+      "neverallow_check": false
+    }
+  },
+  "policy_modified": false,
+  "services_started": false,
+  "mounts_created": false
+}

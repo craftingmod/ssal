@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<permissions>
+    <unavailable-feature name="android.software.secure_lock_screen" />
+
+    <!-- Biometrics -->
+    <unavailable-feature name="android.hardware.fingerprint" />
+    <unavailable-feature name="android.hardware.biometrics.face" />
+    <unavailable-feature name="android.hardware.biometrics.iris" />
+
+    <!-- Hardware-backed advanced security features -->
+    <unavailable-feature name="android.hardware.strongbox_keystore" />
+    <unavailable-feature name="android.hardware.device_unique_attestation" />
+    <unavailable-feature name="android.hardware.keystore.app_attest_key" />
+
+    <!-- Secure Element -->
+    <unavailable-feature name="android.hardware.se.omapi.ese" />
+    <unavailable-feature name="android.hardware.nfc.ese" />
+
+    <!-- Guest OS management -->
+    <unavailable-feature name="android.software.managed_users" />
+    <unavailable-feature name="android.software.device_admin" />
+</permissions>

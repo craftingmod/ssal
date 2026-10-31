@@ -1,6 +1,6 @@
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('setup', 'image', 'start', 'build', 'check', 'userdata', 'stop')]
+    [ValidateSet('setup', 'update', 'image', 'start', 'build', 'check', 'userdata', 'stop')]
     [string]$Action,
     [string]$Size = '256M'
 )
@@ -51,6 +51,34 @@ try {
                     throw "ssal-dev is in unsupported state '$($details.State.Status)'."
                 }
             }
+        }
+        'update' {
+            $containers = @(Get-WslcList container list --all --format json)
+            $container = $containers | Where-Object { $_.Names -eq 'ssal-dev' } | Select-Object -First 1
+            if ($container) {
+                $detailsJson = & wslc container inspect --format json ssal-dev
+                if ($LASTEXITCODE -ne 0) { throw "wslc inspect failed (exit $LASTEXITCODE)" }
+                $details = @($detailsJson | ConvertFrom-Json)[0]
+                $mount = $details.Mounts | Where-Object { $_.Destination -eq '/src' -and $_.Type -eq 'bind' } | Select-Object -First 1
+                if (-not $mount -or $mount.Source.TrimEnd('\') -ine $root.TrimEnd('\') -or $details.Config.Image -ne 'ssal-builder:dev') {
+                    throw 'ssal-dev belongs to a different workspace or image. Remove or rename that container before running update.'
+                }
+                if ($details.State.Status -notin @('running', 'created', 'exited')) {
+                    throw "ssal-dev is in unsupported state '$($details.State.Status)'."
+                }
+            }
+            Write-Host 'Building ssal-builder:dev...'
+            Invoke-Wslc build -f containers/builder/Containerfile -t ssal-builder:dev .
+            if ($container) {
+                if ($details.State.Status -eq 'running') {
+                    Write-Host 'Stopping ssal-dev...'
+                    Invoke-Wslc container stop ssal-dev
+                }
+                Write-Host 'Removing ssal-dev...'
+                Invoke-Wslc container remove ssal-dev
+            }
+            Write-Host 'Creating ssal-dev...'
+            Invoke-Wslc run -d --name ssal-dev --mount "type=bind,source=$root,target=/src" -w /src ssal-builder:dev sleep infinity
         }
         'image' { Invoke-Wslc build -f containers/builder/Containerfile -t ssal-builder:dev . }
         'start' { Invoke-Wslc run -d --name ssal-dev --mount "type=bind,source=$root,target=/src" -w /src ssal-builder:dev sleep infinity }

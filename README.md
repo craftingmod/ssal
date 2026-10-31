@@ -33,7 +33,7 @@ bun run setup:windows
 ./scripts/dev.ps1 build
 ```
 
-결과는 `out/ssal-module.zip`과 `out/bin/`에 생성됩니다. 설치 후 root 셸에서 `export PATH="/data/adb/modules/ssal/bin:$PATH"`를 실행하면 해당 셸에서 `ssal`을 사용할 수 있습니다. 또는 `/data/adb/modules/ssal/bin/ssal`을 직접 실행합니다. 사용자 이미지와 상태는 모듈 업데이트 및 제거 시 보존됩니다. 빌더 이미지 변경 후에는 기존 `ssal-dev`를 제거하고 setup을 다시 실행해야 합니다.
+결과는 `out/ssal-module.zip`과 `out/bin/`에 생성됩니다. 설치 후 root 셸에서 `export PATH="/data/adb/modules/ssal/bin:$PATH"`를 실행하면 해당 셸에서 `ssal`을 사용할 수 있습니다. 또는 `/data/adb/modules/ssal/bin/ssal`을 직접 실행합니다. 사용자 이미지와 상태는 모듈 업데이트 및 제거 시 보존됩니다. 빌더 이미지를 다시 빌드하고 기존 `ssal-dev`를 교체하려면 `bun run update:windows`를 실행합니다. 기존 컨테이너가 실행 중이면 중지한 뒤 삭제하고 새 컨테이너를 생성합니다. 다른 작업공간이나 이미지에 연결된 동명의 컨테이너는 교체하지 않습니다.
 
 WebUI 소스는 `frontend/`에 있으며 `bun run build:web`으로 `out/webroot/`에 빌드합니다. `bun run package`는 빌드된 바이너리와 WebUI를 모듈 ZIP으로 묶습니다. KernelSU 모듈 WebUI의 버튼으로 데몬을 재시작할 수 있으며, 이미지 등록 중에는 재시작이 거부됩니다.
 
@@ -41,7 +41,11 @@ WebUI 소스는 `frontend/`에 있으며 `bun run build:web`으로 `out/webroot/
 
 SELinux 전환 사전 검사는 `ssal probe-selinux-transition PROFILE_NAME`으로 실행합니다. [검사 범위와 기기 결과](docs/selinux-transition-probe.md)를 참고하세요.
 
+PC에서 `bun run selinux:check`를 실행하면 adb의 root 접근과 실행 중인 `ssal-dev`를 사용해 SELinux를 조회합니다. 기본 프로필은 `profile1`이며 `--profile NAME`, `--serial ADB_SERIAL`로 선택할 수 있습니다. 등록된 raw ext4 이미지의 해시를 검증해 `.cache/selinux-images/`에 보관하고, 마운트 없이 Guest 정책을 추출해 기기의 vendor/odm과 비교합니다. Debian 컴파일러가 처리하지 못하는 CIL은 기기 컴파일러로 임시 복사본만 컴파일합니다. 현재 커널의 context·AV 조회, 컴파일 결과와 정리는 `out/selinux-check/<run>/report.json`에 기록하며 최신 위치는 `out/selinux-check/latest.json`에 남깁니다. 정책 로드·라벨 변경·서비스 기동은 하지 않습니다. 종료 코드 0은 조회 완료를 뜻하며 호환 여부는 JSON의 `overall`과 세부 결과를 확인해야 합니다. [기기 점검 결과](docs/selinux-check-device-20261031.md)를 참고하세요.
+
 정식 Guest servicemanager의 실행 없는 권한·환경·격리 검사는 `ssal probe-servicemanager-preflight PROFILE_NAME`으로 실행합니다. [실행 선행 조건과 기기 결과](docs/servicemanager-preflight.md)를 참고하세요.
+
+`selinux:check`는 진단 후 같은 디렉터리에 적용 없는 `patch-plan.json`도 생성합니다. 기기 없이 저장된 진단을 다시 분석하려면 `bun run selinux:plan` 또는 `bun run selinux:plan --report out/selinux-check/<run>/report.json`을 실행합니다. 실행 중인 `ssal-dev`와 로컬 참고 정책 소스가 필요합니다. 계획에는 선언·매핑·사용 참조, attribute 영향과 검증 한계를 기록하며, 부팅 필수성·실제 사용 여부·Host 보안 영향은 입증 전까지 미확인으로 둡니다. JSON 안의 KernelSU 선언 후보는 구문·적용 검증 전의 검토 자료이며 실행 가능한 정책 파일이나 allow 규칙을 생성하지 않습니다. 기존 진단의 `blocked` 판정도 해제하지 않습니다.
 
 실제 private Binder를 연결하고 라벨 호환성·실행 명세·Host 노출 경로를 조사하는 후속 검사는 `ssal probe-servicemanager-runtime-preflight PROFILE_NAME`으로 실행합니다. 실제 서비스는 실행하지 않습니다. [런타임 차단 요인과 기기 결과](docs/servicemanager-runtime-preflight.md)를 참고하세요.
 

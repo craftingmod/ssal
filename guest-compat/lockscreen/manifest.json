@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "enabled": false,
+  "launch_enabled": false,
+  "application_phase": "before-first-service",
+  "require_fresh_userdata": true,
+  "migration_allowed": false,
+  "sysconfig": {
+    "source": "ssal-lockscreen.xml",
+    "target": "/system/etc/sysconfig/ssal-lockscreen.xml",
+    "mode": "0644",
+    "uid": 0,
+    "gid": 0,
+    "context": "u:object_r:system_file:s0"
+  },
+  "rro": {
+    "source": "overlay/AndroidManifest.xml",
+    "build_output": "out/guest-lock-compat/SSALWeaverOverlay-unsigned.apk",
+    "candidate_target": "/product/overlay/SSALWeaverOverlay.apk",
+    "package": "dev.ssal.overlay.weaver",
+    "target_package": "android",
+    "required_mutable": false,
+    "required_enabled": true,
+    "status": "blocked-pending-signing-idmap-and-activation"
+  }
+}

@@ -1,4 +1,5 @@
 use sha2::{Digest, Sha256};
+use ssal::namespace_mounts::parse_device_number;
 use ssal::unix::{image_context, valid_image_name, IMAGE_CONTEXT};
 use std::cell::RefCell;
 use std::ffi::CString;
@@ -30,6 +31,8 @@ pub fn check(root: &Path, name: &str) -> io::Result<CheckedProfile> {
     }
     let dir = root.join("guests").join(name);
     let profile: serde_json::Value = serde_json::from_slice(&fs::read(dir.join("profile.json"))?)?;
+    // Compatibility resources cannot authorize service execution or migrate data.
+    ssal::guest_lock_compat::Config::from_profile(&profile)?.runtime_gate()?;
     if profile["version"] == 1 {
         return Err(io::Error::other(
             "legacy userdata image profile is unsupported; create a new profile",
@@ -319,16 +322,6 @@ impl Drop for LoopNodes {
             eprintln!("loop-node cleanup: {error}");
         }
     }
-}
-
-fn parse_device_number(value: &str) -> io::Result<libc::dev_t> {
-    let (major, minor) = value
-        .trim()
-        .split_once(':')
-        .ok_or_else(|| io::Error::other("invalid sysfs device number"))?;
-    let major = major.parse::<u32>().map_err(io::Error::other)?;
-    let minor = minor.parse::<u32>().map_err(io::Error::other)?;
-    Ok(libc::makedev(major, minor))
 }
 
 pub(crate) fn loop_device(
@@ -707,6 +700,19 @@ mod tests {
             )?,
         )?;
         assert!(check(&root, "profile1").is_ok());
+        let profile_path = root.join("guests/profile1/profile.json");
+        let original = fs::read(&profile_path)?;
+        let mut enabled: serde_json::Value = serde_json::from_slice(&original)?;
+        enabled["guest_lock_compat"] = serde_json::json!({"enabled":true});
+        fs::write(&profile_path, serde_json::to_vec(&enabled)?)?;
+        assert!(check(&root, "profile1")
+            .unwrap_err()
+            .to_string()
+            .contains("offline preparation only"));
+        assert!(fs::read_dir(root.join("guests/profile1/userdata"))?
+            .next()
+            .is_none());
+        fs::write(&profile_path, original)?;
         bytes[0] = 1;
         fs::write(root.join("images/id-1/system.img"), bytes)?;
         assert!(check(&root, "profile1")

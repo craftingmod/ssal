@@ -5,6 +5,20 @@ fn main() {
     use std::os::fd::AsRawFd;
     use std::os::unix::net::UnixStream;
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args
+        .first()
+        .is_some_and(|a| a == "probe" || a == "--lock-probe-child")
+    {
+        let internal = args[0] == "--lock-probe-child";
+        match ssal::lock_namespace_probe::cli(&args[1..], internal) {
+            Ok(true) => return,
+            Ok(false) => std::process::exit(1),
+            Err(e) => {
+                eprintln!("lock probe: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
     let (command, image_name, profile_name, file) = match args.as_slice() {
         [a] if ["status", "doctor", "return", "logs", "stop-for-restart"].contains(&a.as_str()) => {
             (a.clone(), None, None, None)
