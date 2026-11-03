@@ -1,0 +1,22 @@
+[package]
+name = "ssal-rsbinder-phase2"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "ssal_rsbinder_phase2"
+
+[[bin]]
+name = "host_probe"
+path = "src/bin/host_probe.rs"
+
+[[bin]]
+name = "guest_probe"
+path = "src/bin/guest_probe.rs"
+
+[target.'cfg(target_os = "android")'.dependencies]
+libc = "=0.2.191"
+rsbinder = { version = "=0.12.0", default-features = false, features = ["android_16_plus"] }
+rsproperties = { version = "=0.6.0", features = ["builder"] }
+serde_json = "=1.0.154"

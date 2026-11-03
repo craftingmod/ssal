@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+[features]
+phase2c-diagnostic = []
+
 [[bin]]
 name = "ssal"
 path = "src/ssal.rs"

@@ -465,6 +465,12 @@ mod daemon {
         }
         result
     }
+
+    #[cfg(feature = "phase2c-diagnostic")]
+    pub fn run_phase2c_diagnostic(root: &Path, profile: &str, probe: &Path) -> io::Result<String> {
+        std::env::set_var("SSAL_PHASE2C_RSBINDER_PROBE", probe);
+        prepare_session(root, profile, "probe-servicemanager")
+    }
     pub fn run() -> io::Result<()> {
         if unsafe { libc::geteuid() } != 0 {
             return Err(io::Error::other("ssald must run as root"));
@@ -658,6 +664,30 @@ mod daemon {
 #[cfg(unix)]
 fn main() {
     let args: Vec<_> = std::env::args_os().collect();
+    #[cfg(feature = "phase2c-diagnostic")]
+    if args
+        .get(1)
+        .is_some_and(|arg| arg == "--phase2c-rsbinder-runner")
+    {
+        if args.len() != 4 || unsafe { libc::geteuid() } != 0 {
+            eprintln!("invalid Phase 2C diagnostic runner invocation");
+            std::process::exit(1);
+        }
+        let root = std::path::PathBuf::from(ssal::unix::ROOT);
+        let result = daemon::run_phase2c_diagnostic(
+            &root,
+            args[2].to_str().unwrap_or(""),
+            std::path::Path::new(&args[3]),
+        );
+        match result {
+            Ok(output) => println!("{output}"),
+            Err(error) => {
+                eprintln!("Phase 2C diagnostic: {error}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     if args
         .get(1)
         .is_some_and(|a| a == "--runtime-credentials-worker")

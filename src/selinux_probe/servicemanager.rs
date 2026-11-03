@@ -8,6 +8,8 @@ use std::collections::BTreeMap;
 use std::io::BufRead;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
+#[cfg(feature = "phase2c-diagnostic")]
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 
@@ -408,6 +410,125 @@ fn client(command: Command, expected: &str, processes: &mut Vec<Process>) -> io:
         }
         std::thread::sleep(Duration::from_millis(25));
     }
+}
+
+#[cfg(feature = "phase2c-diagnostic")]
+fn run_phase2c_rsbinder_probe(root: &Path) -> io::Result<Value> {
+    let probe = std::env::var_os("SSAL_PHASE2C_RSBINDER_PROBE")
+        .map(PathBuf::from)
+        .ok_or_else(|| io::Error::other("Phase 2C probe path missing"))?;
+    let property_area = root.join("dev/phase2-property-area");
+    let guest_probe = root.join("data/local/tmp/ssal-rsbinder-phase2-guest-probe");
+    super::enforcing::labeled_copy(&probe, &guest_probe, "u:object_r:shell_exec:s0")?;
+    let mut initializer = crate::guest_probe::command(
+        root,
+        "/data/local/tmp/ssal-rsbinder-phase2-guest-probe",
+        false,
+    )?;
+    initializer.args([
+        "--initialize-private-properties",
+        "/dev/phase2-property-area",
+    ]);
+    let setup = super::super::guest_probe::run_with_timeout(
+        &mut initializer,
+        "Guest private property initialization",
+        Duration::from_secs(10),
+    )?;
+    if !setup.status.success() {
+        return Err(io::Error::other(format!(
+            "Guest property initializer exited {}: stdout={}, stderr={}",
+            setup.status,
+            String::from_utf8_lossy(&setup.stdout),
+            String::from_utf8_lossy(&setup.stderr),
+        )));
+    }
+    let properties = root.join("dev/__properties__");
+    if !properties.is_dir() || fs::read_dir(&properties)?.next().is_some() {
+        return Err(io::Error::other(
+            "Guest /dev/__properties__ is not the expected empty directory",
+        ));
+    }
+    if !property_area.is_dir() || !property_area.join("property_info").is_file() {
+        return Err(io::Error::other(
+            "Guest modern property area is missing property_info",
+        ));
+    }
+    fs::remove_dir(&properties)?;
+    fs::rename(&property_area, &properties)?;
+    let mut getprop = crate::guest_probe::command(root, "/system/bin/getprop", false)?;
+    getprop.arg("ro.build.version.sdk");
+    let getprop = super::super::guest_probe::run_with_timeout(
+        &mut getprop,
+        "Guest getprop control",
+        Duration::from_secs(5),
+    )?;
+    let guest_getprop = json!({
+        "exit_code":getprop.status.code(),
+        "stdout":String::from_utf8_lossy(&getprop.stdout).trim(),
+        "stderr":String::from_utf8_lossy(&getprop.stderr),
+    });
+    let property_metadata = fs::metadata(&properties)?;
+    let property_label = Command::new("/system/bin/ls")
+        .args(["-lZ"])
+        .arg(&properties)
+        .output()?;
+    let private_property_area = json!({
+        "kind": if property_metadata.is_file() { "file" } else if property_metadata.is_dir() { "directory" } else { "other" },
+        "size_bytes": property_metadata.len(),
+        "mode_octal": format!("{:o}", property_metadata.mode() & 0o7777),
+        "ls_label": String::from_utf8_lossy(&property_label.stdout).trim(),
+    });
+    let shell_property_access = json!({
+        "directory_search": query("u:r:shell:s0", "u:object_r:properties_device:s0", "dir", "search")?,
+        "property_info_open": query("u:r:shell:s0", "u:object_r:property_info:s0", "file", "open")?,
+        "property_info_read": query("u:r:shell:s0", "u:object_r:property_info:s0", "file", "read")?,
+        "property_info_map": query("u:r:shell:s0", "u:object_r:property_info:s0", "file", "map")?,
+        "build_prop_open": query("u:r:shell:s0", "u:object_r:build_prop:s0", "file", "open")?,
+        "build_prop_read": query("u:r:shell:s0", "u:object_r:build_prop:s0", "file", "read")?,
+        "build_prop_map": query("u:r:shell:s0", "u:object_r:build_prop:s0", "file", "map")?,
+        "properties_serial_open": query("u:r:shell:s0", "u:object_r:properties_serial:s0", "file", "open")?,
+        "properties_serial_read": query("u:r:shell:s0", "u:object_r:properties_serial:s0", "file", "read")?,
+        "properties_serial_map": query("u:r:shell:s0", "u:object_r:properties_serial:s0", "file", "map")?,
+    });
+
+    let mut command = crate::guest_probe::command_for_phase2c(
+        root,
+        "/data/local/tmp/ssal-rsbinder-phase2-guest-probe",
+    )?;
+    command.args([
+        "--device",
+        "/dev/binder",
+        "--service",
+        "aidl_lazy_test_1",
+        "--expected-descriptor",
+        "BBinder",
+    ]);
+    let output = super::super::guest_probe::run_with_timeout(
+        &mut command,
+        "rsbinder Guest probe",
+        Duration::from_secs(20),
+    )?;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let record = stdout
+        .lines()
+        .find_map(|line| serde_json::from_str::<Value>(line).ok())
+        .ok_or_else(|| {
+            io::Error::other(format!(
+                "Guest probe emitted no JSON (status={}, stdout={stdout:?}, stderr={})",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            ))
+        })?;
+    Ok(json!({
+        "exit_code": output.status.code(),
+        "child_reaped": true,
+        "property_initializer": String::from_utf8_lossy(&setup.stdout),
+        "guest_getprop_control": guest_getprop,
+        "private_property_area": private_property_area,
+        "shell_property_access": shell_property_access,
+        "result": record,
+        "stderr": String::from_utf8_lossy(&output.stderr),
+    }))
 }
 
 fn process_identity(
@@ -1329,6 +1450,25 @@ fn verify_mode(root: &Path, userdata: Option<&Path>) -> io::Result<()> {
             TEST_SERVER,
             &root.join("data/local/tmp/ssal-binder-test-server"),
         )?;
+        #[cfg(feature = "phase2c-diagnostic")]
+        if std::env::var_os("SSAL_PHASE2C_RSBINDER_PROBE").is_some() {
+            match run_phase2c_rsbinder_probe(root) {
+                Ok(value) => {
+                    report["checks"]["rsbinder_guest_probe"] =
+                        json!(if value["result"]["ok"] == true {
+                            "passed"
+                        } else {
+                            "failed"
+                        });
+                    report["rsbinder_guest_probe"] = value;
+                }
+                Err(error) => {
+                    report["checks"]["rsbinder_guest_probe"] = json!("failed");
+                    report["rsbinder_guest_probe"] =
+                        json!({"setup_error":error.to_string(),"child_reaped":true});
+                }
+            }
+        }
         if enforcing == "1" && !target.permissive_domain && !server_domain.permissive_domain {
             report["checks"]["android_service_selinux"] = json!("passed");
         }

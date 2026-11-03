@@ -216,7 +216,7 @@ fn cpath(path: &Path) -> io::Result<CString> {
     CString::new(path.as_os_str().as_bytes()).map_err(io::Error::other)
 }
 
-fn command(root: &Path, executable: &str, pivot: bool) -> io::Result<Command> {
+pub(crate) fn command(root: &Path, executable: &str, pivot: bool) -> io::Result<Command> {
     let root_c = cpath(root)?;
     // Capture parent descriptors before spawn creates its own CLOEXEC pipes.
     let inherited: Vec<i32> = fs::read_dir("/proc/self/fd")?
@@ -293,6 +293,82 @@ fn command(root: &Path, executable: &str, pivot: bool) -> io::Result<Command> {
             }
             if actual.st_dev != expected.dev() || actual.st_ino != expected.ino() {
                 return Err(io::Error::other("guest root identity mismatch"));
+            }
+            Ok(())
+        });
+    }
+    Ok(command)
+}
+
+#[cfg(feature = "phase2c-diagnostic")]
+pub(crate) fn command_for_phase2c(root: &Path, executable: &str) -> io::Result<Command> {
+    let root_c = cpath(root)?;
+    let expected = fs::metadata(root)?;
+    let inherited: Vec<i32> = fs::read_dir("/proc/self/fd")?
+        .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
+        .filter(|fd| *fd > 2)
+        .collect();
+    let mut command = Command::new(executable);
+    command
+        .env_clear()
+        .env("PATH", "/system/bin:/apex/com.android.runtime/bin");
+    unsafe {
+        command.pre_exec(move || {
+            if libc::setsid() < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            for fd in &inherited {
+                let flags = libc::fcntl(*fd, libc::F_GETFD);
+                if flags >= 0 && libc::fcntl(*fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            let context = c"u:r:shell:s0";
+            let fd = libc::open(
+                c"/proc/thread-self/attr/exec".as_ptr(),
+                libc::O_WRONLY | libc::O_CLOEXEC,
+            );
+            if fd < 0 {
+                let error = io::Error::last_os_error();
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("setexeccon open: {error}"),
+                ));
+            }
+            let written = libc::write(
+                fd,
+                context.as_ptr().cast(),
+                context.to_bytes_with_nul().len(),
+            );
+            let error = io::Error::last_os_error();
+            libc::close(fd);
+            if written != context.to_bytes_with_nul().len() as isize {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("setexeccon write: {error}"),
+                ));
+            }
+            if libc::chroot(root_c.as_ptr()) != 0 {
+                let error = io::Error::last_os_error();
+                return Err(io::Error::new(error.kind(), format!("chroot: {error}")));
+            }
+            if libc::chdir(c"/".as_ptr()) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let mut actual: libc::stat = std::mem::zeroed();
+            if libc::stat(c"/".as_ptr(), &mut actual) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if actual.st_dev != expected.dev() || actual.st_ino != expected.ino() {
+                return Err(io::Error::other("guest root identity mismatch"));
+            }
+            let groups = [3009 as libc::gid_t];
+            if libc::setgroups(groups.len(), groups.as_ptr()) != 0
+                || libc::setresgid(1000, 1000, 1000) != 0
+                || libc::setresuid(1000, 1000, 1000) != 0
+                || libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
+            {
+                return Err(io::Error::last_os_error());
             }
             Ok(())
         });
