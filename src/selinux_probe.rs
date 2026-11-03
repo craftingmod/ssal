@@ -261,6 +261,8 @@ fn host_services() -> io::Result<serde_json::Value> {
             "system_server",
             "hwservicemanager",
             "vndservicemanager",
+            "installd",
+            "artd",
         ]
         .contains(&name)
             && !executable.starts_with("/vendor/bin/")

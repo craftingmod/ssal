@@ -1,6 +1,8 @@
 #[cfg(unix)]
 mod binder_probe;
 #[cfg(unix)]
+mod guest_data_probe;
+#[cfg(unix)]
 mod guest_mounts;
 #[cfg(unix)]
 mod guest_probe;
@@ -325,7 +327,7 @@ mod daemon {
                 }
             }
             "doctor" => reply(&mut stream, true, format!("daemon and root socket: OK\nmount namespace: {}\nloop control: {}\ndevice profile, Binder, property, HAL and guest services: not implemented; switching unavailable", Path::new("/proc/self/ns/mnt").exists(), Path::new("/dev/loop-control").exists())),
-            "prepare" | "probe-binder" | "probe-selinux-transition" | "probe-servicemanager-preflight" | "probe-servicemanager-runtime-preflight" | "probe-servicemanager" => {
+            "prepare" | "probe-binder" | "probe-selinux-transition" | "probe-servicemanager-preflight" | "probe-servicemanager-runtime-preflight" | "probe-servicemanager" | "probe-guest-data" => {
                 let Some(name) = req.profile_name.as_deref().filter(|name| valid_image_name(name)) else { return reply(&mut stream, false, "invalid profile name"); };
                 let guard = busy.lock().unwrap();
                 if *guard { return reply(&mut stream, false, "another operation is running"); }
@@ -393,6 +395,7 @@ mod daemon {
                 .arg(match mode {
                     "probe-binder" => "--binder-probe-worker",
                     "probe-servicemanager" => "--servicemanager-worker",
+                    "probe-guest-data" => "--guest-data-worker",
                     "probe-selinux-transition" => "--selinux-probe-worker",
                     "probe-servicemanager-preflight" => "--servicemanager-preflight-worker",
                     "probe-servicemanager-runtime-preflight" => {
@@ -685,6 +688,7 @@ fn main() {
             || arg == "--servicemanager-runtime-preflight-worker"
             || arg == "--enforcing-binder-worker"
             || arg == "--servicemanager-worker"
+            || arg == "--guest-data-worker"
     }) {
         if args.len() != 5 || unsafe { libc::geteuid() } != 0 {
             eprintln!("invalid prepare worker invocation");

@@ -3,7 +3,7 @@
 set -eu
 for ssal_base in "$@"; do
     case "$ssal_base" in
-        /data/local/tmp/ssal-enforcing-*|/data/local/tmp/ssal-test-b-*) ;;
+        /data/local/tmp/ssal-enforcing-*|/data/local/tmp/ssal-test-b-*|/data/local/tmp/ssal-phase2-*) ;;
         *) echo "refused cleanup path: $ssal_base" >&2; exit 40 ;;
     esac
     [ "$(readlink -f "$ssal_base")" = "$ssal_base" ] || exit 41
@@ -25,6 +25,12 @@ for ssal_base in "$@"; do
             "$ssal_base"|"$ssal_base"/*) echo "owned root remains: $ssal_process $ssal_target"; exit 47 ;;
         esac
         if grep -F "$ssal_base" "$ssal_process/mountinfo" 2>/dev/null; then exit 48; fi
+        for ssal_fd in "$ssal_process"/fd/*; do
+            ssal_target=$(readlink "$ssal_fd" 2>/dev/null || true)
+            case "$ssal_target" in
+                "$ssal_base"|"$ssal_base"/*) echo "owned FD remains: $ssal_fd $ssal_target"; exit 49 ;;
+            esac
+        done
     done
     # Exact canonical path was checked above. No lazy unmount, daemon kill or
     # policy restoration command is hidden in scratch deletion.

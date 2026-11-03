@@ -628,7 +628,7 @@ pub fn worker(system: &Path, userdata: &Path, base: &Path, mode: &str) -> io::Re
         cleanup.push(e.to_string());
     }
     if !cleanup.is_empty() {
-        if mode == "--servicemanager-worker" {
+        if mode == "--servicemanager-worker" || mode == "--guest-data-worker" {
             crate::selinux_probe::servicemanager::mark_recovery(
                 &base.display().to_string(),
                 &cleanup.join("; "),
@@ -639,6 +639,7 @@ pub fn worker(system: &Path, userdata: &Path, base: &Path, mode: &str) -> io::Re
             || mode == "--servicemanager-runtime-preflight-worker"
             || mode == "--enforcing-binder-worker"
             || mode == "--servicemanager-worker"
+            || mode == "--guest-data-worker"
         {
             println!(
                 "SELinux transition resource summary: {}",
@@ -656,10 +657,17 @@ pub fn worker(system: &Path, userdata: &Path, base: &Path, mode: &str) -> io::Re
         || mode == "--servicemanager-runtime-preflight-worker"
         || mode == "--enforcing-binder-worker"
         || mode == "--servicemanager-worker"
+        || mode == "--guest-data-worker"
     {
         println!(
             "SELinux transition resource summary: {}",
             serde_json::json!({"cleanup": "passed", "scope": "system_userdata_mounts_and_loops"})
+        );
+    }
+    if mode == "--guest-data-worker" {
+        println!(
+            "Phase 2 worker gate: {}",
+            serde_json::json!({"phase2_complete":result.is_ok(),"outer_mounts_and_loops_released":true,"launch_enabled":false,"switch_enabled":false})
         );
     }
     result?;

@@ -21,6 +21,7 @@
 #include <sys/prctl.h>
 #include <dlfcn.h>
 #include <sys/resource.h>
+#include "system_properties/prop_area.h"
 
 using namespace android;
 static constexpr uint32_t kEcho = IBinder::FIRST_CALL_TRANSACTION + 73;
@@ -103,7 +104,7 @@ static int registry(int argc, char** argv) {
     struct stat node {};
     if (stat(argv[2], &node) || (server && node.st_rdev == hostRdev)) return 3;
     const char* name = argv[5];
-    if (server && strncmp(name, "ssal.probe.", 11)) return 2;
+    if (server && strcmp(name, "aidl_lazy_test_1")) return 2;
     for (const char* p = name; *p; ++p) if (!isalnum(static_cast<unsigned char>(*p)) && *p != '.' && *p != '_' && *p != '-') return 2;
     auto process = driver(argv[2], majorNumber, minorNumber);
     if (!process) return 4;
@@ -113,34 +114,38 @@ static int registry(int argc, char** argv) {
     if (namespaceSize > 0) namespaceName[namespaceSize] = '\0';
     if (stat("/", &root)) return 5;
     printf("{\"event\":\"registry_environment\",\"root_dev\":%llu,\"root_inode\":%llu,\"mount_namespace\":\"%s\"}\n", static_cast<unsigned long long>(root.st_dev), static_cast<unsigned long long>(root.st_ino), namespaceName);
-    void* selinux = dlopen("libselinux.so", RTLD_NOW | RTLD_LOCAL);
-    if (!selinux) return unavailable("dlopen_libselinux");
-    using Handle = void*;
-    auto handle = reinterpret_cast<Handle(*)()>(dlsym(selinux, "selinux_android_service_context_handle"));
-    auto lookup = reinterpret_cast<int(*)(Handle,char**,const char*,int)>(dlsym(selinux, "selabel_lookup"));
-    auto getcon = reinterpret_cast<int(*)(char**)>(dlsym(selinux, "getcon"));
-    auto release = reinterpret_cast<void(*)(char*)>(dlsym(selinux, "freecon"));
-    auto access = reinterpret_cast<int(*)(const char*,const char*,const char*,const char*,void*)>(dlsym(selinux, "selinux_check_access"));
-    auto enabled = reinterpret_cast<int(*)()>(dlsym(selinux, "is_selinux_enabled"));
-    auto statusOpen = reinterpret_cast<int(*)(int)>(dlsym(selinux, "selinux_status_open"));
-    auto enforcement = reinterpret_cast<int(*)()>(dlsym(selinux, "security_getenforce"));
-    if (!handle || !lookup || !getcon || !release || !access || !enabled || !statusOpen || !enforcement) return unavailable("libselinux_symbols");
-    if (enabled() != 1 || statusOpen(1) < 0) return unavailable("effective_selinux_status");
-    printf("{\"event\":\"registry_policy_status\",\"enabled\":true,\"enforcing\":%d}\n", enforcement());
-    Handle labels = handle();
-    char *source = nullptr, *target = nullptr;
-    if (!labels) return unavailable("service_context_handle");
-    if (getcon(&source)) return unavailable("getcon");
-    if (lookup(labels, &target, name, 0)) {
-        puts("{\"event\":\"registry\",\"result\":\"name_mapping_absent\"}");
-        release(source); return 6;
-    }
-    bool allowed = access(source, target, "service_manager", server ? "add" : "find", nullptr) == 0;
-    printf("{\"event\":\"registry_permission\",\"name\":\"%s\",\"uid\":%d,\"sid\":\"%s\",\"target\":\"%s\",\"permission\":\"%s\",\"effective_allowed\":%s}\n", name, getuid(), source, target, server ? "add" : "find", allowed ? "true" : "false");
-    release(source); release(target);
-    if (!allowed) {
-        printf("{\"event\":\"registry\",\"result\":\"%s_denied\"}\n", server ? "add" : "find");
-        return 7;
+    if (!server) {
+        void* selinux = dlopen("libselinux.so", RTLD_NOW | RTLD_LOCAL);
+        if (!selinux) return unavailable("dlopen_libselinux");
+        using Handle = void*;
+        auto handle = reinterpret_cast<Handle(*)()>(dlsym(selinux, "selinux_android_service_context_handle"));
+        auto lookup = reinterpret_cast<int(*)(Handle,char**,const char*,int)>(dlsym(selinux, "selabel_lookup"));
+        auto getcon = reinterpret_cast<int(*)(char**)>(dlsym(selinux, "getcon"));
+        auto release = reinterpret_cast<void(*)(char*)>(dlsym(selinux, "freecon"));
+        auto access = reinterpret_cast<int(*)(const char*,const char*,const char*,const char*,void*)>(dlsym(selinux, "selinux_check_access"));
+        auto enabled = reinterpret_cast<int(*)()>(dlsym(selinux, "is_selinux_enabled"));
+        auto statusOpen = reinterpret_cast<int(*)(int)>(dlsym(selinux, "selinux_status_open"));
+        auto enforcement = reinterpret_cast<int(*)()>(dlsym(selinux, "security_getenforce"));
+        if (!handle || !lookup || !getcon || !release || !access || !enabled || !statusOpen || !enforcement) return unavailable("libselinux_symbols");
+        if (enabled() != 1 || statusOpen(1) < 0) return unavailable("effective_selinux_status");
+        printf("{\"event\":\"registry_policy_status\",\"enabled\":true,\"enforcing\":%d}\n", enforcement());
+        Handle labels = handle();
+        char *source = nullptr, *target = nullptr;
+        if (!labels) return unavailable("service_context_handle");
+        if (getcon(&source)) return unavailable("getcon");
+        if (lookup(labels, &target, name, 0)) {
+            puts("{\"event\":\"registry\",\"result\":\"name_mapping_absent\"}");
+            release(source); return 6;
+        }
+        bool allowed = access(source, target, "service_manager", "find", nullptr) == 0;
+        printf("{\"event\":\"registry_permission\",\"name\":\"%s\",\"uid\":%d,\"sid\":\"%s\",\"target\":\"%s\",\"permission\":\"find\",\"effective_allowed\":%s}\n", name, getuid(), source, target, allowed ? "true" : "false");
+        release(source); release(target);
+        if (!allowed) {
+            puts("{\"event\":\"registry\",\"result\":\"find_denied\"}");
+            return 7;
+        }
+    } else {
+        puts("{\"event\":\"registry_policy\",\"source\":\"selinuxfs supervisor query\"}");
     }
     auto manager = process->getContextObject(nullptr);
     if (!manager || manager->pingBinder() != OK) return 8;
@@ -231,9 +236,143 @@ static bool enforcedIdentity(char** argv, const char* target) {
     return passed;
 }
 
+// Fixed Android 16 AIDL probe. No caller-supplied package, path or transaction code.
+static bool dataCall(const sp<IBinder>& remote, uint32_t code, Parcel& request, Parcel& reply) {
+    status_t rc = remote->transact(IBinder::FIRST_CALL_TRANSACTION + code, request, &reply);
+    binder::Status status;
+    if (rc == OK) rc = status.readFromParcel(reply);
+    if (rc != OK || !status.isOk()) {
+        printf("{\"event\":\"data_error\",\"transaction\":%u,\"status_t\":%d,\"exception\":%d,\"service_error\":%d,\"detail\":\"", code, rc, status.exceptionCode(), status.serviceSpecificErrorCode());
+        const auto detail = status.toString8();
+        for (const unsigned char* p = reinterpret_cast<const unsigned char*>(detail.c_str()); *p; ++p) {
+            if (*p == '"' || *p == '\\') putchar('\\');
+            if (*p >= 32) putchar(*p); else printf("\\u%04x", *p);
+        }
+        puts("\"}");
+        return false;
+    }
+    return true;
+}
+
+template <typename Write> static status_t sized(Parcel& parcel, Write write) {
+    size_t start = parcel.dataPosition();
+    status_t rc = parcel.writeInt32(0);
+    if (rc == OK) rc = write();
+    size_t end = parcel.dataPosition();
+    parcel.setDataPosition(start);
+    if (rc == OK) rc = parcel.writeInt32(static_cast<int32_t>(end - start));
+    parcel.setDataPosition(end);
+    return rc;
+}
+
+static int dataProbe(int argc, char** argv) {
+    if (argc != 7) return 2;
+    auto process = driver(argv[2], strtoul(argv[3], nullptr, 10), strtoul(argv[4], nullptr, 10));
+    struct stat node {};
+    if (!process || stat(argv[2], &node) || node.st_rdev == strtoull(argv[6], nullptr, 10)) return 3;
+    const bool art = !strcmp(argv[1], "data-artd");
+    const bool create = !strcmp(argv[1], "data-installd-create");
+    if (!art && !create && strcmp(argv[1], "data-installd-delete")) return 2;
+    const char* service = art ? "artd" : "installd";
+    const char* descriptor = art ? "com.android.server.art.IArtd" : "android.os.IInstalld";
+    auto manager = process->getContextObject(nullptr);
+    if (!manager) return 4;
+    sp<IBinder> remote;
+    for (int attempt = 0; attempt < 100 && !remote; ++attempt) {
+        Parcel lookup, found;
+        if (lookup.writeInterfaceToken(String16("android.os.IServiceManager")) != OK || lookup.writeString16(String16(service)) != OK || !dataCall(manager, 2, lookup, found)) return 5;
+        if (found.readNullableStrongBinder(&remote) != OK || found.dataAvail() != 0) return 6;
+        if (!remote) usleep(50000);
+    }
+    const bool matches = remote && remote->getInterfaceDescriptor() == String16(descriptor);
+    printf("{\"event\":\"data_service_lookup\",\"service\":\"%s\",\"present\":%s,\"descriptor_matches\":%s}\n", service, remote ? "true" : "false", matches ? "true" : "false");
+    if (!matches) return 6;
+    const char* package = "com.android.ssal.phase2";
+    const char* dex = "/data/app/com.android.ssal.phase2/base.apk";
+    if (!art) {
+        Parcel request, reply;
+        if (request.writeInterfaceToken(String16(descriptor)) != OK) return 7;
+        if (create) {
+            // CreateAppDataArgs, non-null parcelable; nullable internal volume UUID.
+            if (request.writeInt32(1) != OK || sized(request, [&]() -> status_t {
+                if (request.writeInt32(-1) != OK || request.writeString16(String16(package)) != OK) return BAD_VALUE;
+                for (int32_t value : {0, 3, 10000, 0}) if (request.writeInt32(value) != OK) return BAD_VALUE;
+                if (request.writeString16(String16("default:targetSdkVersion=36")) != OK) return BAD_VALUE;
+                return request.writeInt32(36);
+            }) != OK || !dataCall(remote, 3, request, reply)) return 8;
+            int32_t present = 0, size = 0;
+            int64_t ce = 0, de = 0;
+            int32_t exception = -1;
+            if (reply.readInt32(&present) != OK || present != 1 || reply.readInt32(&size) != OK || size < 24 || reply.readInt64(&ce) != OK || reply.readInt64(&de) != OK || reply.readInt32(&exception) != OK || exception != 0 || ce <= 0 || de <= 0) return 9;
+        } else {
+            if (request.writeInt32(-1) != OK || request.writeString16(String16(package)) != OK || request.writeInt32(0) != OK || request.writeInt32(3) != OK || request.writeInt64(0) != OK || !dataCall(remote, 9, request, reply) || reply.dataAvail() != 0) return 10;
+        }
+        printf("{\"event\":\"data_operation\",\"result\":\"%s\",\"private_binder\":true}\n", create ? "installd_created" : "installd_deleted");
+        return 0;
+    }
+    Parcel aliveRequest, aliveReply;
+    bool alive = false;
+    if (aliveRequest.writeInterfaceToken(String16(descriptor)) != OK || !dataCall(remote, 0, aliveRequest, aliveReply) || aliveReply.readBool(&alive) != OK || !alive || aliveReply.dataAvail() != 0) return 11;
+    Parcel cancelRequest, cancelReply;
+    sp<IBinder> cancel;
+    if (cancelRequest.writeInterfaceToken(String16(descriptor)) != OK || !dataCall(remote, 16, cancelRequest, cancelReply) || cancelReply.readStrongBinder(&cancel) != OK || !cancel || cancelReply.dataAvail() != 0) return 12;
+    int loggingFd = open("/data/local/tmp/phase2-dex2oat.log", O_WRONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (loggingFd < 0) return 13;
+    Parcel request, reply;
+    auto text = [&](const char* s) { return request.writeString16(String16(s)); };
+    auto permission = [&]() -> status_t { if (request.writeInt32(1) != OK) return BAD_VALUE; return sized(request, [&]() -> status_t {
+        for (int32_t value : {1000, 1000, 1, 0}) if (request.writeInt32(value) != OK) return BAD_VALUE;
+        return OK;
+    }); };
+    if (request.writeInterfaceToken(String16(descriptor)) != OK || request.writeInt32(1) != OK || sized(request, [&]() -> status_t {
+        if (request.writeInt32(1) != OK || sized(request, [&]() -> status_t {
+            if (text(dex) != OK || text("arm64") != OK || request.writeBool(true) != OK) return BAD_VALUE;
+            return request.writeBool(false);
+        }) != OK) return BAD_VALUE;
+        if (request.writeInt32(1) != OK) return BAD_VALUE;
+        return sized(request, [&]() -> status_t {
+            if (permission() != OK || permission() != OK) return BAD_VALUE;
+            return request.writeInt32(0); // no SeContext
+        });
+    }) != OK || text(dex) != OK || text("arm64") != OK || text("PCL[]") != OK || text("verify") != OK) return 13;
+    // Nullable profile, input VDEX and DM; PriorityClass::BOOT (no Host cgroup task profile).
+    for (int32_t value : {0, 0, 0, 100}) if (request.writeInt32(value) != OK) return 13;
+    if (request.writeInt32(1) != OK || sized(request, [&]() -> status_t {
+        if (text("cmdline") != OK || request.writeInt32(36) != OK) return BAD_VALUE;
+        for (int i = 0; i < 3; ++i) if (request.writeBool(false) != OK) return BAD_VALUE;
+        return text("ssal Phase 2 disposable probe");
+    }) != OK || request.writeStrongBinder(cancel) != OK || request.writeInt32(1) != OK || request.writeDupParcelFileDescriptor(loggingFd) != OK) { close(loggingFd); return 14; }
+    close(loggingFd);
+    // Android 16 QPR2 adds a nullable trailing loggingFd, scoped to Guest userdata.
+    if (!dataCall(remote, 15, request, reply)) return 14;
+    // ArtdDexoptResult is a required sized parcelable. Filesystem evidence is checked by the supervisor.
+    int32_t present = 0, size = 0;
+    bool cancelled = true;
+    if (reply.readInt32(&present) != OK || present != 1) return 15;
+    size_t start = reply.dataPosition();
+    int64_t wall = -1, cpu = -1, bytes = -1, before = -1;
+    if (reply.readInt32(&size) != OK || size < 40 || static_cast<size_t>(size) > reply.dataSize() - start || reply.readBool(&cancelled) != OK || cancelled || reply.readInt64(&wall) != OK || reply.readInt64(&cpu) != OK || reply.readInt64(&bytes) != OK || reply.readInt64(&before) != OK || wall < 0 || cpu < 0 || bytes <= 0 || before < 0) return 15;
+    reply.setDataPosition(start + size);
+    if (reply.dataAvail() != 0) return 15;
+    printf("{\"event\":\"data_operation\",\"result\":\"artd_compiled\",\"private_binder\":true,\"compiler_filter\":\"verify\",\"wall_time_ms\":%lld,\"cpu_time_ms\":%lld,\"output_bytes\":%lld}\n",static_cast<long long>(wall),static_cast<long long>(cpu),static_cast<long long>(bytes));
+    return 0;
+}
+
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     setvbuf(stderr, nullptr, _IONBF, 0);
+    if (argc == 3 && !strcmp(argv[1], "phase2-properties")) {
+        auto area = prop_area::map_prop_area_rw(argv[2], nullptr, nullptr);
+        if (!area) return 1;
+        const char* compiler = "dalvik.vm.dex2oat64.enabled";
+        const char* abi = "ro.product.cpu.abilist64";
+        const char* sdk = "ro.build.version.sdk";
+        const char* codename = "ro.build.version.codename";
+        const bool ok = area->add("servicemanager.ready", 20, "true", 4) && area->add(compiler, strlen(compiler), "true", 4) && area->add(abi, strlen(abi), "arm64-v8a", 9) && area->add(sdk,strlen(sdk),"36",2) && area->add(codename,strlen(codename),"REL",3);
+        prop_area::unmap_prop_area(&area);
+        return ok ? 0 : 1;
+    }
+    if (argc > 1 && !strncmp(argv[1], "data-", 5)) return dataProbe(argc, argv);
     if (argc > 1 && !strncmp(argv[1], "registry-", 9)) return registry(argc, argv);
     bool serverOnly = argc == 10 && !strcmp(argv[1], "enforcing-server");
     bool clientOnly = argc == 10 && !strcmp(argv[1], "enforcing-client");

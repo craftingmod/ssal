@@ -34,6 +34,12 @@ if (existsSync("out/bin/ssal-binder-probe") || existsSync("out/bin/ssal-binder-p
     ["helper_sha256", "out/bin/ssal-binder-probe"],
     ["source_sha256", "native/binder-probe/main.cpp"],
     ["build_script_sha256", "scripts/build-binder-probe.sh"],
+    ["phase2_apk_sha256", "out/bin/ssal-phase2.apk"],
+    ["art_exec_proc_sha256", "out/bin/ssal-art-exec-proc"],
+    ["art_exec_proc_source_sha256", "native/binder-probe/art-exec-proc.c"],
+    ["phase2_log_sha256", "out/bin/ssal-phase2-log.so"],
+    ["phase2_log_source_sha256", "native/binder-probe/log-to-stderr.c"],
+    ["phase2_apk_source_sha256", "scripts/make-phase2-apk.py"],
   ] as const) {
     const digest = createHash("sha256").update(await readFile(path)).digest("hex")
     if (manifest[key] !== digest) throw new Error(`Stale Binder helper: ${path}; rebuild before packaging`)
@@ -42,6 +48,9 @@ if (existsSync("out/bin/ssal-binder-probe") || existsSync("out/bin/ssal-binder-p
   entries.push(
     { name: "bin/ssal-binder-probe", path: "out/bin/ssal-binder-probe", mode: 0o100755 },
     { name: "bin/ssal-binder-probe.json", path: "out/bin/ssal-binder-probe.json", mode: 0o100644 },
+    { name: "bin/ssal-phase2.apk", path: "out/bin/ssal-phase2.apk", mode: 0o100644 },
+    { name: "bin/ssal-art-exec-proc", path: "out/bin/ssal-art-exec-proc", mode: 0o100755 },
+    { name: "bin/ssal-phase2-log.so", path: "out/bin/ssal-phase2-log.so", mode: 0o100644 },
     { name: "NOTICE.binder-probe", path: "native/binder-probe/NOTICE", mode: 0o100644 },
     { name: "LICENSE.binder-probe", path: "native/binder-probe/LICENSE.apache-2.0", mode: 0o100644 },
   )

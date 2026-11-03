@@ -1,6 +1,6 @@
 # `probe-servicemanager` 구현 계획 — Binder Test B
 
-상태: `ssal probe-servicemanager PROFILE_NAME`과 제한 런처를 구현했다. 2026-11-03 실기기에서 Permissive 진단의 등록·nonce 호출·양방향 레지스트리 격리가 통과했다. Enforcing은 실제 servicemanager 도메인까지 확인했으나 시험 서버의 `add_denied`로 차단됐다. [실행 결과와 제한](servicemanager-test-b-device-20261103.md)을 참고한다. 아래의 엄격한 다섯 필드 통과 기준과 `switch` 차단은 유지한다.
+상태: Test B 구현과 2026-11-03 SM-S937N/profile1 실기기 Enforcing 검증이 완료됐다. 시험 서버는 전용 `aidl_lazy_test_server` 도메인에서 사전 매핑된 `aidl_lazy_test_1` 서비스로 실행한다. 최종 실행에서 다섯 필드가 모두 통과해 `phase1_complete=true`다. `/data` 격리 Phase 2가 끝날 때까지 `switch`는 차단한다. [최종 Enforcing 증거](servicemanager-test-b-enforcing-hardened-device-20261103.json)를 참고한다.
 
 사용자 승인에 따라 Permissive에서 제한 진단을 실행할 수 있다. 명령 자체는 SELinux 모드를 변경하지 않으며, Permissive 성공은 `permissive_diagnostic_passed=true`로 별도 기록한다. `android_service_selinux=passed`나 Enforcing 검증 완료로 변환하지 않는다.
 
@@ -21,7 +21,9 @@
 - 실행 파일 라벨, 전환 가능성, Binder 노드 접근, SELinux 상태·설정 파일 접근을 사전 검사한다. 파일 라벨만으로 도메인 전환 성공을 판정하지 않는다.
 - 실행 후 추적한 servicemanager PID의 실제 `/proc/<pid>/attr/current`가 정확히 `u:r:servicemanager:s0`인지 확인한다. `u:r:ksu:s0` 또는 다른 도메인이면 실패하고 후속 시험을 중단한다.
 - UID/GID/보조 그룹, root·namespace identity, 실제 Binder FD가 해당 세션의 private 장치인지 확인한다. 같은 도메인의 Host 프로세스를 Guest 실행 증거로 사용하지 않는다.
-- SELinux Enforcing을 유지한다. 정책 변경·타입 추가·allow 규칙·permissive 변경을 별도 사용자 승인 없이 자동 적용하지 않는다. 필요한 정책이 없으면 차단 사유와 필요한 변경안을 보고하고 시험을 중단한다.
+- Test B 등록 서버는 shell이 아니라 `u:r:aidl_lazy_test_server:s0`에서 실행하고, Guest의 기존 `aidl_lazy_test_1` 매핑(`aidl_lazy_test_service`)을 사용한다. 실효 정책에서 이 도메인이 permissive가 아니며 등록 권한이 있는지 확인한다.
+- 모듈 정책은 시험 바이너리 entrypoint 실행, 시험 타입의 `service_manager add`, `servicemanager`와 시험 서버 간 Binder call/transfer, shell과 시험 서버 간 Binder transfer만 허용한다. generic `default_android_service` 권한이나 permissive 도메인은 사용하지 않는다. Probe 실행 중 정책·SELinux 모드를 바꾸지 않는다.
+- 실기기에서 private Binder 접근은 이미 허용됐고, Enforcing 실패는 실행 entrypoint와 서비스 등록·Binder 상호작용의 실효 권한 부족이었다. 여섯 개의 좁은 규칙을 모듈 정책에 반영하고 Enforcing에서 재검증했다.
 
 ## 3. 서비스 권한과 호출 판정
 
@@ -37,7 +39,7 @@
 | `passed` | 등록·별도 클라이언트 조회·nonce 응답과 서버 identity가 모두 일치함 |
 | `unavailable` | 권한·매핑·통신 증거가 부족해 원인을 구분할 수 없음 |
 
-단순 null 반환·일반 오류 코드만으로 `not_registered`나 격리 성공을 판정하지 않는다. 실효 정책·매핑·접근 검사와 필요한 감사 증거를 수집하며, 원인이 불명확하면 통과시키지 않는다. 시험 이름은 세션별 고유 이름을 사용하고 기존 Host 서비스 이름으로 등록하지 않는다.
+단순 null 반환·일반 오류 코드만으로 `not_registered`나 격리 성공을 판정하지 않는다. 실효 정책·매핑·접근 검사와 필요한 감사 증거를 수집하며, 원인이 불명확하면 통과시키지 않는다. 임의 이름은 `default_android_service`로 매핑되어 정상 Enforcing에서는 등록할 수 없으므로, 사전 매핑된 AIDL 테스트 이름 `aidl_lazy_test_1`을 사용한다. Host에서 같은 이름의 `find` 허용과 시험 전 미등록을 확인하고, 시험 후에도 Host 등록 상태가 불변인지 확인한다. 이미 Host에 등록돼 있으면 시험을 실패 처리하며 다른 이름을 덮어쓰지 않는다.
 
 ## 4. 양방향 레지스트리 격리
 
@@ -81,4 +83,4 @@
 5. 권한 원인 구분과 양방향 대조군 검사를 추가한다.
 6. 기기에서 정상 경로와 차단 불명·도메인 불일치·권한 거부·timeout·부분 실행·정리 실패 경로를 검증한다. Property 차단 검증을 위해 Host 변경 요청을 실제 전송하지 않는다.
 
-자동 검증은 null/권한 거부의 격리 성공 오판 방지, 일부 필드만 통과한 전체 성공 거부, 실패 단계별 공통 정리 진입과 자원 해제 순서를 포함한다. 정책 변경이 필요한 기기 검증은 변경안에 대한 별도 승인 이후 수행한다.
+자동 검증은 null/권한 거부의 격리 성공 오판 방지, 일부 필드만 통과한 전체 성공 거부, 실패 단계별 공통 정리 진입과 자원 해제 순서를 포함한다. 사용자 승인에 따라 좁은 시험 정책을 적용한 뒤 실제 Enforcing 검증을 완료했다.

@@ -62,3 +62,5 @@ Private Binder의 Enforcing 접근 방안은 [후속 조사](docs/private-binder
 후속 [구현·기기 실험](docs/private-binder-device-20261031.md)에서는 원본 binder_device 선택과 enforcing servicemanager/UID 1000의 제한된 ioctl 검사를 통과했습니다. 추가 정책은 적용하지 않았으며, enforcing IPC·service_contexts와 정식 서비스 기동은 미검증입니다.
 
 최신 [Enforcing Binder IPC·레지스트리 시험](docs/enforcing-binder-device-20261031.md)은 기존 정책에서 shell → servicemanager의 실제 transaction, Guest libbinder echo와 Binder 객체 전달을 확인했습니다. 같은 도메인의 거부 대조군을 구분했으며, service_contexts의 9개 context가 차단됩니다. 정식 Android 서비스 실행과 launch_enabled 해제는 수행하지 않았습니다.
+
+Phase 2 데이터 격리 검사는 `ssal probe-guest-data PROFILE_NAME`으로 실행합니다. **새로 만든 빈 프로필**과 기존 Permissive 상태가 필요하며, 검사 자체는 SELinux 모드를 변경하지 않습니다. 디렉터리 bind `/data`에서 private `installd` 생성·삭제와 `artd` 컴파일, Host 불변성 및 역순 정리를 확인합니다. [실기기 결과와 실행 조건](docs/phase2-data-isolation.md)을 참고하세요. `switch`와 운영 서비스 `launch_enabled=false`는 유지합니다.

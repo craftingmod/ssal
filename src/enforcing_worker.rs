@@ -11,6 +11,7 @@ use std::process::Command;
 mod wire;
 const MANAGER: &str = "u:r:servicemanager:s0";
 const CLIENT: &str = "u:r:shell:s0";
+const TEST_SERVER: &str = "u:r:aidl_lazy_test_server:s0";
 fn check(rc: i32) -> io::Result<()> {
     if rc == 0 {
         Ok(())
@@ -42,6 +43,9 @@ fn read_fd(fd: i32) -> io::Result<String> {
 
 pub fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    if args.len() == 10 && args[1] == "phase2" {
+        return launch_data_daemon(&args);
+    }
     if args.len() == 10 && args[1] == "test-b" {
         return launch(&args);
     }
@@ -210,23 +214,39 @@ fn launch(args: &[String]) -> io::Result<()> {
         "registry-server",
         "registry-check",
         "registry-echo",
+        "data-installd-create",
+        "data-installd-delete",
+        "data-artd",
     ]
     .contains(&args[8].as_str())
     {
         return Err(io::Error::other("fixed engine"));
     }
-    if !test_b && (args[8].starts_with("registry-") || args[8] == "manager") {
+    if !test_b
+        && (args[8].starts_with("registry-")
+            || args[8].starts_with("data-")
+            || args[8] == "manager")
+    {
         return Err(io::Error::other("Test B requires dedicated launch mode"));
     }
+    let registry_server = args[8] == "registry-server";
     let client = [
         "client",
         "libclient",
-        "registry-server",
         "registry-check",
         "registry-echo",
+        "data-installd-create",
+        "data-installd-delete",
+        "data-artd",
     ]
     .contains(&args[8].as_str());
-    let target = if client { CLIENT } else { MANAGER };
+    let target = if registry_server {
+        TEST_SERVER
+    } else if client {
+        CLIENT
+    } else {
+        MANAGER
+    };
     let root = &args[2];
     let root_meta = fs::metadata(root)?;
     let meta = fs::metadata(format!("{root}/dev/binder"))?;
@@ -403,7 +423,12 @@ fn launch(args: &[String]) -> io::Result<()> {
         if args[8] == "manager" {
             Command::new("/system/bin/servicemanager")
         } else {
-            let mut cmd = Command::new("/data/local/tmp/ssal-binder-client");
+            let path = if registry_server {
+                "/data/local/tmp/ssal-binder-test-server"
+            } else {
+                "/data/local/tmp/ssal-binder-client"
+            };
+            let mut cmd = Command::new(path);
             cmd.arg(&args[8])
                 .arg("/dev/binder")
                 .arg(libc::major(nums[2]).to_string())
@@ -458,12 +483,16 @@ fn launch(args: &[String]) -> io::Result<()> {
     let error = command.exec();
     println!(
         "{}",
-        json!({"event":"execve","syscall":"execve","errno":error.raw_os_error(),"error":error.to_string(),"target":target,"entrypoint":if client{"u:object_r:shell_exec:s0"}else{"u:object_r:servicemanager_exec:s0"},"nnp_order":args[7]})
+        json!({"event":"execve","syscall":"execve","errno":error.raw_os_error(),"error":error.to_string(),"target":target,"entrypoint":if registry_server{"u:object_r:aidl_lazy_test_server_exec:s0"}else if client{"u:object_r:shell_exec:s0"}else{"u:object_r:servicemanager_exec:s0"},"nnp_order":args[7]})
     );
     Err(error)
 }
 
 fn deny_connect() -> io::Result<()> {
+    connection_filter(false)
+}
+
+fn connection_filter(allow_processes: bool) -> io::Result<()> {
     #[cfg(target_arch = "aarch64")]
     const AUDIT_ARCH: u32 = 0xc00000b7;
     #[cfg(target_arch = "x86_64")]
@@ -482,7 +511,7 @@ fn deny_connect() -> io::Result<()> {
         jf: 0,
         k,
     };
-    let mut filter = [
+    let mut filter = vec![
         stmt(0x20, 4),
         libc::sock_filter {
             code: 0x15,
@@ -537,6 +566,24 @@ fn deny_connect() -> io::Result<()> {
         stmt(0x06, 0x00050000 | libc::EPERM as u32),
         stmt(0x06, 0x7fff0000),
     ];
+    if allow_processes {
+        // Compilation may fork, but descendants cannot leave the owned process group.
+        filter[8].k = u32::MAX - 2;
+        filter[10].k = u32::MAX - 3;
+        filter[12].k = u32::MAX - 4;
+        filter.pop();
+        filter.push(stmt(0x20, 0));
+        for syscall in [libc::SYS_setsid, libc::SYS_setpgid] {
+            filter.push(libc::sock_filter {
+                code: 0x15,
+                jt: 0,
+                jf: 1,
+                k: syscall as u32,
+            });
+            filter.push(stmt(0x06, 0x00050000 | libc::EPERM as u32));
+        }
+        filter.push(stmt(0x06, 0x7fff0000));
+    }
     check(unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) })?;
     let program = libc::sock_fprog {
         len: filter.len() as u16,
@@ -555,8 +602,288 @@ fn deny_connect() -> io::Result<()> {
     Ok(())
 }
 
+// This kernel lacks PID namespaces. Expose this daemon's proc directory only.
+fn launch_data_daemon(args: &[String]) -> io::Result<()> {
+    let supervisor = unsafe { libc::getppid() };
+    check(unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) })?;
+    if unsafe { libc::getppid() } != supervisor {
+        return Err(io::Error::other("Phase 2 supervisor exited before launch"));
+    }
+    if unsafe { libc::geteuid() } != 0
+        || fs::read_to_string("/proc/self/attr/current")?
+            .trim_matches('\0')
+            .trim()
+            != "u:r:ksu:s0"
+        || fs::read_to_string("/sys/fs/selinux/enforce")?.trim() != "0"
+        || !["installd", "artd", "derive-classpath"].contains(&args[8].as_str())
+    {
+        return Err(io::Error::other(
+            "Phase 2 requires management credentials and existing global Permissive mode",
+        ));
+    }
+    let root = &args[2];
+    let meta = fs::metadata(format!("{root}/dev/binder"))?;
+    let nums = args[3..7]
+        .iter()
+        .map(|v| v.parse::<u64>().map_err(io::Error::other))
+        .collect::<io::Result<Vec<_>>>()?;
+    if !meta.file_type().is_char_device()
+        || [meta.dev(), meta.ino(), meta.rdev()] != nums[..3]
+        || meta.rdev() == nums[3]
+    {
+        return Err(io::Error::other("Phase 2 private Binder identity"));
+    }
+    let art = args[8] == "artd";
+    let derive = args[8] == "derive-classpath";
+    let uid = if art { 1082 } else { 0 };
+    let domain = if derive {
+        "u:r:shell:s0"
+    } else if art {
+        "u:r:artd:s0"
+    } else {
+        "u:r:installd:s0"
+    };
+    let executable = if derive {
+        "/apex/com.android.sdkext/bin/derive_classpath"
+    } else if art {
+        "/apex/com.android.art/bin/artd"
+    } else {
+        "/system/bin/installd"
+    };
+    let mut command = Command::new(executable);
+    if derive {
+        command.args([
+            "--override-device-sdk-version=36",
+            "--override-device-codename=REL",
+            "/data/local/tmp/phase2-classpath.env",
+        ]);
+    }
+    command
+        .env_clear()
+        .env("PATH", "/system/bin:/apex/com.android.art/bin")
+        .env("ANDROID_ROOT", "/system")
+        .env("ANDROID_DATA", "/data")
+        .env("ASEC_MOUNTPOINT", "/mnt/asec")
+        .env("ANDROID_STORAGE", "/storage")
+        .env("ANDROID_ART_ROOT", "/apex/com.android.art")
+        .env("ANDROID_RUNTIME_ROOT", "/apex/com.android.runtime")
+        .env("ANDROID_I18N_ROOT", "/apex/com.android.i18n")
+        .env("ANDROID_TZDATA_ROOT", "/apex/com.android.tzdata");
+    if art {
+        command.env("LD_PRELOAD", "/data/local/tmp/ssal-phase2-log.so");
+        command.env("LD_LIBRARY_PATH", "/apex/com.android.art/lib64:/system/lib64:/apex/com.android.os.statsd/lib64:/apex/com.android.i18n/lib64");
+    }
+    if derive {
+        command
+            .env("LD_PRELOAD", "/data/local/tmp/ssal-phase2-log.so")
+            .env(
+                "LD_LIBRARY_PATH",
+                "/data/local/tmp:/apex/com.android.sdkext/lib64:/system/lib64",
+            );
+    }
+    for path in [
+        "init.environ.rc",
+        "system/etc/init/hw/init.environ.rc",
+        "data/local/tmp/phase2-classpath.env",
+    ] {
+        if let Ok(path) = ssal::namespace_mounts::guest_path(std::path::Path::new(root), path) {
+            for line in fs::read_to_string(path)?.lines() {
+                let fields = line.split_whitespace().collect::<Vec<_>>();
+                if fields.len() == 3
+                    && fields[0] == "export"
+                    && [
+                        "BOOTCLASSPATH",
+                        "DEX2OATBOOTCLASSPATH",
+                        "SYSTEMSERVERCLASSPATH",
+                    ]
+                    .contains(&fields[1])
+                {
+                    command.env(fields[1], fields[2]);
+                }
+            }
+        }
+    }
+    check(unsafe { libc::unshare(libc::CLONE_NEWNS | libc::CLONE_NEWNET) })?;
+    check(unsafe {
+        libc::mount(
+            std::ptr::null(),
+            c"/".as_ptr(),
+            std::ptr::null(),
+            libc::MS_PRIVATE | libc::MS_REC,
+            std::ptr::null(),
+        )
+    })?;
+    let parent = unsafe { libc::getpid() };
+    if unsafe { libc::setsid() } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let parent_fd = unsafe { libc::syscall(libc::SYS_pidfd_open, parent, 0) } as i32;
+    if parent_fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let parent_fd = unsafe { File::from_raw_fd(parent_fd) };
+    let child = unsafe { libc::fork() };
+    if child < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if child > 0 {
+        println!(
+            "{}",
+            json!({"event":"phase2_child","pid":child,"role":args[8]})
+        );
+        let mut status = 0;
+        loop {
+            if unsafe { libc::waitpid(child, &mut status, 0) } >= 0 {
+                break;
+            }
+            if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        return if status == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!("{} exited: {status}", args[8])))
+        };
+    }
+    // The daemon dies with its launcher; the supervisor also reaps its entire group.
+    check(unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) })?;
+    if unsafe { libc::getppid() } != parent {
+        return Err(io::Error::other("launcher disappeared"));
+    }
+    // Verify the outside parent is still alive before replacing proc.
+    if !std::path::Path::new(&format!("/proc/{parent}")).exists() {
+        return Err(io::Error::other("launcher disappeared"));
+    }
+    check(unsafe {
+        libc::mount(
+            c"tmpfs".as_ptr(),
+            cpath(&format!("{root}/proc"))?.as_ptr(),
+            c"tmpfs".as_ptr(),
+            libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+            std::ptr::null(),
+        )
+    })?;
+    fs::create_dir(format!("{root}/proc/self"))?;
+    check(unsafe {
+        libc::mount(
+            c"/proc/self".as_ptr(),
+            cpath(&format!("{root}/proc/self"))?.as_ptr(),
+            std::ptr::null(),
+            libc::MS_BIND,
+            std::ptr::null(),
+        )
+    })?;
+    std::os::unix::fs::symlink("self", format!("{root}/proc/thread-self"))?;
+    std::os::unix::fs::symlink("self", format!("{root}/proc/{}", unsafe { libc::getpid() }))?;
+    for entry in fs::read_dir("/proc/self/fd")? {
+        let fd: i32 = entry?
+            .file_name()
+            .to_string_lossy()
+            .parse()
+            .map_err(io::Error::other)?;
+        if fd > 2 && !(art && fd == 198) && unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0 {
+            check(unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) })?;
+        }
+    }
+    OpenOptions::new()
+        .write(true)
+        .open("/proc/self/attr/exec")?
+        .write_all(cpath(domain)?.as_bytes_with_nul())?;
+    check(unsafe { libc::chroot(cpath(root)?.as_ptr()) })?;
+    check(unsafe { libc::chdir(c"/".as_ptr()) })?;
+    // Phase 2 artd retains SYS_ADMIN only for the approved compiler mount-namespace shim.
+    let mut bits = (1u64 << 0) | (1 << 1) | (1 << 2) | (1 << 3);
+    if art {
+        bits |= 1 << 21;
+    }
+    if !art {
+        bits |= (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7);
+    }
+    for cap in 0..=40 {
+        if bits & (1 << cap) == 0 {
+            check(unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0) })?;
+        }
+    }
+    check(unsafe { libc::prctl(libc::PR_SET_KEEPCAPS, 1, 0, 0, 0) })?;
+    check(unsafe { libc::setgroups(0, std::ptr::null()) })?;
+    check(unsafe { libc::setresgid(uid, uid, uid) })?;
+    check(unsafe { libc::setresuid(uid, uid, uid) })?;
+    check(unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) })?;
+    let mut parent_poll = libc::pollfd {
+        fd: parent_fd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    if unsafe { libc::poll(&mut parent_poll, 1, 0) } != 0 {
+        return Err(io::Error::other("launcher exited during daemon setup"));
+    }
+    drop(parent_fd);
+    let caps = [
+        Cap {
+            effective: bits as u32,
+            permitted: bits as u32,
+            inheritable: bits as u32,
+        },
+        Cap::default(),
+    ];
+    check(unsafe {
+        libc::syscall(
+            libc::SYS_capset,
+            &Header {
+                version: 0x20080522,
+                pid: 0,
+            },
+            caps.as_ptr(),
+        )
+    } as i32)?;
+    for cap in 0..=31 {
+        if bits & (1 << cap) != 0 {
+            check(unsafe {
+                libc::prctl(libc::PR_CAP_AMBIENT, libc::PR_CAP_AMBIENT_RAISE, cap, 0, 0)
+            })?;
+        }
+    }
+    check(unsafe {
+        libc::setrlimit(
+            libc::RLIMIT_CORE,
+            &libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            },
+        )
+    })?;
+    connection_filter(true)?;
+    Err(command.exec())
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn compiler_filter_allows_fork_but_prevents_group_escape() {
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            let mut passed =
+                unsafe { libc::setsid() } >= 0 && super::connection_filter(true).is_ok();
+            passed &= unsafe { libc::setsid() } == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+            passed &= unsafe { libc::setpgid(0, 0) } == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+            let compiler = unsafe { libc::fork() };
+            if compiler == 0 {
+                unsafe { libc::_exit(0) };
+            }
+            let mut status = 0;
+            passed &= compiler > 0
+                && unsafe { libc::waitpid(compiler, &mut status, 0) } == compiler
+                && status == 0;
+            unsafe { libc::_exit(if passed { 0 } else { 1 }) };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert_eq!(status, 0);
+    }
     #[test]
     fn connect_filter_survives_without_property_payload() {
         // The filter is deliberately installed only in the disposable test child.
