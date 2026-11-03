@@ -471,6 +471,17 @@ mod daemon {
         std::env::set_var("SSAL_PHASE2C_RSBINDER_PROBE", probe);
         prepare_session(root, profile, "probe-servicemanager")
     }
+    #[cfg(feature = "phase3-diagnostic")]
+    pub fn run_phase3_diagnostic(
+        root: &Path,
+        profile: &str,
+        phase2_probe: &Path,
+        phase3_probe: &Path,
+    ) -> io::Result<String> {
+        std::env::set_var("SSAL_PHASE2C_RSBINDER_PROBE", phase2_probe);
+        std::env::set_var("SSAL_PHASE3_RSBINDER_PROBE", phase3_probe);
+        prepare_session(root, profile, "probe-servicemanager")
+    }
     pub fn run() -> io::Result<()> {
         if unsafe { libc::geteuid() } != 0 {
             return Err(io::Error::other("ssald must run as root"));
@@ -683,6 +694,30 @@ fn main() {
             Ok(output) => println!("{output}"),
             Err(error) => {
                 eprintln!("Phase 2C diagnostic: {error}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+    #[cfg(feature = "phase3-diagnostic")]
+    if args
+        .get(1)
+        .is_some_and(|arg| arg == "--phase3-rsbinder-runner")
+    {
+        if args.len() != 5 || unsafe { libc::geteuid() } != 0 {
+            eprintln!("invalid Phase 3 diagnostic runner invocation");
+            std::process::exit(1);
+        }
+        let result = daemon::run_phase3_diagnostic(
+            &std::path::PathBuf::from(ssal::unix::ROOT),
+            args[2].to_str().unwrap_or(""),
+            std::path::Path::new(&args[3]),
+            std::path::Path::new(&args[4]),
+        );
+        match result {
+            Ok(output) => println!("{output}"),
+            Err(error) => {
+                eprintln!("Phase 3 diagnostic: {error}");
                 std::process::exit(1);
             }
         }

@@ -214,6 +214,10 @@ fn launch(args: &[String]) -> io::Result<()> {
         "registry-server",
         "registry-check",
         "registry-echo",
+        "phase3-server",
+        "phase3-client",
+        "phase3-death-client",
+        "phase3-absent",
         "data-installd-create",
         "data-installd-delete",
         "data-artd",
@@ -230,6 +234,7 @@ fn launch(args: &[String]) -> io::Result<()> {
         return Err(io::Error::other("Test B requires dedicated launch mode"));
     }
     let registry_server = args[8] == "registry-server";
+    let phase3_server = args[8] == "phase3-server";
     let client = [
         "client",
         "libclient",
@@ -238,9 +243,12 @@ fn launch(args: &[String]) -> io::Result<()> {
         "data-installd-create",
         "data-installd-delete",
         "data-artd",
+        "phase3-client",
+        "phase3-death-client",
+        "phase3-absent",
     ]
     .contains(&args[8].as_str());
-    let target = if registry_server {
+    let target = if registry_server || phase3_server {
         TEST_SERVER
     } else if client {
         CLIENT
@@ -422,6 +430,23 @@ fn launch(args: &[String]) -> io::Result<()> {
     let mut command = if test_b {
         if args[8] == "manager" {
             Command::new("/system/bin/servicemanager")
+        } else if args[8].starts_with("phase3-") {
+            let server = phase3_server;
+            let path = if server {
+                "/data/local/tmp/ssal-rsbinder-phase3-server"
+            } else {
+                "/data/local/tmp/ssal-rsbinder-phase3-client"
+            };
+            let mode = match args[8].as_str() {
+                "phase3-server" => "server",
+                "phase3-client" => "client",
+                "phase3-death-client" => "death-client",
+                "phase3-absent" => "check-absent",
+                _ => return Err(io::Error::other("fixed Phase 3 role")),
+            };
+            let mut cmd = Command::new(path);
+            cmd.arg(mode);
+            cmd
         } else {
             let path = if registry_server {
                 "/data/local/tmp/ssal-binder-test-server"

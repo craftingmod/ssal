@@ -13,6 +13,10 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 
+#[cfg(feature = "phase3-diagnostic")]
+#[path = "servicemanager/phase3.rs"]
+mod phase3;
+
 const FIELDS: [&str; 5] = [
     "servicemanager",
     "android_service_selinux",
@@ -1174,6 +1178,10 @@ pub fn verify_phase2(root: &Path, userdata: &Path) -> io::Result<()> {
 
 fn verify_mode(root: &Path, userdata: Option<&Path>) -> io::Result<()> {
     check_recovery()?;
+    #[cfg(feature = "phase3-diagnostic")]
+    let phase3_requested = std::env::var_os("SSAL_PHASE3_RSBINDER_PROBE").is_some();
+    #[cfg(not(feature = "phase3-diagnostic"))]
+    let phase3_requested = false;
     let mut report = json!({"schema":1,"validation_scope":"private_binder_test_b","launch_enabled":false,"checks":{},"phase1_complete":false,"cleanup_scope":"Test B processes, FDs and masks/Binder only; outer worker must confirm rootfs/loop release"});
     for field in FIELDS {
         report["checks"][field] = json!("not_run");
@@ -1482,6 +1490,36 @@ fn verify_mode(root: &Path, userdata: Option<&Path>) -> io::Result<()> {
         }) {
             return Err(io::Error::other("nonce server PID mismatch"));
         }
+        #[cfg(feature = "phase3-diagnostic")]
+        if phase3_requested {
+            let phase3_result = (|| -> io::Result<Value> {
+                let phase2c = if report["rsbinder_guest_probe"].is_object() {
+                    report["rsbinder_guest_probe"].clone()
+                } else {
+                    run_phase2c_rsbinder_probe(root)?
+                };
+                if phase2c["exit_code"] != 0 || phase2c["result"]["ok"] != true {
+                    return Err(io::Error::other(
+                        "Phase 2C private Binder probe failed; Phase 3 was not started",
+                    ));
+                }
+                report["rsbinder_guest_probe"] = phase2c;
+                phase3::run(root, identity, server_index, &mut processes)
+            })();
+            match phase3_result {
+                Ok(value) => {
+                    let passed = value["passed"] == true;
+                    report["phase3"] = value;
+                    if !passed {
+                        return Err(io::Error::other("Phase 3 diagnostic did not pass"));
+                    }
+                }
+                Err(error) => {
+                    report["phase3"] = json!({"passed":false,"error":error.to_string()});
+                    return Err(error);
+                }
+            }
+        }
         report["guest_positive"] = echo;
         report["checks"]["servicemanager"] = json!("passed");
         report["checks"]["host_registry_isolation"] = json!("failed");
@@ -1638,6 +1676,8 @@ fn verify_mode(root: &Path, userdata: Option<&Path>) -> io::Result<()> {
         "failed"
     });
     report["cleanup_errors"] = json!(cleanup_errors);
+    report["phase3_requested"] = json!(phase3_requested);
+    report["phase3_complete"] = json!(!phase3_requested || report["phase3"]["passed"] == true);
     let data_complete = if userdata.is_some() {
         let host_data_after = host_data_paths();
         let host_data_ok = host_data_before
@@ -1692,7 +1732,9 @@ fn verify_mode(root: &Path, userdata: Option<&Path>) -> io::Result<()> {
         eprintln!("RECOVERY_REQUIRED: Test B resources retained");
         unsafe { libc::_exit(1) };
     }
-    if phase1_complete || data_complete {
+    if (phase1_complete || data_complete)
+        && (!phase3_requested || report["phase3"]["passed"] == true)
+    {
         Ok(())
     } else {
         Err(io::Error::other(if userdata.is_some() {

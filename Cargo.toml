@@ -6,6 +6,7 @@ publish = false
 
 [features]
 phase2c-diagnostic = []
+phase3-diagnostic = ["phase2c-diagnostic"]
 
 [[bin]]
 name = "ssal"
