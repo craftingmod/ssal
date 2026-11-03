@@ -1,6 +1,8 @@
 # `probe-servicemanager` 구현 계획 — Binder Test B
 
-상태: 계획이며 명령·서비스 런처는 아직 구현되지 않았다. [Test A](binder-probe.md)의 독립 Binder IPC 결과를 기반으로, 새 세션에서 AOSP servicemanager와 서비스 등록·조회·호출을 검증한다.
+상태: `ssal probe-servicemanager PROFILE_NAME`과 제한 런처를 구현했다. 2026-11-03 실기기에서 Permissive 진단의 등록·nonce 호출·양방향 레지스트리 격리가 통과했다. Enforcing은 실제 servicemanager 도메인까지 확인했으나 시험 서버의 `add_denied`로 차단됐다. [실행 결과와 제한](servicemanager-test-b-device-20261103.md)을 참고한다. 아래의 엄격한 다섯 필드 통과 기준과 `switch` 차단은 유지한다.
+
+사용자 승인에 따라 Permissive에서 제한 진단을 실행할 수 있다. 명령 자체는 SELinux 모드를 변경하지 않으며, Permissive 성공은 `permissive_diagnostic_passed=true`로 별도 기록한다. `android_service_selinux=passed`나 Enforcing 검증 완료로 변환하지 않는다.
 
 운영 서비스의 `launch_enabled=false`와 기존 선행 조건은 유지한다. Guest property service 없는 제한 시험은 운영 서비스 기동이나 `properties_ready`의 통과가 아니다. Android init·HAL·다른 운영 서비스는 실행하지 않는다.
 

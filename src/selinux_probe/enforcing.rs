@@ -125,7 +125,7 @@ fn trial(root: &Path, identity: [u64; 4], order: &str, engine: &str) -> io::Resu
     )
 }
 
-fn labeled_copy(source: &Path, target: &Path, label: &str) -> io::Result<()> {
+pub(super) fn labeled_copy(source: &Path, target: &Path, label: &str) -> io::Result<()> {
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)

@@ -133,7 +133,9 @@ impl Masks {
                 options.as_ptr().cast(),
             )
         })?;
-        self.paths.push(target.to_owned());
+        if flags & libc::MS_REMOUNT == 0 {
+            self.paths.push(target.to_owned());
+        }
         Ok(())
     }
     pub(crate) fn cleanup(&mut self) -> io::Result<()> {

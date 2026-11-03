@@ -860,21 +860,7 @@ echo 'guest runtime paths and write/read checks: OK'
     Ok(report)
 }
 
-pub fn binder_ipc(
-    root: &Path,
-    major: u32,
-    minor: u32,
-    stage: &mut dyn FnMut(&str),
-) -> io::Result<()> {
-    let source = match crate::guest_mounts::guest_path(root, "run/ssal/ssal-binder-probe") {
-        Ok(source) => source,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            stage("unavailable");
-            println!("Binder IPC: unavailable; AOSP helper not packaged; device-only result, no IPC claim");
-            return Ok(());
-        }
-        Err(e) => return Err(e),
-    };
+pub(crate) fn verify_binder_helper(root: &Path, source: &Path) -> io::Result<serde_json::Value> {
     let manifest_path = crate::guest_mounts::guest_path(root, "run/ssal/ssal-binder-probe.json")?;
     let manifest: serde_json::Value = serde_json::from_slice(&fs::read(manifest_path)?)?;
     if manifest["header_revision"] != "android-16.0.0_r2" {
@@ -900,7 +886,7 @@ pub fn binder_ipc(
             .map(|byte| format!("{byte:02x}"))
             .collect())
     };
-    if manifest["helper_sha256"].as_str() != Some(digest(&source)?.as_str()) {
+    if manifest["helper_sha256"].as_str() != Some(digest(source)?.as_str()) {
         return Err(io::Error::other(
             "Binder helper binary/manifest hash mismatch",
         ));
@@ -912,6 +898,25 @@ pub fn binder_ipc(
         }
     }
     println!("Binder helper binary and guest platform library hashes: verified; header revision android-16.0.0_r2");
+    Ok(manifest)
+}
+
+pub fn binder_ipc(
+    root: &Path,
+    major: u32,
+    minor: u32,
+    stage: &mut dyn FnMut(&str),
+) -> io::Result<()> {
+    let source = match crate::guest_mounts::guest_path(root, "run/ssal/ssal-binder-probe") {
+        Ok(source) => source,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            stage("unavailable");
+            println!("Binder IPC: unavailable; AOSP helper not packaged; device-only result, no IPC claim");
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
+    verify_binder_helper(root, &source)?;
     let directory = crate::guest_mounts::directory(root, "data/local/tmp", 0o755)?;
     let name = format!(".ssal-binder-probe-{}", std::process::id());
     let target = directory.join(&name);

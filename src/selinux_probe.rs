@@ -1,4 +1,4 @@
-//! Query the loaded policy; never execute an Android service or modify policy.
+//! Loaded-policy diagnostics and opt-in disposable Binder probes; no policy edits.
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
@@ -19,6 +19,7 @@ const TARGET: &str = "u:r:servicemanager:s0";
 pub mod enforcing;
 pub mod preflight;
 pub mod runtime_preflight;
+pub mod servicemanager;
 
 fn context(path: &str) -> io::Result<String> {
     Ok(fs::read_to_string(path)?.trim_matches('\0').trim().into())

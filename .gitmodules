@@ -21,3 +21,6 @@
 	path = vendor/LineageOS_gsi
 	url = https://github.com/MisterZtr/LineageOS_gsi.git
 	branch = lineage-23.2
+[submodule "vendor/OneOS"]
+	path = vendor/OneOS
+	url = https://github.com/fahadalijaved/OneOS.git

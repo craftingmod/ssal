@@ -1,4 +1,4 @@
-//! Initial boot mount layout. No guest service is started by this module.
+//! Initial mount layout; service execution requires an explicit disposable probe mode.
 use serde::Deserialize;
 pub(crate) use ssal::namespace_mounts::guest_path;
 #[cfg(test)]
@@ -810,6 +810,9 @@ pub fn verify(
         if mode == "--enforcing-binder-worker" {
             crate::selinux_probe::enforcing::verify(&root)?;
         }
+        if mode == "--servicemanager-worker" {
+            crate::selinux_probe::servicemanager::verify(&root)?;
+        }
         same_directory(userdata, &root.join("data"))?;
         println!("mount profile: {}\nrootfs: {}\nmedia views: verified against guest /data/media\nshared /dev: Binder/properties/devices shared; sockets and block paths masked\nchroot/pivot_root dynamic shell and userdata write/read: verified\nAPEX activation, guest services, FUSE permissions, SELinux compatibility: NOT validated", profile.name, root.display());
         let info = fs::read_to_string("/proc/self/mountinfo")?;
@@ -838,10 +841,19 @@ pub fn verify(
         }
     });
     let cleanup = cleanup.and(residual);
+    if mode == "--servicemanager-worker" {
+        if let Err(error) = &cleanup {
+            crate::selinux_probe::servicemanager::mark_recovery(
+                &root.display().to_string(),
+                &error.to_string(),
+            );
+        }
+    }
     if mode == "--selinux-probe-worker"
         || mode == "--servicemanager-preflight-worker"
         || mode == "--servicemanager-runtime-preflight-worker"
         || mode == "--enforcing-binder-worker"
+        || mode == "--servicemanager-worker"
     {
         println!(
             "SELinux transition resource summary: {}",

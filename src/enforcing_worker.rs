@@ -42,6 +42,9 @@ fn read_fd(fd: i32) -> io::Result<String> {
 
 pub fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    if args.len() == 10 && args[1] == "test-b" {
+        return launch(&args);
+    }
     if args.len() == 9 && args[1] == "launch" {
         return launch(&args);
     }
@@ -182,6 +185,8 @@ pub fn main() -> io::Result<()> {
 }
 
 fn launch(args: &[String]) -> io::Result<()> {
+    let test_b = args[1] == "test-b";
+    let parent = unsafe { libc::getppid() };
     if unsafe { libc::geteuid() } != 0
         || fs::read_to_string("/proc/self/attr/current")?
             .trim_matches('\0')
@@ -201,12 +206,26 @@ fn launch(args: &[String]) -> io::Result<()> {
         "client",
         "libserver",
         "libclient",
+        "manager",
+        "registry-server",
+        "registry-check",
+        "registry-echo",
     ]
     .contains(&args[8].as_str())
     {
         return Err(io::Error::other("fixed engine"));
     }
-    let client = ["client", "libclient"].contains(&args[8].as_str());
+    if !test_b && (args[8].starts_with("registry-") || args[8] == "manager") {
+        return Err(io::Error::other("Test B requires dedicated launch mode"));
+    }
+    let client = [
+        "client",
+        "libclient",
+        "registry-server",
+        "registry-check",
+        "registry-echo",
+    ]
+    .contains(&args[8].as_str());
     let target = if client { CLIENT } else { MANAGER };
     let root = &args[2];
     let root_meta = fs::metadata(root)?;
@@ -297,7 +316,50 @@ fn launch(args: &[String]) -> io::Result<()> {
         }
     }
     for file in &observations {
-        check(unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, 0) })?;
+        if !test_b {
+            check(unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, 0) })?;
+        }
+    }
+    if test_b {
+        // Only this PID's read-only context is visible; no proc magic root/FD links.
+        let proc = format!("{root}/proc");
+        check(unsafe {
+            libc::mount(
+                c"tmpfs".as_ptr(),
+                cpath(&proc)?.as_ptr(),
+                c"tmpfs".as_ptr(),
+                libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+                c"mode=0555".as_ptr().cast(),
+            )
+        })?;
+        fs::create_dir_all(format!("{proc}/self/attr"))?;
+        fs::write(format!("{proc}/self/attr/current"), b"")?;
+        std::os::unix::fs::symlink("self", format!("{proc}/thread-self"))?;
+        std::os::unix::fs::symlink("self", format!("{proc}/{}", std::process::id()))?;
+        let target = format!("{root}/proc/self/attr/current");
+        check(unsafe {
+            libc::mount(
+                c"/proc/self/attr/current".as_ptr(),
+                cpath(&target)?.as_ptr(),
+                std::ptr::null(),
+                libc::MS_BIND,
+                std::ptr::null(),
+            )
+        })?;
+        check(unsafe {
+            libc::mount(
+                std::ptr::null(),
+                cpath(&target)?.as_ptr(),
+                std::ptr::null(),
+                libc::MS_BIND
+                    | libc::MS_REMOUNT
+                    | libc::MS_RDONLY
+                    | libc::MS_NOSUID
+                    | libc::MS_NODEV
+                    | libc::MS_NOEXEC,
+                std::ptr::null(),
+            )
+        })?;
     }
     check(unsafe { libc::chroot(cpath(root)?.as_ptr()) })?;
     check(unsafe { libc::chdir(c"/".as_ptr()) })?;
@@ -330,7 +392,27 @@ fn launch(args: &[String]) -> io::Result<()> {
     if args[7] == "before" {
         check(unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) })?;
     }
-    let mut command = if ["libbinder", "libserver", "libclient"].contains(&args[8].as_str()) {
+    if test_b {
+        check(unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) })?;
+        if unsafe { libc::getppid() } != parent {
+            return Err(io::Error::other("supervisor exited during launch"));
+        }
+        deny_connect()?;
+    }
+    let mut command = if test_b {
+        if args[8] == "manager" {
+            Command::new("/system/bin/servicemanager")
+        } else {
+            let mut cmd = Command::new("/data/local/tmp/ssal-binder-client");
+            cmd.arg(&args[8])
+                .arg("/dev/binder")
+                .arg(libc::major(nums[2]).to_string())
+                .arg(libc::minor(nums[2]).to_string())
+                .arg(&args[9])
+                .arg(nums[3].to_string());
+            cmd
+        }
+    } else if ["libbinder", "libserver", "libclient"].contains(&args[8].as_str()) {
         let mut cmd = Command::new(if client {
             "/data/local/tmp/ssal-binder-client"
         } else {
@@ -379,4 +461,115 @@ fn launch(args: &[String]) -> io::Result<()> {
         json!({"event":"execve","syscall":"execve","errno":error.raw_os_error(),"error":error.to_string(),"target":target,"entrypoint":if client{"u:object_r:shell_exec:s0"}else{"u:object_r:servicemanager_exec:s0"},"nnp_order":args[7]})
     );
     Err(error)
+}
+
+fn deny_connect() -> io::Result<()> {
+    #[cfg(target_arch = "aarch64")]
+    const AUDIT_ARCH: u32 = 0xc00000b7;
+    #[cfg(target_arch = "x86_64")]
+    const AUDIT_ARCH: u32 = 0xc000003e;
+    #[cfg(target_arch = "x86_64")]
+    const FORK: u32 = libc::SYS_fork as u32;
+    #[cfg(target_arch = "x86_64")]
+    const VFORK: u32 = libc::SYS_vfork as u32;
+    #[cfg(target_arch = "aarch64")]
+    const FORK: u32 = u32::MAX;
+    #[cfg(target_arch = "aarch64")]
+    const VFORK: u32 = u32::MAX - 1;
+    let stmt = |code, k| libc::sock_filter {
+        code,
+        jt: 0,
+        jf: 0,
+        k,
+    };
+    let mut filter = [
+        stmt(0x20, 4),
+        libc::sock_filter {
+            code: 0x15,
+            jt: 1,
+            jf: 0,
+            k: AUDIT_ARCH,
+        },
+        stmt(0x06, 0x80000000),
+        stmt(0x20, 0),
+        libc::sock_filter {
+            code: 0x15,
+            jt: 0,
+            jf: 1,
+            k: libc::SYS_connect as u32,
+        },
+        stmt(0x06, 0x00050000 | libc::EPERM as u32),
+        // clone3 falls back to clone, whose thread-only flags we can inspect.
+        libc::sock_filter {
+            code: 0x15,
+            jt: 0,
+            jf: 1,
+            k: libc::SYS_clone3 as u32,
+        },
+        stmt(0x06, 0x00050000 | libc::ENOSYS as u32),
+        libc::sock_filter {
+            code: 0x15,
+            jt: 0,
+            jf: 1,
+            k: FORK,
+        },
+        stmt(0x06, 0x00050000 | libc::EPERM as u32),
+        libc::sock_filter {
+            code: 0x15,
+            jt: 0,
+            jf: 1,
+            k: VFORK,
+        },
+        stmt(0x06, 0x00050000 | libc::EPERM as u32),
+        libc::sock_filter {
+            code: 0x15,
+            jt: 0,
+            jf: 3,
+            k: libc::SYS_clone as u32,
+        },
+        stmt(0x20, 16),
+        libc::sock_filter {
+            code: 0x45,
+            jt: 1,
+            jf: 0,
+            k: libc::CLONE_THREAD as u32,
+        },
+        stmt(0x06, 0x00050000 | libc::EPERM as u32),
+        stmt(0x06, 0x7fff0000),
+    ];
+    check(unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) })?;
+    let program = libc::sock_fprog {
+        len: filter.len() as u16,
+        filter: filter.as_mut_ptr(),
+    };
+    check(unsafe { libc::prctl(libc::PR_SET_SECCOMP, 2, &program) })?;
+    // No property payload or Host connection attempt: the kernel rejects connect first.
+    let error = std::os::unix::net::UnixStream::connect("/dev/socket/property_service").err();
+    if error.and_then(|e| e.raw_os_error()) != Some(libc::EPERM) {
+        return Err(io::Error::other("connect filter self-check failed"));
+    }
+    println!(
+        "{}",
+        json!({"event":"property_connect_blocked","errno":libc::EPERM,"filter":"all connect syscalls; inherited across exec","property_payload_sent":false})
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn connect_filter_survives_without_property_payload() {
+        // The filter is deliberately installed only in the disposable test child.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            let passed = super::deny_connect().is_ok()
+                && unsafe { libc::fork() } == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+            unsafe { libc::_exit(if passed { 0 } else { 1 }) };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert_eq!(status, 0);
+    }
 }

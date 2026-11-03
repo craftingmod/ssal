@@ -1,0 +1,629 @@
+{
+  "binder_identity": [
+    166,
+    8,
+    129797,
+    129793
+  ],
+  "boot_id": "f7900911-c061-4570-8f65-900571a55c11",
+  "checks": {
+    "android_service_selinux": "passed",
+    "cleanup": "passed",
+    "host_registry_isolation": "not_run",
+    "property_host_unchanged": "passed",
+    "servicemanager": "failed"
+  },
+  "cleanup_errors": [],
+  "cleanup_scope": "Test B processes, FDs and masks/Binder only; outer worker must confirm rootfs/loop release",
+  "execution_spec": {
+    "capabilities": {
+      "ambient": 0,
+      "bounding": 0,
+      "effective": 0,
+      "inheritable": 0,
+      "permitted": 0
+    },
+    "environment": {
+      "ANDROID_DATA": "/data",
+      "ANDROID_FILE_*": "forbidden",
+      "ANDROID_ROOT": "/system",
+      "ANDROID_SOCKET_*": "forbidden",
+      "PATH": "/system/bin",
+      "clear_inherited": true
+    },
+    "executable": "/system/bin/servicemanager",
+    "fd_allowlist": {
+      "0": "/dev/null read",
+      "1": "session log write",
+      "2": "session log write",
+      "kmsg_rc_override": "omit; guest logging backend required",
+      "other": "close; no host root, Binder, property, kmsg or socket FDs"
+    },
+    "gid": 1000,
+    "launch_enabled": false,
+    "namespaces": {
+      "cgroup": "guest-owned task profile destination required",
+      "ipc": "new if supported, record unshare errors",
+      "mount": "private recursively; chroot required",
+      "net": "new required",
+      "pid": "private proc required; empty proc mask tested as restrictive alternative only",
+      "user": "host UID mapping, no new user namespace",
+      "uts": "new required"
+    },
+    "rlimits": {
+      "core": {
+        "hard": 0,
+        "soft": 0
+      },
+      "nofile": {
+        "hard": 1024,
+        "soft": 1024
+      },
+      "other": "preserve worker_limits snapshot in this report; verify after applying overrides"
+    },
+    "selinux_domain": "u:r:servicemanager:s0",
+    "supplementary_groups": [
+      3009
+    ],
+    "task_profiles": [
+      "ProcessCapacityHigh"
+    ],
+    "uid": 1000,
+    "version": 2
+  },
+  "failure": "test_server exited before registered",
+  "global_enforcing": true,
+  "helper_manifest": {
+    "abi_scope": "Android 16 platform C++ ABI; runtime private IPC test still required",
+    "build_script_sha256": "6e7cc1f47dc722728af96e2883be36b2b12a402aec7b3ad784ed014adc6f7a95",
+    "guest_library_sha256": {
+      "libbinder.so": "628c61662f675103fb440a75c0dc4b49266873cb30bfd9bb4e42f739c29b6a61",
+      "libc++.so": "dd327fb7c8d4abcb0fbb5bb839a946d365102af120466b956637e3559f4353e8",
+      "libutils.so": "287ac8f2d4973d6fddc731cdc76e3bd28f9ba3280a533a27c59a0331a9876cce"
+    },
+    "header_revision": "android-16.0.0_r2",
+    "helper_sha256": "41bd0b5107beedcc05ea8d5baf777580c121d6295b801175df081697afe1db87",
+    "source_sha256": "2ac849471b8de323a9c60440adffed3a7475d38bf58b008a0750919746e0c285"
+  },
+  "host_framework_unchanged": true,
+  "host_mounts_unchanged": true,
+  "host_properties": {
+    "after_collected": true,
+    "before_collected": true,
+    "changed_names": []
+  },
+  "labels": {
+    "binder": {
+      "attempts": [
+        {
+          "method": "original_genfs_label",
+          "result": {
+            "status": "passed"
+          }
+        }
+      ],
+      "av": {
+        "class": "chr_file",
+        "decisions": [
+          {
+            "allowed": true,
+            "allowed_mask": 18089559,
+            "api": "selinuxfs/access (security_compute_av_flags_raw wire protocol)",
+            "class": "chr_file",
+            "class_index": 12,
+            "flags": 0,
+            "permission": "open",
+            "permissive_domain": false,
+            "raw_response": "1140657 ffffffff 0 ffffffff 1 0",
+            "requested_mask": 262144,
+            "sequence": 1,
+            "source": "u:r:servicemanager:s0",
+            "target": "u:object_r:binder_device:s0"
+          },
+          {
+            "allowed": true,
+            "allowed_mask": 18089559,
+            "api": "selinuxfs/access (security_compute_av_flags_raw wire protocol)",
+            "class": "chr_file",
+            "class_index": 12,
+            "flags": 0,
+            "permission": "read",
+            "permissive_domain": false,
+            "raw_response": "1140657 ffffffff 0 ffffffff 1 0",
+            "requested_mask": 2,
+            "sequence": 1,
+            "source": "u:r:servicemanager:s0",
+            "target": "u:object_r:binder_device:s0"
+          },
+          {
+            "allowed": true,
+            "allowed_mask": 18089559,
+            "api": "selinuxfs/access (security_compute_av_flags_raw wire protocol)",
+            "class": "chr_file",
+            "class_index": 12,
+            "flags": 0,
+            "permission": "write",
+            "permissive_domain": false,
+            "raw_response": "1140657 ffffffff 0 ffffffff 1 0",
+            "requested_mask": 4,
+            "sequence": 1,
+            "source": "u:r:servicemanager:s0",
+            "target": "u:object_r:binder_device:s0"
+          },
+          {
+            "allowed": true,
+            "allowed_mask": 18089559,
+            "api": "selinuxfs/access (security_compute_av_flags_raw wire protocol)",
+            "class": "chr_file",
+            "class_index": 12,
+            "flags": 0,
+            "permission": "getattr",
+            "permissive_domain": false,
+            "raw_response": "1140657 ffffffff 0 ffffffff 1 0",
+            "requested_mask": 16,
+            "sequence": 1,
+            "source": "u:r:servicemanager:s0",
+            "target": "u:object_r:binder_device:s0"
+          },
+          {
+            "allowed": true,
+            "allowed_mask": 18089559,
+            "api": "selinuxfs/access (security_compute_av_flags_raw wire protocol)",
+            "class": "chr_file",
+            "class_index": 12,
+            "flags": 0,
+            "permission": "ioctl",
+            "permissive_domain": false,
+            "raw_response": "1140657 ffffffff 0 ffffffff 1 0",
+            "requested_mask": 1,
+            "sequence": 1,
+            "source": "u:r:servicemanager:s0",
+            "target": "u:object_r:binder_device:s0"
+          },
+          {
+            "allowed": true,
+            "allowed_mask": 18089559,
+            "api": "selinuxfs/access (security_compute_av_flags_raw wire protocol)",
+            "class": "chr_file",
+            "class_index": 12,
+            "flags": 0,
+            "permission": "map",
+            "permissive_domain": false,
+            "raw_response": "1140657 ffffffff 0 ffffffff 1 0",
+            "requested_mask": 1024,
+            "sequence": 1,
+            "source": "u:r:servicemanager:s0",
+            "target": "u:object_r:binder_device:s0"
+          }
+        ],
+        "label": "u:object_r:binder_device:s0",
+        "status": "passed"
+      },
+      "identity": {
+        "guest": {
+          "char_device": true,
+          "dev": 166,
+          "directory": false,
+          "gid": 0,
+          "ino": 8,
+          "label": "u:object_r:binder_device:s0",
+          "major": 507,
+          "minor": 5,
+          "mode": "20600",
+          "path": "/data/local/tmp/ssal-test-b-20261103/verified-e/rootfs/dev/binderfs/binder",
+          "rdev": 129797,
+          "socket": false,
+          "uid": 0
+        },
+        "guest_error": null,
+        "guest_path": "/dev/binder",
+        "host": {
+          "char_device": true,
+          "dev": 33,
+          "directory": false,
+          "gid": 0,
+          "ino": 4,
+          "label": "u:object_r:binder_device:s0",
+          "major": 507,
+          "minor": 1,
+          "mode": "20666",
+          "path": "/dev/binder",
+          "rdev": 129793,
+          "socket": false,
+          "uid": 0
+        },
+        "host_error": null,
+        "same_host_object": false
+      },
+      "label": "u:object_r:binder_device:s0",
+      "original_label": "u:object_r:binder_device:s0"
+    },
+    "linkerconfig": {
+      "attempt": {
+        "status": "passed"
+      },
+      "av": {
+        "class": "file",
+        "decisions": [
+          {
+            "allowed": true,
+            "allowed_mask": 18089043,
+            "api": "selinuxfs/access (security_compute_av_flags_raw wire protocol)",
+            "class": "file",
+            "class_index": 6,
+            "flags": 0,
+            "permission": "open",
+            "permissive_domain": false,
+            "raw_response": "1140453 ffffffff 0 ffffffff 1 0",
+            "requested_mask": 262144,
+            "sequence": 1,
+            "source": "u:r:servicemanager:s0",
+            "target": "u:object_r:linkerconfig_file:s0"
+          },
+          {
+            "allowed": true,
+            "allowed_mask": 18089043,
+            "api": "selinuxfs/access (security_compute_av_flags_raw wire protocol)",
+            "class": "file",
+            "class_index": 6,
+            "flags": 0,
+            "permission": "read",
+            "permissive_domain": false,
+            "raw_response": "1140453 ffffffff 0 ffffffff 1 0",
+            "requested_mask": 2,
+            "sequence": 1,
+            "source": "u:r:servicemanager:s0",
+            "target": "u:object_r:linkerconfig_file:s0"
+          },
+          {
+            "allowed": true,
+            "allowed_mask": 18089043,
+            "api": "selinuxfs/access (security_compute_av_flags_raw wire protocol)",
+            "class": "file",
+            "class_index": 6,
+            "flags": 0,
+            "permission": "getattr",
+            "permissive_domain": false,
+            "raw_response": "1140453 ffffffff 0 ffffffff 1 0",
+            "requested_mask": 16,
+            "sequence": 1,
+            "source": "u:r:servicemanager:s0",
+            "target": "u:object_r:linkerconfig_file:s0"
+          },
+          {
+            "allowed": true,
+            "allowed_mask": 18089043,
+            "api": "selinuxfs/access (security_compute_av_flags_raw wire protocol)",
+            "class": "file",
+            "class_index": 6,
+            "flags": 0,
+            "permission": "map",
+            "permissive_domain": false,
+            "raw_response": "1140453 ffffffff 0 ffffffff 1 0",
+            "requested_mask": 1024,
+            "sequence": 1,
+            "source": "u:r:servicemanager:s0",
+            "target": "u:object_r:linkerconfig_file:s0"
+          }
+        ],
+        "label": "u:object_r:linkerconfig_file:s0",
+        "status": "passed"
+      },
+      "label": "u:object_r:linkerconfig_file:s0",
+      "original_label": "u:object_r:tmpfs:s0"
+    },
+    "scope": "temporary owned Guest resources and loaded-policy AV only; no target-domain exec or xperm proof",
+    "status": "passed"
+  },
+  "launch_enabled": false,
+  "manager_diagnostics": [],
+  "manager_identity": {
+    "binder_fds": [
+      "4"
+    ],
+    "context": "u:r:servicemanager:s0",
+    "executable": [
+      1050416,
+      593
+    ],
+    "mount_namespace": "mnt:[4026536755]",
+    "pid": 10191,
+    "root": [
+      117,
+      1
+    ],
+    "starttime": "19819555",
+    "status": "Name:\tservicemanager\nUmask:\t0022\nState:\tS (sleeping)\nTgid:\t10191\nNgid:\t0\nPid:\t10191\nPPid:\t9648\nTracerPid:\t0\nUid:\t1000\t1000\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\nFDSize:\t128\nGroups:\t3009 \nKthread:\t0\nVmPeak:\t10955524 kB\nVmSize:\t10955524 kB\nVmLck:\t       0 kB\nVmPin:\t       0 kB\nVmHWM:\t    5388 kB\nVmRSS:\t    5388 kB\nRssAnon:\t    1260 kB\nRssFile:\t    4128 kB\nRssShmem:\t       0 kB\nVmData:\t    7392 kB\nVmStk:\t     132 kB\nVmExe:\t      56 kB\nVmLib:\t    4988 kB\nVmPTE:\t     180 kB\nVmSwap:\t       0 kB\nCoreDumping:\t0\nTHP_enabled:\t1\nuntag_mask:\t0xffffffffffffff\nThreads:\t2\nSigQ:\t63/38969\nSigPnd:\t0000000000000000\nShdPnd:\t0000000000000000\nSigBlk:\t0000000080000000\nSigIgn:\t0000002000000000\nSigCgt:\t0000004c400084f8\nCapInh:\t0000000000000000\nCapPrm:\t0000000000000000\nCapEff:\t0000000000000000\nCapBnd:\t0000000000000000\nCapAmb:\t0000000000000000\nNoNewPrivs:\t1\nSeccomp:\t2\nSeccomp_filters:\t1\nSpeculation_Store_Bypass:\tthread vulnerable\nSpeculationIndirectBranch:\tunknown\nCpus_allowed:\tff\nCpus_allowed_list:\t0-7\nMems_allowed:\t1\nMems_allowed_list:\t0\nvoluntary_ctxt_switches:\t77\nnonvoluntary_ctxt_switches:\t7\n"
+  },
+  "permissive_diagnostic_passed": false,
+  "phase1_complete": false,
+  "policy_sha256": null,
+  "processes": [
+    {
+      "events": [
+        {
+          "errno": null,
+          "event": "namespace",
+          "name": "net",
+          "rc": 0
+        },
+        {
+          "errno": null,
+          "event": "namespace",
+          "name": "uts",
+          "rc": 0
+        },
+        {
+          "errno": 22,
+          "event": "namespace",
+          "name": "ipc",
+          "rc": -1
+        },
+        {
+          "errno": 1,
+          "event": "property_connect_blocked",
+          "filter": "all connect syscalls; inherited across exec",
+          "property_payload_sent": false
+        }
+      ],
+      "exit_status": "signal: 15 (SIGTERM)",
+      "pid": 10191,
+      "role": "servicemanager",
+      "starttime": "19819555"
+    },
+    {
+      "events": [
+        {
+          "errno": null,
+          "event": "namespace",
+          "name": "net",
+          "rc": 0
+        },
+        {
+          "errno": null,
+          "event": "namespace",
+          "name": "uts",
+          "rc": 0
+        },
+        {
+          "errno": 22,
+          "event": "namespace",
+          "name": "ipc",
+          "rc": -1
+        },
+        {
+          "errno": 1,
+          "event": "property_connect_blocked",
+          "filter": "all connect syscalls; inherited across exec",
+          "property_payload_sent": false
+        },
+        {
+          "event": "libbinder_runtime_library",
+          "path": "/system/lib64/libbinder.so"
+        },
+        {
+          "actual_fd_verified": true,
+          "default_private": true,
+          "dev": 166,
+          "event": "libbinder_driver",
+          "inode": 8,
+          "path": "/dev/binder",
+          "pid": 10197,
+          "rdev": 129797
+        },
+        {
+          "event": "registry_environment",
+          "mount_namespace": "",
+          "root_dev": 117,
+          "root_inode": 1
+        },
+        {
+          "enabled": true,
+          "enforcing": 1,
+          "event": "registry_policy_status"
+        },
+        {
+          "effective_allowed": true,
+          "event": "registry_permission",
+          "name": "manager",
+          "permission": "find",
+          "sid": "u:r:shell:s0",
+          "target": "u:object_r:service_manager_service:s0",
+          "uid": 1000
+        },
+        {
+          "event": "registry",
+          "name": "manager",
+          "result": "present"
+        }
+      ],
+      "exit_status": "exit status: 0",
+      "pid": 10197,
+      "role": "present",
+      "starttime": "19819560"
+    },
+    {
+      "events": [
+        {
+          "errno": null,
+          "event": "namespace",
+          "name": "net",
+          "rc": 0
+        },
+        {
+          "errno": null,
+          "event": "namespace",
+          "name": "uts",
+          "rc": 0
+        },
+        {
+          "errno": 22,
+          "event": "namespace",
+          "name": "ipc",
+          "rc": -1
+        },
+        {
+          "errno": 1,
+          "event": "property_connect_blocked",
+          "filter": "all connect syscalls; inherited across exec",
+          "property_payload_sent": false
+        },
+        {
+          "event": "libbinder_runtime_library",
+          "path": "/system/lib64/libbinder.so"
+        },
+        {
+          "actual_fd_verified": true,
+          "default_private": true,
+          "dev": 166,
+          "event": "libbinder_driver",
+          "inode": 8,
+          "path": "/dev/binder",
+          "pid": 10200,
+          "rdev": 129797
+        },
+        {
+          "event": "registry_environment",
+          "mount_namespace": "",
+          "root_dev": 117,
+          "root_inode": 1
+        },
+        {
+          "enabled": true,
+          "enforcing": 1,
+          "event": "registry_policy_status"
+        },
+        {
+          "effective_allowed": false,
+          "event": "registry_permission",
+          "name": "ssal.probe.f7900911-c061-4570-8f65-900571a55c11.9648",
+          "permission": "add",
+          "sid": "u:r:shell:s0",
+          "target": "u:object_r:default_android_service:s0",
+          "uid": 1000
+        },
+        {
+          "event": "registry",
+          "result": "add_denied"
+        }
+      ],
+      "exit_status": "exit status: 7",
+      "pid": 10200,
+      "role": "test_server",
+      "starttime": "19819566"
+    }
+  ],
+  "rc": {
+    "directives": {
+      "file": [
+        "/dev/kmsg w"
+      ],
+      "group": [
+        "system readproc"
+      ],
+      "task_profiles": [
+        "ProcessCapacityHigh"
+      ],
+      "user": [
+        "system"
+      ]
+    },
+    "expected": {
+      "explicit_capabilities_in_reference_rc": false,
+      "file_fd": "/dev/kmsg write via init file directive",
+      "gid": 1000,
+      "reference": "android-16.0.0_r2",
+      "supplementary_groups": [
+        3009
+      ],
+      "task_profile": "ProcessCapacityHigh",
+      "uid": 1000
+    },
+    "init_onrestart_actions": "not inherited or executed by SSAL; no host restart actions allowed",
+    "matches_android16_credentials": true,
+    "service": "service servicemanager /system/bin/servicemanager"
+  },
+  "schema": 1,
+  "selinux_boundary": {
+    "global_after": "1",
+    "target_after": {
+      "allowed": true,
+      "allowed_mask": 2195325,
+      "api": "selinuxfs/access (security_compute_av_flags_raw wire protocol)",
+      "class": "process",
+      "class_index": 2,
+      "flags": 0,
+      "permission": "getattr",
+      "permissive_domain": false,
+      "raw_response": "217f7d ffffffff 0 ffffffff 1 0",
+      "requested_mask": 65536,
+      "sequence": 1,
+      "source": "u:r:servicemanager:s0",
+      "target": "u:r:servicemanager:s0"
+    },
+    "target_before": {
+      "allowed": true,
+      "allowed_mask": 2195325,
+      "api": "selinuxfs/access (security_compute_av_flags_raw wire protocol)",
+      "class": "process",
+      "class_index": 2,
+      "flags": 0,
+      "permission": "getattr",
+      "permissive_domain": false,
+      "raw_response": "217f7d ffffffff 0 ffffffff 1 0",
+      "requested_mask": 65536,
+      "sequence": 1,
+      "source": "u:r:servicemanager:s0",
+      "target": "u:r:servicemanager:s0"
+    },
+    "unchanged": true
+  },
+  "servicemanager_sha256": "7881833ce0cc3bdab33bf31178179d845e6285fb56447a2f5e2fe4e4def647db",
+  "session": "ssal.probe.f7900911-c061-4570-8f65-900571a55c11.9648",
+  "target_domain_av": {
+    "allowed": true,
+    "allowed_mask": 2195325,
+    "api": "selinuxfs/access (security_compute_av_flags_raw wire protocol)",
+    "class": "process",
+    "class_index": 2,
+    "flags": 0,
+    "permission": "getattr",
+    "permissive_domain": false,
+    "raw_response": "217f7d ffffffff 0 ffffffff 1 0",
+    "requested_mask": 65536,
+    "sequence": 1,
+    "source": "u:r:servicemanager:s0",
+    "target": "u:r:servicemanager:s0"
+  },
+  "test_b_overrides": {
+    "connect": "seccomp EPERM; no property payload; no process forks, threads only",
+    "data": "disposable empty tmpfs; profile data isolation is Phase 2",
+    "logging": "session regular file at /dev/kmsg; Host device absent",
+    "proc": "per-child current SID only; no Host root/FD magic links",
+    "property_area": "empty; not Guest property initialization",
+    "task_profiles": "not applied; no Host cgroup destinations exposed"
+  },
+  "test_b_passed": false,
+  "validation_scope": "private_binder_test_b",
+  "outer_resource_cleanup": [
+    {
+      "cleanup": "passed",
+      "error": null,
+      "scope": "guest_rootfs_mounts"
+    },
+    {
+      "cleanup": "passed",
+      "scope": "system_userdata_mounts_and_loops"
+    }
+  ],
+  "device_model": "SM-S937N",
+  "image_id": "1793366406758-25627",
+  "system_image_sha256": "7b9ba62e8b48b6e40432be949ae0858a8971175c79502550e74691222d3889ff",
+  "scratch_cleanup": {
+    "status": "passed",
+    "path": "/data/local/tmp/ssal-test-b-20261103",
+    "evidence": "CLEANUP_PASSED /data/local/tmp/ssal-test-b-20261103",
+    "selinux_restored": "Enforcing",
+    "recovery_marker_absent": true
+  }
+}

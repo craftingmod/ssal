@@ -1,8 +1,9 @@
-// AOSP platform libbinder helper; no service registry or HAL access.
+// AOSP platform libbinder helper; Test B registry access is explicit and scoped.
 #include <binder/Binder.h>
 #include <binder/IPCThreadState.h>
 #include <binder/Parcel.h>
 #include <binder/ProcessState.h>
+#include <binder/Status.h>
 #include <poll.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
@@ -14,6 +15,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cerrno>
+#include <cctype>
 #include <cstdint>
 #include <dirent.h>
 #include <sys/prctl.h>
@@ -78,6 +80,113 @@ class Echo final : public BBinder {
     }
 };
 
+static int registry(int argc, char** argv) {
+    auto unavailable = [](const char* stage) {
+        printf("{\"event\":\"registry\",\"result\":\"unavailable\",\"stage\":\"%s\",\"errno\":%d}\n", stage, errno);
+        return 5;
+    };
+    if (argc != 7) return 2;
+    Dl_info library {};
+    if (!dladdr(reinterpret_cast<void*>(&ProcessState::self), &library) || !library.dli_fname || strcmp(library.dli_fname,"/system/lib64/libbinder.so")) return unavailable("runtime_libbinder");
+    printf("{\"event\":\"libbinder_runtime_library\",\"path\":\"%s\"}\n",library.dli_fname);
+    const bool server = !strcmp(argv[1], "registry-server");
+    const bool echo = !strcmp(argv[1], "registry-echo");
+    if (!server && !echo && strcmp(argv[1], "registry-check")) return 2;
+    char* end = nullptr;
+    unsigned long majorNumber = strtoul(argv[3], &end, 10);
+    if (!end || *end || majorNumber > UINT32_MAX) return 2;
+    unsigned long minorNumber = strtoul(argv[4], &end, 10);
+    if (!end || *end || minorNumber > UINT32_MAX) return 2;
+    unsigned long long hostRdev = strtoull(argv[6], &end, 10);
+    if (!end || *end) return 2;
+    // Registration is forbidden on the Host driver, including accidental aliases.
+    struct stat node {};
+    if (stat(argv[2], &node) || (server && node.st_rdev == hostRdev)) return 3;
+    const char* name = argv[5];
+    if (server && strncmp(name, "ssal.probe.", 11)) return 2;
+    for (const char* p = name; *p; ++p) if (!isalnum(static_cast<unsigned char>(*p)) && *p != '.' && *p != '_' && *p != '-') return 2;
+    auto process = driver(argv[2], majorNumber, minorNumber);
+    if (!process) return 4;
+    struct stat root {};
+    char namespaceName[128] = {};
+    ssize_t namespaceSize = readlink("/proc/self/ns/mnt", namespaceName, sizeof(namespaceName)-1);
+    if (namespaceSize > 0) namespaceName[namespaceSize] = '\0';
+    if (stat("/", &root)) return 5;
+    printf("{\"event\":\"registry_environment\",\"root_dev\":%llu,\"root_inode\":%llu,\"mount_namespace\":\"%s\"}\n", static_cast<unsigned long long>(root.st_dev), static_cast<unsigned long long>(root.st_ino), namespaceName);
+    void* selinux = dlopen("libselinux.so", RTLD_NOW | RTLD_LOCAL);
+    if (!selinux) return unavailable("dlopen_libselinux");
+    using Handle = void*;
+    auto handle = reinterpret_cast<Handle(*)()>(dlsym(selinux, "selinux_android_service_context_handle"));
+    auto lookup = reinterpret_cast<int(*)(Handle,char**,const char*,int)>(dlsym(selinux, "selabel_lookup"));
+    auto getcon = reinterpret_cast<int(*)(char**)>(dlsym(selinux, "getcon"));
+    auto release = reinterpret_cast<void(*)(char*)>(dlsym(selinux, "freecon"));
+    auto access = reinterpret_cast<int(*)(const char*,const char*,const char*,const char*,void*)>(dlsym(selinux, "selinux_check_access"));
+    auto enabled = reinterpret_cast<int(*)()>(dlsym(selinux, "is_selinux_enabled"));
+    auto statusOpen = reinterpret_cast<int(*)(int)>(dlsym(selinux, "selinux_status_open"));
+    auto enforcement = reinterpret_cast<int(*)()>(dlsym(selinux, "security_getenforce"));
+    if (!handle || !lookup || !getcon || !release || !access || !enabled || !statusOpen || !enforcement) return unavailable("libselinux_symbols");
+    if (enabled() != 1 || statusOpen(1) < 0) return unavailable("effective_selinux_status");
+    printf("{\"event\":\"registry_policy_status\",\"enabled\":true,\"enforcing\":%d}\n", enforcement());
+    Handle labels = handle();
+    char *source = nullptr, *target = nullptr;
+    if (!labels) return unavailable("service_context_handle");
+    if (getcon(&source)) return unavailable("getcon");
+    if (lookup(labels, &target, name, 0)) {
+        puts("{\"event\":\"registry\",\"result\":\"name_mapping_absent\"}");
+        release(source); return 6;
+    }
+    bool allowed = access(source, target, "service_manager", server ? "add" : "find", nullptr) == 0;
+    printf("{\"event\":\"registry_permission\",\"name\":\"%s\",\"uid\":%d,\"sid\":\"%s\",\"target\":\"%s\",\"permission\":\"%s\",\"effective_allowed\":%s}\n", name, getuid(), source, target, server ? "add" : "find", allowed ? "true" : "false");
+    release(source); release(target);
+    if (!allowed) {
+        printf("{\"event\":\"registry\",\"result\":\"%s_denied\"}\n", server ? "add" : "find");
+        return 7;
+    }
+    auto manager = process->getContextObject(nullptr);
+    if (!manager || manager->pingBinder() != OK) return 8;
+    Parcel request, reply;
+    status_t result = request.writeInterfaceToken(String16("android.os.IServiceManager"));
+    if (result == OK) result = request.writeString16(String16(name));
+    sp<Echo> local;
+    if (server) {
+        local = sp<Echo>::make();
+        if (result == OK) result = request.writeStrongBinder(local);
+        if (result == OK) result = request.writeBool(false);
+        if (result == OK) result = request.writeInt32(8);
+    }
+    // android-16.0.0_r2 IServiceManager.aidl: legacy checkService=2, addService=4.
+    if (result == OK) result = manager->transact(IBinder::FIRST_CALL_TRANSACTION + (server ? 4 : 2), request, &reply);
+    binder::Status status;
+    if (result == OK) result = status.readFromParcel(reply);
+    if (result != OK || !status.isOk()) {
+        printf("{\"event\":\"registry\",\"result\":\"transaction_failed\",\"status_t\":%d,\"exception\":%d}\n", result, status.exceptionCode());
+        return 8;
+    }
+    if (server) {
+        printf("{\"event\":\"registry\",\"result\":\"registered\",\"pid\":%d}\n", getpid());
+        IPCThreadState::self()->joinThreadPool();
+        return 9;
+    }
+    sp<IBinder> remote;
+    // A successful nullable read is distinct from malformed/failed transport.
+    result = reply.readNullableStrongBinder(&remote);
+    if (result != OK || reply.dataAvail() != 0) return 8;
+    if (!echo) {
+        printf("{\"event\":\"registry\",\"result\":\"%s\",\"name\":\"%s\"}\n", remote ? "present" : "not_registered", name);
+        return 0;
+    }
+    if (!remote) return 8;
+    Parcel challenge, response;
+    int32_t nonce = 0, pid = 0;
+    result = challenge.writeInt32(kNonce);
+    if (result == OK) result = remote->transact(kEcho, challenge, &response);
+    if (result == OK) result = response.readInt32(&nonce);
+    if (result == OK) result = response.readInt32(&pid);
+    if (result != OK || nonce != kNonce || pid <= 0) return 8;
+    printf("{\"event\":\"registry\",\"result\":\"echo\",\"server_pid\":%d,\"nonce\":%d}\n", pid, nonce);
+    return 0;
+}
+
 static void stop(pid_t child) {
     kill(child, SIGTERM);
     for (int i = 0; i < 50; ++i) { if (waitpid(child, nullptr, WNOHANG) == child) return; usleep(10000); }
@@ -125,6 +234,7 @@ static bool enforcedIdentity(char** argv, const char* target) {
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     setvbuf(stderr, nullptr, _IONBF, 0);
+    if (argc > 1 && !strncmp(argv[1], "registry-", 9)) return registry(argc, argv);
     bool serverOnly = argc == 10 && !strcmp(argv[1], "enforcing-server");
     bool clientOnly = argc == 10 && !strcmp(argv[1], "enforcing-client");
     bool enforcing = argc == 10 && (!strcmp(argv[1], "enforcing-selftest") || serverOnly || clientOnly);

@@ -487,6 +487,7 @@ pub(crate) fn mount_image(source: &Path, target: &Path, readonly: bool) -> io::R
 }
 
 pub fn worker(system: &Path, userdata: &Path, base: &Path, mode: &str) -> io::Result<()> {
+    crate::selinux_probe::servicemanager::check_recovery()?;
     if unsafe { libc::unshare(libc::CLONE_NEWNS) } != 0 {
         return Err(io::Error::last_os_error());
     }
@@ -627,10 +628,17 @@ pub fn worker(system: &Path, userdata: &Path, base: &Path, mode: &str) -> io::Re
         cleanup.push(e.to_string());
     }
     if !cleanup.is_empty() {
+        if mode == "--servicemanager-worker" {
+            crate::selinux_probe::servicemanager::mark_recovery(
+                &base.display().to_string(),
+                &cleanup.join("; "),
+            );
+        }
         if mode == "--selinux-probe-worker"
             || mode == "--servicemanager-preflight-worker"
             || mode == "--servicemanager-runtime-preflight-worker"
             || mode == "--enforcing-binder-worker"
+            || mode == "--servicemanager-worker"
         {
             println!(
                 "SELinux transition resource summary: {}",
@@ -647,6 +655,7 @@ pub fn worker(system: &Path, userdata: &Path, base: &Path, mode: &str) -> io::Re
         || mode == "--servicemanager-preflight-worker"
         || mode == "--servicemanager-runtime-preflight-worker"
         || mode == "--enforcing-binder-worker"
+        || mode == "--servicemanager-worker"
     {
         println!(
             "SELinux transition resource summary: {}",
