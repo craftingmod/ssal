@@ -1,0 +1,192 @@
+host_mount_namespace=mnt:[4026532950] guest_mount_namespace=mnt:[4026536386]
+mount namespace: mnt:[4026536386]
+userdata backing: /data/local/ssal/guests/phase5a-bringup-20261104/userdata
+userdata bind and write/read probe: OK
+userdata mountinfo: 36114 35917 254:81 /local/ssal/guests/phase5a-bringup-20261104/userdata /dev/ssal-common-launcher/run-1793797036/worker/data rw,nosuid,nodev,noatime - f2fs /dev/block/dm-81 rw,lazytime,seclabel,background_gc=on,nogc_merge,discard,discard_unit=block,user_xattr,inline_xattr,acl,inline_data,inline_dentry,flush_merge,barrier,extent_cache,mode=adaptive,active_logs=6,reserve_root=32768,reserve_node=0,resuid=0,resgid=5678,usrquota,grpquota,inlinecrypt,alloc_mode=default,checkpoint_merge,fsync_mode=nobarrier,compress_algorithm=lz4,compress_log_size=5,compress_mode=user,memory=normal,errors=continue,lookup_mode=perf
+system mounted on /dev/ssal-common-launcher/run-1793797036/worker/system via /dev/block/loop38
+image Android release: 16
+mount namespace: mnt:[4026536386]
+system backing: /data/local/ssal/images/1793366406758-25627/system.img
+userdata backing: /data/local/ssal/guests/phase5a-bringup-20261104/userdata
+mountinfo:
+36114 35917 254:81 /local/ssal/guests/phase5a-bringup-20261104/userdata /dev/ssal-common-launcher/run-1793797036/worker/data rw,nosuid,nodev,noatime - f2fs /dev/block/dm-81 rw,lazytime,seclabel,background_gc=on,nogc_merge,discard,discard_unit=block,user_xattr,inline_xattr,acl,inline_data,inline_dentry,flush_merge,barrier,extent_cache,mode=adaptive,active_logs=6,reserve_root=32768,reserve_node=0,resuid=0,resgid=5678,usrquota,grpquota,inlinecrypt,alloc_mode=default,checkpoint_merge,fsync_mode=nobarrier,compress_algorithm=lz4,compress_log_size=5,compress_mode=user,memory=normal,errors=continue,lookup_mode=perf
+36115 35917 7:304 / /dev/ssal-common-launcher/run-1793797036/worker/system ro,nosuid,nodev,relatime - ext4 /dev/block/loop38 ro,seclabel,norecovery
+Guest device /dev/null: rdev=1:3 uid=0 gid=0 mode=666 label=u:object_r:null_device:s0 host_mount=35917 guest_mount=36127
+Guest device /dev/zero: rdev=1:5 uid=0 gid=0 mode=666 label=u:object_r:zero_device:s0 host_mount=35917 guest_mount=36128
+Guest device /dev/random: rdev=1:8 uid=0 gid=0 mode=666 label=u:object_r:random_device:s0 host_mount=35917 guest_mount=36129
+Guest device /dev/urandom: rdev=1:9 uid=0 gid=0 mode=666 label=u:object_r:random_device:s0 host_mount=35917 guest_mount=36130
+Guest /dev allowlist verified: null, zero, random, urandom; Host Binder/property/Binder-control/HAL nodes absent
+Guest cgroup bind: /sys/fs/cgroup/apps/ssal_guest -> /dev/ssal-common-launcher/run-1793797036/worker/rootfs/sys/fs/cgroup
+Guest cgroup bind: /dev/cpuctl/ssal_guest -> /dev/ssal-common-launcher/run-1793797036/worker/rootfs/dev/cpuctl
+Guest cgroup bind: /dev/cpuset/ssal_guest -> /dev/ssal-common-launcher/run-1793797036/worker/rootfs/dev/cpuset
+Guest cgroup bind: /dev/blkio/ssal_guest -> /dev/ssal-common-launcher/run-1793797036/worker/rootfs/dev/blkio
+guest stage: APEX preparation
+preparing APEX 1/54: /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.adbd.capex
+APEX com.android.adbd: allocating loop for /dev/ssal-common-launcher/run-1793797036/worker/apex-cache/0.img
+guest APEX: com.android.adbd <- /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.adbd.capex (ro)
+preparing APEX 2/54: /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.adservices.capex
+APEX com.android.adservices: allocating loop for /dev/ssal-common-launcher/run-1793797036/worker/apex-cache/1.img
+guest APEX: com.android.adservices <- /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.adservices.capex (ro)
+preparing APEX 3/54: /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.apex.cts.shim.apex
+APEX com.android.apex.cts.shim: allocating loop for /dev/ssal-common-launcher/run-1793797036/worker/apex-cache/2.img
+guest APEX: com.android.apex.cts.shim <- /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.apex.cts.shim.apex (ro)
+preparing APEX 4/54: /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.appsearch.capex
+APEX com.android.appsearch: allocating loop for /dev/ssal-common-launcher/run-1793797036/worker/apex-cache/3.img
+guest APEX: com.android.appsearch <- /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.appsearch.capex (ro)
+preparing APEX 5/54: /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.art.capex
+APEX com.android.art: allocating loop for /dev/ssal-common-launcher/run-1793797036/worker/apex-cache/4.img
+guest APEX: com.android.art <- /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.art.capex (ro)
+preparing APEX 6/54: /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.bt.capex
+APEX com.android.bt: allocating loop for /dev/ssal-common-launcher/run-1793797036/worker/apex-cache/5.img
+guest APEX: com.android.bt <- /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.bt.capex (ro)
+preparing APEX 7/54: /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.cellbroadcast.capex
+APEX com.android.cellbroadcast: allocating loop for /dev/ssal-common-launcher/run-1793797036/worker/apex-cache/6.img
+guest APEX: com.android.cellbroadcast <- /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.cellbroadcast.capex (ro)
+preparing APEX 8/54: /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.configinfrastructure.capex
+APEX com.android.configinfrastructure: allocating loop for /dev/ssal-common-launcher/run-1793797036/worker/apex-cache/7.img
+guest APEX: com.android.configinfrastructure <- /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.configinfrastructure.capex (ro)
+preparing APEX 9/54: /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.conscrypt.capex
+APEX com.android.conscrypt: allocating loop for /dev/ssal-common-launcher/run-1793797036/worker/apex-cache/8.img
+guest APEX: com.android.conscrypt <- /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.conscrypt.capex (ro)
+preparing APEX 10/54: /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.crashrecovery.capex
+APEX com.android.crashrecovery: allocating loop for /dev/ssal-common-launcher/run-1793797036/worker/apex-cache/9.img
+guest APEX: com.android.crashrecovery <- /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.crashrecovery.capex (ro)
+preparing APEX 11/54: /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.devicelock.apex
+APEX com.android.devicelock: allocating loop for /dev/ssal-common-launcher/run-1793797036/worker/apex-cache/10.img
+guest APEX: com.android.devicelock <- /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.devicelock.apex (ro)
+preparing APEX 12/54: /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.extservices.capex
+APEX com.android.extservices: allocating loop for /dev/ssal-common-launcher/run-1793797036/worker/apex-cache/11.img
+guest APEX: com.android.extservices <- /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.extservices.capex (ro)
+preparing APEX 13/54: /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.healthfitness.apex
+APEX com.android.healthfitness: allocating loop for /dev/ssal-common-launcher/run-1793797036/worker/apex-cache/12.img
+guest APEX: com.android.healthfitness <- /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.healthfitness.apex (ro)
+preparing APEX 14/54: /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.i18n.apex
+APEX com.android.i18n: allocating loop for /dev/ssal-common-launcher/run-1793797036/worker/apex-cache/13.img
+guest APEX: com.android.i18n <- /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.i18n.apex (ro)
+preparing APEX 15/54: /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.ipsec.capex
+APEX com.android.ipsec: allocating loop for /dev/ssal-common-launcher/run-1793797036/worker/apex-cache/14.img
+guest APEX: com.android.ipsec <- /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.ipsec.capex (ro)
+preparing APEX 16/54: /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.media.capex
+APEX com.android.media: allocating loop for /dev/ssal-common-launcher/run-1793797036/worker/apex-cache/15.img
+guest APEX: com.android.media <- /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.media.capex (ro)
+preparing APEX 17/54: /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.media.swcodec.capex
+APEX com.android.media.swcodec: allocating loop for /dev/ssal-common-launcher/run-1793797036/worker/apex-cache/16.img
+guest APEX: com.android.media.swcodec <- /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.media.swcodec.capex (ro)
+preparing APEX 18/54: /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.mediaprovider.capex
+APEX com.android.mediaprovider: allocating loop for /dev/ssal-common-launcher/run-1793797036/worker/apex-cache/17.img
+guest APEX: com.android.mediaprovider <- /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.mediaprovider.capex (ro)
+preparing APEX 19/54: /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.neuralnetworks.capex
+APEX com.android.neuralnetworks: allocating loop for /dev/ssal-common-launcher/run-1793797036/worker/apex-cache/18.img
+guest APEX: com.android.neuralnetworks <- /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.neuralnetworks.capex (ro)
+preparing APEX 20/54: /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.nfcservices.capex
+APEX com.android.nfcservices: allocating loop for /dev/ssal-common-launcher/run-1793797036/worker/apex-cache/19.img
+guest APEX: com.android.nfcservices <- /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.nfcservices.capex (ro)
+preparing APEX 21/54: /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.ondevicepersonalization.capex
+APEX com.android.ondevicepersonalization: allocating loop for /dev/ssal-common-launcher/run-1793797036/worker/apex-cache/20.img
+guest APEX: com.android.ondevicepersonalization <- /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.ondevicepersonalization.capex (ro)
+preparing APEX 22/54: /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.os.statsd.apex
+APEX com.android.os.statsd: allocating loop for /dev/ssal-common-launcher/run-1793797036/worker/apex-cache/21.img
+guest APEX: com.android.os.statsd <- /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.os.statsd.apex (ro)
+preparing APEX 23/54: /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.permission.capex
+APEX com.android.permission: allocating loop for /dev/ssal-common-launcher/run-1793797036/worker/apex-cache/22.img
+guest APEX: com.android.permission <- /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.permission.capex (ro)
+preparing APEX 24/54: /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.profiling.capex
+APEX com.android.profiling: allocating loop for /dev/ssal-common-launcher/run-1793797036/worker/apex-cache/23.img
+guest APEX: com.android.profiling <- /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.profiling.capex (ro)
+preparing APEX 25/54: /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.resolv.capex
+APEX com.android.resolv: allocating loop for /dev/ssal-common-launcher/run-1793797036/worker/apex-cache/24.img
+guest APEX: com.android.resolv <- /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.resolv.capex (ro)
+preparing APEX 26/54: /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.rkpd.apex
+APEX com.android.rkpd: allocating loop for /dev/ssal-common-launcher/run-1793797036/worker/apex-cache/25.img
+guest APEX: com.android.rkpd <- /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.rkpd.apex (ro)
+preparing APEX 27/54: /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.runtime.apex
+APEX com.android.runtime: allocating loop for /dev/ssal-common-launcher/run-1793797036/worker/apex-cache/26.img
+guest APEX: com.android.runtime <- /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.runtime.apex (ro)
+preparing APEX 28/54: /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.scheduling.capex
+APEX com.android.scheduling: allocating loop for /dev/ssal-common-launcher/run-1793797036/worker/apex-cache/27.img
+guest APEX: com.android.scheduling <- /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.scheduling.capex (ro)
+preparing APEX 29/54: /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.sdkext.apex
+APEX com.android.sdkext: allocating loop for /dev/ssal-common-launcher/run-1793797036/worker/apex-cache/28.img
+guest APEX: com.android.sdkext <- /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.sdkext.apex (ro)
+preparing APEX 30/54: /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.telephonycore.capex
+APEX com.android.telephonycore: allocating loop for /dev/ssal-common-launcher/run-1793797036/worker/apex-cache/29.img
+guest APEX: com.android.telephonycore <- /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.telephonycore.capex (ro)
+preparing APEX 31/54: /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.tethering.capex
+APEX com.android.tethering: allocating loop for /dev/ssal-common-launcher/run-1793797036/worker/apex-cache/30.img
+guest APEX: com.android.tethering <- /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.tethering.capex (ro)
+preparing APEX 32/54: /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.tzdata.apex
+APEX com.android.tzdata: allocating loop for /dev/ssal-common-launcher/run-1793797036/worker/apex-cache/31.img
+guest APEX: com.android.tzdata <- /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.tzdata.apex (ro)
+preparing APEX 33/54: /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.uprobestats.capex
+APEX com.android.uprobestats: allocating loop for /dev/ssal-common-launcher/run-1793797036/worker/apex-cache/32.img
+guest APEX: com.android.uprobestats <- /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.uprobestats.capex (ro)
+preparing APEX 34/54: /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.uwb.capex
+APEX com.android.uwb: allocating loop for /dev/ssal-common-launcher/run-1793797036/worker/apex-cache/33.img
+guest APEX: com.android.uwb <- /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.uwb.capex (ro)
+preparing APEX 35/54: /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.virt.apex
+APEX com.android.virt: allocating loop for /dev/ssal-common-launcher/run-1793797036/worker/apex-cache/34.img
+guest APEX: com.android.virt <- /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.virt.apex (ro)
+preparing APEX 36/54: /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.wifi.capex
+APEX com.android.wifi: allocating loop for /dev/ssal-common-launcher/run-1793797036/worker/apex-cache/35.img
+guest APEX: com.android.wifi <- /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/apex/com.android.wifi.capex (ro)
+preparing APEX 37/54: /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/system_ext/apex/com.android.compos.apex
+APEX com.android.compos: allocating loop for /dev/ssal-common-launcher/run-1793797036/worker/apex-cache/36.img
+guest APEX: com.android.compos <- /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/system_ext/apex/com.android.compos.apex (ro)
+preparing APEX 38/54: /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/system_ext/apex/com.android.vndk.v28.apex
+APEX com.android.vndk.v28: allocating loop for /dev/ssal-common-launcher/run-1793797036/worker/apex-cache/37.img
+guest APEX: com.android.vndk.v28 <- /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/system_ext/apex/com.android.vndk.v28.apex (ro)
+preparing APEX 39/54: /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/system_ext/apex/com.android.vndk.v29.apex
+APEX com.android.vndk.v29: allocating loop for /dev/ssal-common-launcher/run-1793797036/worker/apex-cache/38.img
+guest APEX: com.android.vndk.v29 <- /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/system_ext/apex/com.android.vndk.v29.apex (ro)
+preparing APEX 40/54: /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/system_ext/apex/com.android.vndk.v30.apex
+APEX com.android.vndk.v30: allocating loop for /dev/ssal-common-launcher/run-1793797036/worker/apex-cache/39.img
+guest APEX: com.android.vndk.v30 <- /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/system_ext/apex/com.android.vndk.v30.apex (ro)
+preparing APEX 41/54: /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/system_ext/apex/com.android.vndk.v31.apex
+APEX com.android.vndk.v31: allocating loop for /dev/ssal-common-launcher/run-1793797036/worker/apex-cache/40.img
+guest APEX: com.android.vndk.v31 <- /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/system_ext/apex/com.android.vndk.v31.apex (ro)
+preparing APEX 42/54: /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/system_ext/apex/com.android.vndk.v32.apex
+APEX com.android.vndk.v32: allocating loop for /dev/ssal-common-launcher/run-1793797036/worker/apex-cache/41.img
+guest APEX: com.android.vndk.v32 <- /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/system_ext/apex/com.android.vndk.v32.apex (ro)
+preparing APEX 43/54: /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/system_ext/apex/com.android.vndk.v33.apex
+APEX com.android.vndk.v33: allocating loop for /dev/ssal-common-launcher/run-1793797036/worker/apex-cache/42.img
+guest APEX: com.android.vndk.v33 <- /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/system_ext/apex/com.android.vndk.v33.apex (ro)
+preparing APEX 44/54: /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/system_ext/apex/com.android.vndk.v34.apex
+APEX com.android.vndk.v34: allocating loop for /dev/ssal-common-launcher/run-1793797036/worker/apex-cache/43.img
+guest APEX: com.android.vndk.v34 <- /dev/ssal-common-launcher/run-1793797036/worker/rootfs/system/system_ext/apex/com.android.vndk.v34.apex (ro)
+preparing APEX 45/54: /dev/ssal-common-launcher/run-1793797036/worker/rootfs/vendor/apex/com.android.hardware.cas.lazy.apex
+APEX com.android.hardware.cas.lazy: allocating loop for /dev/ssal-common-launcher/run-1793797036/worker/apex-cache/44.img
+guest APEX: com.android.hardware.cas.lazy <- /dev/ssal-common-launcher/run-1793797036/worker/rootfs/vendor/apex/com.android.hardware.cas.lazy.apex (ro)
+preparing APEX 46/54: /dev/ssal-common-launcher/run-1793797036/worker/rootfs/vendor/apex/com.google.android.widevine.nonupdatable.apex
+APEX com.google.android.widevine: allocating loop for /dev/ssal-common-launcher/run-1793797036/worker/apex-cache/45.img
+guest APEX: com.google.android.widevine <- /dev/ssal-common-launcher/run-1793797036/worker/rootfs/vendor/apex/com.google.android.widevine.nonupdatable.apex (ro)
+preparing APEX 47/54: /dev/ssal-common-launcher/run-1793797036/worker/rootfs/vendor/apex/com.samsung.android.authfw.ta.preload.apex
+APEX com.samsung.android.authfw.ta: allocating loop for /dev/ssal-common-launcher/run-1793797036/worker/apex-cache/46.img
+guest APEX: com.samsung.android.authfw.ta <- /dev/ssal-common-launcher/run-1793797036/worker/rootfs/vendor/apex/com.samsung.android.authfw.ta.preload.apex (ro)
+preparing APEX 48/54: /dev/ssal-common-launcher/run-1793797036/worker/rootfs/vendor/apex/com.samsung.android.biometrics.face.signed.apex
+APEX com.samsung.android.biometrics.face: allocating loop for /dev/ssal-common-launcher/run-1793797036/worker/apex-cache/47.img
+guest APEX: com.samsung.android.biometrics.face <- /dev/ssal-common-launcher/run-1793797036/worker/rootfs/vendor/apex/com.samsung.android.biometrics.face.signed.apex (ro)
+preparing APEX 49/54: /dev/ssal-common-launcher/run-1793797036/worker/rootfs/vendor/apex/com.samsung.android.biometrics.fingerprint.signed.apex
+APEX com.samsung.android.biometrics.fingerprint: allocating loop for /dev/ssal-common-launcher/run-1793797036/worker/apex-cache/48.img
+guest APEX: com.samsung.android.biometrics.fingerprint <- /dev/ssal-common-launcher/run-1793797036/worker/rootfs/vendor/apex/com.samsung.android.biometrics.fingerprint.signed.apex (ro)
+preparing APEX 50/54: /dev/ssal-common-launcher/run-1793797036/worker/rootfs/vendor/apex/com.samsung.android.camera.unihal.signed.apex
+APEX com.samsung.android.camera.unihal: allocating loop for /dev/ssal-common-launcher/run-1793797036/worker/apex-cache/49.img
+guest APEX: com.samsung.android.camera.unihal <- /dev/ssal-common-launcher/run-1793797036/worker/rootfs/vendor/apex/com.samsung.android.camera.unihal.signed.apex (ro)
+preparing APEX 51/54: /dev/ssal-common-launcher/run-1793797036/worker/rootfs/vendor/apex/com.samsung.android.media.swcodec.vendor.signed.apex
+APEX com.samsung.android.media.swcodec.vendor: allocating loop for /dev/ssal-common-launcher/run-1793797036/worker/apex-cache/50.img
+guest APEX: com.samsung.android.media.swcodec.vendor <- /dev/ssal-common-launcher/run-1793797036/worker/rootfs/vendor/apex/com.samsung.android.media.swcodec.vendor.signed.apex (ro)
+preparing APEX 52/54: /dev/ssal-common-launcher/run-1793797036/worker/rootfs/vendor/apex/com.samsung.android.rild.signed.apex
+APEX com.samsung.android.rild: allocating loop for /dev/ssal-common-launcher/run-1793797036/worker/apex-cache/51.img
+guest APEX: com.samsung.android.rild <- /dev/ssal-common-launcher/run-1793797036/worker/rootfs/vendor/apex/com.samsung.android.rild.signed.apex (ro)
+preparing APEX 53/54: /dev/ssal-common-launcher/run-1793797036/worker/rootfs/vendor/apex/com.samsung.android.sfa.signed.apex
+APEX com.samsung.android.sfa: allocating loop for /dev/ssal-common-launcher/run-1793797036/worker/apex-cache/52.img
+guest APEX: com.samsung.android.sfa <- /dev/ssal-common-launcher/run-1793797036/worker/rootfs/vendor/apex/com.samsung.android.sfa.signed.apex (ro)
+preparing APEX 54/54: /dev/ssal-common-launcher/run-1793797036/worker/rootfs/vendor/apex/com.samsung.android.vital.signed.apex
+APEX com.samsung.android.vital: allocating loop for /dev/ssal-common-launcher/run-1793797036/worker/apex-cache/53.img
+guest APEX: com.samsung.android.vital <- /dev/ssal-common-launcher/run-1793797036/worker/rootfs/vendor/apex/com.samsung.android.vital.signed.apex (ro)
+guest stage: APEX patches
+Guest cgroup cleanup: passed
+worker rootfs residual mount check: verified absent
+session loop backing release: verified (55 allocations)
+prepare worker: Read-only file system (os error 30)
+worker_exit=1 stage=/dev/ssal-common-launcher/run-1793797036
+HOST_ENFORCING_CORE_PROCESSES_ENDPOINTS=UNCHANGED

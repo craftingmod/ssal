@@ -34,7 +34,7 @@ ssal probe-guest-data NEW_PROFILE
 - 이 커널은 PID namespace 생성을 `EINVAL`로 거부한다. 데몬에는 자기 PID의 proc 디렉터리만 보이고 Host PID 트리는 보이지 않는다. 컴파일 자식에는 별도 mount namespace에서 그 자식의 proc 디렉터리만 bind한다.
 - 사용자가 명시적으로 승인한 **시험 전용** 예외로 artd에 `CAP_SYS_ADMIN`을 추가한다. 보조기는 session socketpair로 감독자에게 요청한다. 감독자는 PID/starttime·프로세스 그룹·Guest root·보조기 executable·artd 도메인과 분리된 namespace를 검사한다. proc 연결 후 SYS_ADMIN이 effective/permitted/inheritable/ambient에서 제거되고 NNP가 유지된 실제 status를 확인해야 순정 `art_exec`를 진행한다. 컴파일러의 bounding set에는 해당 비트가 남지만 NNP 및 제거된 permitted/inheritable/ambient 때문에 exec로 복구할 수 없다. 운영 서비스에 이 예외를 적용하지 않았다.
 - 세션 프로세스 그룹 이탈을 seccomp로 차단한다. 감독자는 leader를 `WNOWAIT`로 관찰해 PID 소유권을 유지한 채 자식 그룹 전체를 종료하고, live task가 사라진 뒤 leader를 회수한다.
-- property는 Host 영역 대신 독립 Bionic pre-split RO area다. Guest SDK 36을 확인하고 manager-ready, SDK/codename, ARM64 ABI 및 64-bit dex2oat 선택 값만 준비한다. Guest property service는 없고 모든 `connect`는 EPERM이다. Host property 원문은 보고서에 넣지 않는다.
+- property는 Host 영역 대신 독립 Bionic pre-split RO area다. Guest SDK 36을 확인하고 manager-ready, SDK/codename, ARM64 ABI, 64-bit dex2oat 선택 값 및 Zygote graphics preload 비활성화 값만 준비한다. Guest property service는 없고 모든 `connect`는 EPERM이다. Host property 원문은 보고서에 넣지 않는다.
 - `derive_classpath`는 Guest classpath protobuf만 읽어 BOOTCLASSPATH/DEX2OATBOOTCLASSPATH를 만든다. Guest ART/system/statsd/i18n 라이브러리 검색 경로와 session stderr 로거를 명시한다. Host cgroup/task profile 및 logd/tombstoned는 연결하지 않는다.
 - 준비한 `/data` 하위 경로의 UID/GID·mode·라벨 적용 결과를 기록한다. Permissive에서는 일부 Guest 라벨이 Host 정책에 없어 relabel 오류가 남을 수 있다. 그 오류를 Enforcing 허용 증거로 취급하지 않는다.
 

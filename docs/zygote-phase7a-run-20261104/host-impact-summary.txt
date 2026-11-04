@@ -1,0 +1,9 @@
+Device log window: 2026-11-04 23:21:30–23:21:35 KST
+lmkd reclaim records: 27
+Host services: init, zygote64, system_server, installd remained running; artd remained stopped as in pre-run baseline.
+Guest Zygote PID 15920: worker stderr reported SIGABRT before abstract socket readiness.
+Host memory pressure: lmkd reported low/min watermark and reclaimed cached app processes; this occurred in the same worker window.
+Crash diagnostics: crash buffer had no entry for PID 15920; no new tombstone was found after the run.
+SELinux diagnostics: no Guest-domain AVC denial matched the run window in logcat or dmesg.
+Guest-side nonfatal warnings: linkerconfig path warning before generation; servicemanager ready-property set failed because Guest property service is absent; private AIDL smoke test still passed.
+Attribution: timing strongly correlates with the Guest APEX/Zygote worker; the captured evidence does not isolate the exact memory consumer.

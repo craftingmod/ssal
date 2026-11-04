@@ -9,11 +9,15 @@ mod guest_mounts;
 #[cfg(unix)]
 mod guest_probe;
 #[cfg(unix)]
+mod memory_cgroup;
+#[cfg(unix)]
 mod prepare;
 #[cfg(unix)]
 mod selinux_probe;
 #[cfg(unix)]
 mod service_contract;
+#[cfg(unix)]
+mod zygote_diagnostics;
 #[cfg(unix)]
 mod daemon {
     use sha2::{Digest, Sha256};
@@ -759,8 +763,11 @@ fn main() {
             || arg == "--guest-child-worker"
             || arg == "--guest-cgroup-worker"
             || arg == "--guest-processgroup-worker"
+            || arg == "--guest-memory-worker"
             || arg == "--guest-service-worker"
             || arg == "--guest-services-6a-worker"
+            || arg == "--guest-services-6b-worker"
+            || arg == "--guest-zygote-7a-worker"
     }) {
         if args.len() != 5 || unsafe { libc::geteuid() } != 0 {
             eprintln!("invalid prepare worker invocation");

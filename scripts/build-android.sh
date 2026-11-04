@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
-cd /src
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$repo_root/target}"
+android_ndk="${ANDROID_NDK_HOME:-/opt/android-ndk}"
+android_linker="$android_ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android26-clang"
+if [[ ! -x "$android_linker" ]]; then
+    echo "Android NDK linker missing: $android_linker (set ANDROID_NDK_HOME)" >&2
+    exit 1
+fi
+export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$android_linker"
 cargo build --locked --release --target aarch64-linux-android
 mkdir -p out/bin
 install -m 755 "$CARGO_TARGET_DIR/aarch64-linux-android/release/ssal" out/bin/ssal

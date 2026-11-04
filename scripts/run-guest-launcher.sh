@@ -1,13 +1,15 @@
 #!/system/bin/sh
 set -eu
-bin=/data/local/tmp/ssal-common-launcher
+bin=/dev/ssal-common-launcher
 stage="$bin/run-$(date +%s)"
 mkdir -p "$stage/worker/system" "$stage/worker/data"
 snapshot() {
     getenforce
     cat /proc/sys/kernel/random/boot_id
+    readlink /proc/1/ns/net
     sha256sum /proc/1/mountinfo
-    stat -c '%n %d %i %a %u %g' /data /dev/__properties__ /dev/socket/property_service /dev/binder
+    getprop | sha256sum
+    stat -c '%n %d %i %a %u %g' /data /dev/__properties__ /dev/socket/property_service /dev/socket/zygote /dev/binder
     for key in ro.build.version.sdk ro.boot.serialno init.svc.zygote init.svc.installd init.svc.artd; do
         echo "$key=$(getprop "$key")"
     done
@@ -34,6 +36,9 @@ set -e
 cat "$stage/worker.log"
 snapshot > "$stage/after.txt"
 echo "worker_exit=$status stage=$stage"
+if test -d "$stage/worker/phase7b"; then
+    echo "zygote_diagnostics=$stage/worker/phase7b (pull before removing session tmpfs)"
+fi
 if cmp -s "$stage/before.txt" "$stage/after.txt"; then
     echo HOST_ENFORCING_CORE_PROCESSES_ENDPOINTS=UNCHANGED
 else

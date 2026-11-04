@@ -927,7 +927,7 @@ fn run_data_daemons(
         return Err(io::Error::other("private property area backing mismatch"));
     }
     report["private_properties"] = json!({"format":"Bionic pre-split read-only area","values":{"servicemanager.ready":"true"},"initialized_after_private_manager_ready":true,"identity":[area.dev(),area.ino()],"host_identity":[host.dev(),host.ino()],"property_service":"absent; connect blocked"});
-    report["private_properties"]["values"] = json!({"servicemanager.ready":"true","ro.product.cpu.abilist64":"arm64-v8a","dalvik.vm.dex2oat64.enabled":"true","ro.build.version.sdk":"36","ro.build.version.codename":"REL"});
+    report["private_properties"]["values"] = json!({"servicemanager.ready":"true","ro.product.cpu.abilist64":"arm64-v8a","dalvik.vm.dex2oat64.enabled":"true","ro.build.version.sdk":"36","ro.build.version.codename":"REL","ro.zygote.disable_gl_preload":"1"});
     report["execution_overrides"] = json!({"artd":"UID/GID 1082; RC data capabilities plus explicitly approved SYS_ADMIN for compiler shim","compiler":"own private mount namespace and PID proc bind; SYS_ADMIN removed and NNP verified before stock art_exec","proc":"own PID only; no Host PID tree; no PID namespace support on this kernel","properties":"fixed Android 16 ARM64 probe bootstrap; Guest SDK checked; no Host values copied","linker":"Guest ART/system/statsd/i18n library paths","logging":"Guest-only LD_PRELOAD routes log messages to session stderr","artd_aidl_revision":"1690c6912a7972c9e62c39b48c706de9b8b18b4a","boot_classpath":"Guest derive_classpath output only"});
     let logger = std::env::current_exe()?.with_file_name("ssal-phase2-log.so");
     let manifest: Value =

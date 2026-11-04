@@ -1,0 +1,156 @@
+Enforcing
+f7900911-c061-4570-8f65-900571a55c11
+net:[4026531840]
+a5730bbd4b5f546eb60fc3c8b2c76c577f40bb2e84101081ac7addf7346277e1  /proc/1/mountinfo
+c7096d328f9343146490c18f5dd424f9394e40270246a34eed3aefc6eb1626ff  -
+/data 65105 3 771 1000 1000
+/dev/__properties__ 18 118 711 0 0
+/dev/socket/property_service 18 766 666 0 0
+/dev/socket/zygote 18 2208 660 0 1000
+/dev/binder 18 1616 777 0 0
+ro.build.version.sdk=37
+ro.boot.serialno=<redacted-device-serial>
+init.svc.zygote=running
+init.svc.installd=running
+init.svc.artd=stopped
+Service aidl_lazy_test_1: not found
+host_process=init
+1 (init) 0
+u:r:init:s0Uid:	0	0	0	0
+Gid:	0	0	0	0
+CapInh:	0000000000000000
+CapPrm:	000001ffffffffff
+CapEff:	000001ffffffffff
+CapBnd:	000001ffffffffff
+CapAmb:	0000000000000000
+NoNewPrivs:	0
+Seccomp:	0
+/
+/system/bin/init
+mnt:[4026532950]
+host_process=init
+288 (init) 270
+u:r:vendor_init:s0Uid:	0	0	0	0
+Gid:	0	0	0	0
+CapInh:	0000000000000000
+CapPrm:	000001ffffffffff
+CapEff:	000001ffffffffff
+CapBnd:	000001ffffffffff
+CapAmb:	0000000000000000
+NoNewPrivs:	0
+Seccomp:	0
+/
+/system/bin/init
+mnt:[4026532950]
+host_process=zygote64
+27927 (main) 24968442
+u:r:zygote:s0Uid:	0	0	0	0
+Gid:	0	0	0	0
+CapInh:	0000000000000000
+CapPrm:	000001ffffffffff
+CapEff:	000001ffffffffff
+CapBnd:	000001ffffffffff
+CapAmb:	0000000000000000
+NoNewPrivs:	0
+Seccomp:	0
+/
+/system/bin/app_process64
+mnt:[4026535818]
+host_process=system_server
+28271 (system_server) 24968569
+u:r:system_server:s0Uid:	1000	1000	1000	1000
+Gid:	1000	1000	1000	1000
+CapInh:	0000001a06887c20
+CapPrm:	0000001a06887c20
+CapEff:	0000001a06887c20
+CapBnd:	0000000000000000
+CapAmb:	0000000000000000
+NoNewPrivs:	0
+Seccomp:	2
+/
+/system/bin/app_process64
+mnt:[4026535819]
+host_process=servicemanager
+942 (servicemanager) 374
+u:r:servicemanager:s0Uid:	1000	1000	1000	1000
+Gid:	1000	1000	1000	1000
+CapInh:	0000000000000000
+CapPrm:	0000000000000000
+CapEff:	0000000000000000
+CapBnd:	000001ffffffffff
+CapAmb:	0000000000000000
+NoNewPrivs:	0
+Seccomp:	0
+/
+/system/bin/servicemanager
+mnt:[4026532950]
+host_process=surfaceflinger
+2108 (surfaceflinger) 656
+u:r:surfaceflinger:s0Uid:	1000	1000	1000	1000
+Gid:	1003	1003	1003	1003
+CapInh:	0000000001800000
+CapPrm:	0000000001800000
+CapEff:	0000000001800000
+CapBnd:	0000000001800000
+CapAmb:	0000000001800000
+NoNewPrivs:	0
+Seccomp:	0
+/
+/system/bin/surfaceflinger
+mnt:[4026532950]
+host_process=adbd
+23785 (adbd) 28445920
+u:r:ksu:s0Uid:	0	0	0	0
+Gid:	0	0	0	0
+CapInh:	0000000000000000
+CapPrm:	000001ffffffffff
+CapEff:	000001ffffffffff
+CapBnd:	000001ffffffffff
+CapAmb:	0000000000000000
+NoNewPrivs:	0
+Seccomp:	0
+/
+/apex/com.android.adbd/bin/adbd
+mnt:[4026532950]
+host_process=netd
+27933 (binder:27933_3) 24968444
+u:r:netd:s0Uid:	0	0	0	0
+Gid:	0	0	0	0
+CapInh:	00000000000074ef
+CapPrm:	00000000000074ef
+CapEff:	00000000000074ef
+CapBnd:	00000000000074ef
+CapAmb:	00000000000074ef
+NoNewPrivs:	0
+Seccomp:	0
+/
+/system/bin/netd
+mnt:[4026532950]
+host_process=lmkd
+941 (lmkd) 374
+u:r:lmkd:s0Uid:	1069	1069	1069	1069
+Gid:	1069	1069	1069	1069
+CapInh:	0000000001804022
+CapPrm:	0000000001804022
+CapEff:	0000000001804022
+CapBnd:	0000000001804022
+CapAmb:	0000000001804022
+NoNewPrivs:	0
+Seccomp:	0
+/
+/system/bin/lmkd
+mnt:[4026531841]
+host_process=installd
+2607 (binder:2607_2) 712
+u:r:installd:s0Uid:	0	0	0	0
+Gid:	0	0	0	0
+CapInh:	00000000002000ff
+CapPrm:	00000000002000ff
+CapEff:	00000000002000ff
+CapBnd:	00000000002000ff
+CapAmb:	00000000002000ff
+NoNewPrivs:	0
+Seccomp:	0
+/
+/system/bin/installd
+mnt:[4026532950]

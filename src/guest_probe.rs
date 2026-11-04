@@ -103,6 +103,30 @@ mod tests {
     }
 
     #[test]
+    fn timeout_does_not_wait_for_detached_pipe_holder() -> io::Result<()> {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "setsid /bin/sleep 1 & wait"]);
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        let started = Instant::now();
+        assert_eq!(
+            run_with_timeout(&mut cmd, "detached timeout", Duration::from_millis(50))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert!(started.elapsed() < Duration::from_millis(800));
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "requires Linux root/CAP_SYS_CHROOT; no mount capability needed"]
     fn real_chroot_probe_closes_host_directory_fds() -> io::Result<()> {
         let sentinel =
@@ -413,20 +437,37 @@ pub(crate) fn run_with_timeout(
     let err = reader(Box::new(stderr));
     let deadline = Instant::now() + timeout;
     let status = loop {
-        if let Some(status) = child.try_wait()? {
-            // No service or background process is part of a successful probe.
+        if let Err(error) = crate::memory_cgroup::check_interrupted() {
             unsafe {
                 libc::kill(-(child.id() as i32), libc::SIGKILL);
             }
-            break status;
+            child.wait()?;
+            return Err(error);
+        }
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        if unsafe {
+            libc::waitid(
+                libc::P_PID,
+                child.id(),
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if unsafe { info.si_pid() } != 0 {
+            // Keep the leader pinned until its process group is stopped.
+            unsafe {
+                libc::kill(-(child.id() as i32), libc::SIGKILL);
+            }
+            break child.wait()?;
         }
         if Instant::now() >= deadline {
             unsafe {
                 libc::kill(-(child.id() as i32), libc::SIGKILL);
             }
             child.wait()?;
-            let _ = out.join();
-            let _ = err.join();
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 format!("{stage}: exceeded {timeout:?}; probe process group stopped"),
@@ -434,6 +475,15 @@ pub(crate) fn run_with_timeout(
         }
         std::thread::sleep(Duration::from_millis(25));
     };
+    let drain_deadline = Instant::now() + Duration::from_millis(500);
+    while !out.is_finished() || !err.is_finished() {
+        if Instant::now() >= drain_deadline {
+            return Err(io::Error::other(format!(
+                "{stage}: output pipe held by descendant"
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
     Ok(Output {
         status,
         stdout: out

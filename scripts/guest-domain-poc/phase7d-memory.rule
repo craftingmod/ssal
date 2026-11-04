@@ -1,0 +1,3 @@
+type ssal_guest_probe domain
+allow ksu ssal_guest_probe process transition
+permissive ssal_guest_probe

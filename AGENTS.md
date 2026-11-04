@@ -11,6 +11,12 @@ vendor has huge codebase so don't read unless explicit request.
 - Run WSL and WSLc commands outside the sandbox.
 - Prioritize incremental runtime validation and first boot over exhaustive preemptive hardening. Avoid blocking all progress on unverified risks.
 
+## Analyze log
+
+- Delegate bulk logcat/dmesg/AVC analysis to a low-cost subagent(Luna) when available.
+- Pre-filter logs locally; return only concise findings with timestamps, source paths, and line numbers.
+- Never load complete raw logs into the main agent context unless explicitly requested.
+
 ### SELinux Experimental Policy
 
 - Missing Guest-only SELinux types, attributes, or permissions are implementation tasks, not automatic NO-GO conditions. Prepare the minimal policy delta and continue validation when Host isolation boundaries remain intact.

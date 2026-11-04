@@ -738,6 +738,8 @@ pub(crate) const GUEST_CGROUPS: [(&str, &str); 4] = [
 #[derive(Default)]
 struct GuestCgroups {
     created: Vec<PathBuf>,
+    memory: Option<crate::memory_cgroup::GuestMemory>,
+    preserve: bool,
 }
 
 impl GuestCgroups {
@@ -759,6 +761,20 @@ impl GuestCgroups {
                 return Err(io::Error::other("cgroup parent contains a symlink"));
             }
             self.create(source)?;
+            if target == "sys/fs/cgroup" && self.memory.is_some() {
+                for (name, key) in [
+                    ("memory.high", "SSAL_MEMORY_HIGH"),
+                    ("memory.max", "SSAL_MEMORY_MAX"),
+                ] {
+                    if let Some(value) = memory_limit(std::env::var(key).ok().as_deref())? {
+                        fs::write(source.join(name), value.to_string())?;
+                        crate::memory_cgroup::require(
+                            crate::memory_cgroup::read(source.join(name))? == value.to_string(),
+                            "Guest memory limit readback",
+                        )?;
+                    }
+                }
+            }
             if target == "dev/cpuset" {
                 for name in ["cpus", "mems"] {
                     let value = fs::read_to_string(parent.join(name))?;
@@ -786,6 +802,11 @@ impl GuestCgroups {
     }
 
     fn cleanup(&mut self) -> io::Result<()> {
+        if self.preserve {
+            return Err(io::Error::other(
+                "unverified descendants; preserve Guest cgroups and controllers",
+            ));
+        }
         let mut errors = Vec::new();
         for path in std::mem::take(&mut self.created).into_iter().rev() {
             // rmdir only: occupied or unexpected child groups must remain visible as failures.
@@ -795,11 +816,37 @@ impl GuestCgroups {
             }
         }
         self.created.reverse();
+        if errors.is_empty() {
+            if let Some(memory) = &mut self.memory {
+                if let Err(error) = memory.cleanup() {
+                    errors.push(error.to_string());
+                }
+            }
+        }
         if !errors.is_empty() {
             return Err(io::Error::other(errors.join("; ")));
         }
         Ok(())
     }
+}
+
+impl Drop for GuestCgroups {
+    fn drop(&mut self) {
+        if let Err(error) = self.cleanup() {
+            eprintln!("Guest cgroup cleanup failed: {error}");
+        }
+    }
+}
+
+fn memory_limit(value: Option<&str>) -> io::Result<Option<u64>> {
+    value
+        .map(|v| {
+            v.parse::<u64>()
+                .ok()
+                .filter(|n| *n > 0)
+                .ok_or_else(|| io::Error::other("memory limit must be a positive byte count"))
+        })
+        .transpose()
 }
 
 fn guest_cgroup_probe(root: &Path) -> io::Result<()> {
@@ -1015,6 +1062,19 @@ pub fn verify(
     fs::create_dir(&root)?;
     let mut mounts = Mounts::new();
     let mut cgroups = GuestCgroups::default();
+    if matches!(
+        mode,
+        "--guest-processgroup-worker"
+            | "--guest-memory-worker"
+            | "--guest-child-worker"
+            | "--guest-service-worker"
+            | "--guest-services-6a-worker"
+            | "--guest-services-6b-worker"
+            | "--guest-zygote-7a-worker"
+    ) {
+        crate::memory_cgroup::install_signal_handlers();
+        crate::memory_cgroup::enable_subreaper()?;
+    }
     let result = (|| {
         if mode == "--guest-data-worker" {
             crate::guest_data_probe::fresh(userdata)?;
@@ -1079,9 +1139,27 @@ pub fn verify(
             "--guest-cgroup-worker"
                 | "--guest-child-worker"
                 | "--guest-processgroup-worker"
+                | "--guest-memory-worker"
                 | "--guest-service-worker"
                 | "--guest-services-6a-worker"
+                | "--guest-services-6b-worker"
+                | "--guest-zygote-7a-worker"
         ) {
+            if matches!(
+                mode,
+                "--guest-processgroup-worker"
+                    | "--guest-memory-worker"
+                    | "--guest-child-worker"
+                    | "--guest-service-worker"
+                    | "--guest-services-6a-worker"
+                    | "--guest-services-6b-worker"
+                    | "--guest-zygote-7a-worker"
+            ) {
+                for key in ["SSAL_MEMORY_HIGH", "SSAL_MEMORY_MAX"] {
+                    memory_limit(std::env::var(key).ok().as_deref())?;
+                }
+                cgroups.memory = Some(crate::memory_cgroup::GuestMemory::prepare()?);
+            }
             cgroups.prepare(&mut mounts, &root)?;
         }
         if mode == "--guest-cgroup-worker" {
@@ -1175,15 +1253,31 @@ pub fn verify(
         println!("guest stage: APEX patches");
         patches(&mut mounts, &profile, &patch_dir, &root, true)?;
         permission_controller(&mut mounts, &patch_dir, &root)?;
+        if mode == "--guest-memory-worker" {
+            let helper = std::env::var_os("SSAL_PHASE7D_FIX_HELPER");
+            if let Some(path) = &helper {
+                cgroups.create(&Path::new(GUEST_CGROUPS[0].0).join("phase7d_fix"))?;
+                let target = directory(&root, "run/ssal", 0o755)?.join("phase7d-fix-probe");
+                File::create(&target)?;
+                mounts.bind(Path::new(path), &target, true, false)?;
+            }
+            return crate::guest_launcher::memory_probe(&root, helper.is_some());
+        }
         if matches!(
             mode,
-            "--guest-child-worker" | "--guest-service-worker" | "--guest-services-6a-worker"
+            "--guest-child-worker"
+                | "--guest-service-worker"
+                | "--guest-services-6a-worker"
+                | "--guest-services-6b-worker"
+                | "--guest-zygote-7a-worker"
         ) {
             return crate::guest_launcher::verify(
                 &mut mounts,
                 &root,
                 userdata,
-                mode == "--guest-services-6a-worker",
+                mode == "--guest-services-6a-worker" || mode == "--guest-services-6b-worker",
+                mode == "--guest-services-6b-worker",
+                mode == "--guest-zygote-7a-worker",
             );
         }
         {
@@ -1227,6 +1321,15 @@ pub fn verify(
         }
         Ok(())
     })();
+    let result = result.and_then(|()| crate::memory_cgroup::check_interrupted());
+    let descendants = if cgroups.memory.is_some() {
+        crate::memory_cgroup::cleanup_descendants()
+    } else {
+        Ok(())
+    };
+    if descendants.is_err() {
+        cgroups.preserve = true;
+    }
     let cleanup = mounts.cleanup();
     let cgroup_cleanup = cgroups.cleanup();
     println!(
@@ -1249,7 +1352,7 @@ pub fn verify(
             Ok(())
         }
     });
-    let cleanup = [cleanup, cgroup_cleanup, residual]
+    let cleanup = [descendants, cleanup, cgroup_cleanup, residual]
         .into_iter()
         .filter_map(Result::err)
         .map(|error| error.to_string())
@@ -1292,6 +1395,15 @@ pub fn verify(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn optional_memory_limits_reject_invalid_values() {
+        assert_eq!(memory_limit(None).unwrap(), None);
+        assert_eq!(memory_limit(Some("104857600")).unwrap(), Some(104857600));
+        for value in ["", "0", "max", "-1", "invalid", "18446744073709551616"] {
+            assert!(memory_limit(Some(value)).is_err());
+        }
+    }
 
     #[test]
     fn processgroup_config_preserves_profiles_and_rejects_host_path_escape() -> io::Result<()> {

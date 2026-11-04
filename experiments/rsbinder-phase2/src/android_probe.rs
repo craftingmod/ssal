@@ -57,6 +57,7 @@ pub(super) fn initialize_private_properties(path: &Path) -> std::io::Result<Stri
         ("ro.product.cpu.abilist64", "arm64-v8a"),
         ("ro.build.version.codename", "REL"),
         ("dalvik.vm.dex2oat64.enabled", "true"),
+        ("ro.zygote.disable_gl_preload", "1"),
     ];
     let entries = seeds
         .iter()
