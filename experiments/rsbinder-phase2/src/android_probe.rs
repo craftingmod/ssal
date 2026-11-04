@@ -48,11 +48,25 @@ pub(super) fn initialize_private_properties(path: &Path) -> std::io::Result<Stri
             "Guest /system/build.prop SDK is {sdk}, expected 36"
         )));
     }
+    let sdk_full = build
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("ro.build.version.sdk_full=")
+                .or_else(|| line.strip_prefix("ro.system.build.version.sdk_full="))
+        })
+        .ok_or_else(|| std::io::Error::other("Guest /system/build.prop has no full SDK value"))?;
+    // shortcut: SDK 36.1 only, generalize after validating another Guest image.
+    if sdk_full != "36.1" {
+        return Err(std::io::Error::other(format!(
+            "Guest /system/build.prop full SDK is {sdk_full}, expected 36.1"
+        )));
+    }
 
     fs::create_dir(path)?;
     set_label(path, "u:object_r:properties_device:s0")?;
     let seeds = [
         ("ro.build.version.sdk", sdk),
+        ("ro.build.version.sdk_full", sdk_full),
         ("servicemanager.ready", "true"),
         ("ro.product.cpu.abilist64", "arm64-v8a"),
         ("ro.build.version.codename", "REL"),
@@ -100,6 +114,7 @@ pub(super) fn initialize_private_properties(path: &Path) -> std::io::Result<Stri
         "event":"private_property_area_initialized",
         "sdk_source":"Guest /system/build.prop",
         "guest_sdk":sdk,
+        "guest_sdk_full":sdk_full,
         "rsproperties_sdk":observed,
         "property_area":path.display().to_string(),
         "property_info_context":"u:object_r:property_info:s0",

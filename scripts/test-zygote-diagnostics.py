@@ -32,3 +32,14 @@ with tempfile.TemporaryDirectory(prefix="ssal-7b-") as temporary:
     assert b"object=" in result.stderr and b"offset=" in result.stderr
     assert result.stderr.count(b"SSAL_NATIVE_FRAME") <= 64
     print("PASS: native abort marker, bounded PC frames, stderr payload, SIGABRT preserved")
+    source.write_text('int main(void) { *(volatile int *)0 = 1; }\n')
+    subprocess.run(["cc", "-g", "-fno-omit-frame-pointer", str(source), "-o", str(executable)], check=True)
+    result = subprocess.run([str(executable)], env={**os.environ, "LD_PRELOAD": str(library)},
+                            capture_output=True, timeout=5, preexec_fn=no_core)
+    assert result.returncode == -signal.SIGSEGV, result.returncode
+    for marker in [b"SSAL_CRASH_PID=", b"si_addr=0x0000000000000000", b"pc=", b"sp=",
+                   b"stack_start=", b"frame_pc=", b"SSAL_CRASH_END=", b"/abort-test"]:
+        assert marker in result.stderr, marker
+    assert result.stderr.count(b"frame_pc=") <= 33
+    assert len(result.stderr) < 150000
+    print("PASS: SIGSEGV context, maps, bounded stack/FP chain, fatal semantics preserved")

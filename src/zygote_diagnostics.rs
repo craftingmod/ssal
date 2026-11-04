@@ -120,7 +120,7 @@ impl Diagnostics {
             serde_json::json!({
                 "event": "launch", "unix_ms": launch_ms, "pid": child.id(),
                 "cgroup": cgroup, "stream_limit_bytes": LIMIT,
-                "native_capture": "Guest-only abort interposer + liblog stderr logger; PC frames need offline symbolization",
+                "native_capture": "Guest-only abort interposer + SIGSEGV ucontext/maps/bounded stack/FP capture + liblog stderr logger; offline symbolization",
                 "host_debuggerd_tombstoned": "unchanged; not connected",
             })
         )?;

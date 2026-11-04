@@ -16,6 +16,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn zygote_group_allows_zygote_init_to_setpgid_again() -> io::Result<()> {
+        let mut command = std::process::Command::new("/bin/true");
+        unsafe {
+            command.pre_exec(|| {
+                isolate_process_group(true)?;
+                if libc::getpgrp() != libc::getpid()
+                    || libc::getsid(0) == libc::getpid()
+                    || libc::setpgid(0, 0) != 0
+                {
+                    return Err(io::Error::other("invalid Zygote process group"));
+                }
+                Ok(())
+            });
+        }
+        assert!(command.status()?.success());
+        Ok(())
+    }
+
+    #[test]
     fn policy_equality_includes_identifiers_without_logging_them() -> io::Result<()> {
         let mut raw = [0xabu8; 24];
         raw[..8].copy_from_slice(&[2, 1, 4, 10, 0, 0, 0, 0]);
@@ -259,8 +278,24 @@ pub(crate) fn command(root: &Path, executable: &str, pivot: bool) -> io::Result<
     root_command(root, executable, pivot)
 }
 
+fn isolate_process_group(zygote: bool) -> io::Result<()> {
+    // ZygoteInit calls setpgid itself, which fails for a session leader.
+    if unsafe {
+        if zygote {
+            libc::setpgid(0, 0)
+        } else {
+            libc::setsid()
+        }
+    } < 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 pub(crate) fn root_command(root: &Path, executable: &str, pivot: bool) -> io::Result<Command> {
     let root_c = cpath(root)?;
+    let zygote = executable == "/system/bin/app_process64";
     let inherited = ssal::unix::inherited_fds()?;
     let expected = fs::metadata(root)?;
     if pivot {
@@ -274,9 +309,7 @@ pub(crate) fn root_command(root: &Path, executable: &str, pivot: bool) -> io::Re
         command.pre_exec(move || {
             ssal::unix::close_inherited_fds(&inherited, &[])?;
             ssal::unix::cloexec_unexpected_fds()?;
-            if libc::setsid() < 0 {
-                return Err(io::Error::last_os_error());
-            }
+            isolate_process_group(zygote)?;
             if pivot {
                 if libc::unshare(libc::CLONE_NEWNS) != 0 {
                     return Err(io::Error::last_os_error());

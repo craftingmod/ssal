@@ -1,9 +1,10 @@
 //! Disposable Guest service launcher; shared PID namespace is intentional.
 use ssal::namespace_mounts::Mounts;
 use std::fs::{self, File};
-use std::io;
+use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -72,6 +73,25 @@ pub(crate) fn command(
         });
     }
     Ok(command)
+}
+
+fn zygote_sockets(command: &mut Command, root: &Path) -> io::Result<Vec<UnixListener>> {
+    let mut sockets = Vec::new();
+    for name in ["zygote", "usap_pool_primary"] {
+        let socket = UnixListener::bind(root.join("dev/socket").join(name))?;
+        let fd = socket.as_raw_fd();
+        command.env(format!("ANDROID_SOCKET_{name}"), fd.to_string());
+        unsafe {
+            command.pre_exec(move || {
+                if libc::fcntl(fd, libc::F_SETFD, 0) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        sockets.push(socket);
+    }
+    Ok(sockets)
 }
 
 fn run(root: &Path, exe: &str, args: &[&str], uid: u32) -> io::Result<String> {
@@ -145,6 +165,10 @@ impl Service {
             crate::zygote_diagnostics::Diagnostics::prepare(&diagnostic_dir)?;
         }
         if is_zygote {
+            fs::copy(
+                root.join("linkerconfig/ld.config.txt"),
+                diagnostic_dir.join("ld.config.txt"),
+            )?;
             if !root.join("run/ssal/ssal-zygote-diag.so").is_file() {
                 return Err(io::Error::other("Guest Zygote diagnostic preload missing"));
             }
@@ -160,9 +184,15 @@ impl Service {
         } else {
             command.stdout(output.try_clone()?).stderr(output);
         }
+        let sockets = if is_zygote {
+            zygote_sockets(&mut command, root)?
+        } else {
+            Vec::new()
+        };
         let launch_ms = crate::zygote_diagnostics::launch_time();
         let started = Instant::now();
         let child = command.args(args).spawn()?;
+        drop(sockets);
         println!("Guest service={name} pid={} executable={exe}", child.id());
         let mut service = Self {
             child,
@@ -212,8 +242,7 @@ impl Service {
             std::thread::sleep(Duration::from_millis(50));
         }
     }
-    fn wait_for_socket(&mut self, socket_name: &str) -> io::Result<()> {
-        let needle = format!("@{socket_name}");
+    fn wait_for_socket(&mut self, socket_path: &Path) -> io::Result<()> {
         let deadline = Instant::now() + Duration::from_secs(90);
         loop {
             crate::memory_cgroup::check_interrupted()?;
@@ -226,12 +255,25 @@ impl Service {
                     "Guest Zygote exited before socket readiness: {log}"
                 )));
             }
-            if fs::read_to_string("/proc/net/unix")?.contains(&needle) {
-                return Ok(());
+            if let Ok(mut socket) = UnixStream::connect(socket_path) {
+                socket.set_read_timeout(Some(Duration::from_millis(200)))?;
+                socket.set_write_timeout(Some(Duration::from_millis(200)))?;
+                let mut length = [0; 4];
+                if socket.write_all(b"1\n--query-abi-list\n").is_ok()
+                    && socket.read_exact(&mut length).is_ok()
+                    && u32::from_be_bytes(length) == 9
+                {
+                    let mut abi = [0; 9];
+                    if socket.read_exact(&mut abi).is_ok() && &abi == b"arm64-v8a" {
+                        println!("Guest Zygote ABI socket query=arm64-v8a");
+                        return Ok(());
+                    }
+                }
             }
             if Instant::now() >= deadline {
                 return Err(io::Error::other(format!(
-                    "Guest Zygote socket readiness timeout ({socket_name}): {log}"
+                    "Guest Zygote socket readiness timeout ({}): {log}",
+                    socket_path.display()
                 )));
             }
             std::thread::sleep(Duration::from_millis(100));
@@ -720,6 +762,7 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
         println!("PHASE5B=PASS shell=PASS private_aidl=PASS properties=PASS host_control_socket=ABSENT private_binder={major}:{minor}");
         if phase7a {
             server.stop()?;
+            crate::guest_mounts::directory(root, "data/dalvik-cache", 0o771)?;
             let binary = run(
                 root,
                 "/system/bin/sh",
@@ -731,18 +774,14 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
             )?;
             println!("Guest Zygote binary preflight:\n{binary}");
             let (boot_classpath, dex2oat_classpath) = derive_guest_classpath(root)?;
-            let socket_name = format!("ssal_guest_zygote_{}", std::process::id());
-            if fs::read_to_string("/proc/net/unix")?.contains(&format!("@{socket_name}")) {
-                return Err(io::Error::other("Guest Zygote socket name already in use"));
-            }
-            let socket_arg = format!("--socket-name={socket_name}");
             let mut zygote_env = vec![
                 ("ANDROID_BOOTLOGO", "1"),
                 ("ANDROID_ASSETS", "/system/app"),
                 ("EXTERNAL_STORAGE", "/sdcard"),
                 (
                     "LD_LIBRARY_PATH",
-                    "/run/ssal:/apex/com.android.art/lib64:/system/lib64:/apex/com.android.os.statsd/lib64:/apex/com.android.i18n/lib64",
+                    // Let the generated ART namespace own libart and its runtime singleton.
+                    "/run/ssal:/apex/com.android.adbd/lib64:/system/lib64:/apex/com.android.os.statsd/lib64:/apex/com.android.i18n/lib64",
                 ),
                 ("BOOTCLASSPATH", boot_classpath.as_str()),
             ];
@@ -750,17 +789,22 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
                 zygote_env.push(("DEX2OATBOOTCLASSPATH", classpath));
             }
             println!(
-                "Guest Zygote launch socket=@{socket_name} start_system_server=false private_binder={major}:{minor}"
+                "Guest Zygote launch socket=/dev/socket/zygote start_system_server=false private_binder={major}:{minor}"
             );
             let mut zygote = Service::start(
                 root,
                 "/system/bin/app_process64",
-                &["-Xzygote", "/system/bin", "--zygote", &socket_arg],
+                &[
+                    "-Xzygote",
+                    "/system/bin",
+                    "--zygote",
+                    "--socket-name=zygote",
+                ],
                 "guest-zygote",
                 0,
                 &zygote_env,
             )?;
-            zygote.wait_for_socket(&socket_name)?;
+            zygote.wait_for_socket(&root.join("dev/socket/zygote"))?;
             let pid = zygote.child.id();
             let guest_root = fs::metadata(root)?;
             let process_root = fs::metadata(format!("/proc/{pid}/root"))?;
@@ -787,12 +831,6 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
                     "Guest Zygote left its isolated network namespace",
                 ));
             }
-            let children = fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))?;
-            if !children.trim().is_empty() {
-                return Err(io::Error::other(format!(
-                    "Guest Zygote unexpectedly forked before a client connected: {children}"
-                )));
-            }
             let guest_binder = fs::metadata(root.join("dev/binder"))?.rdev();
             let host_binder = fs::metadata("/dev/binder")?.rdev();
             if guest_binder == host_binder {
@@ -810,13 +848,12 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
                 }
             }
             println!(
-                "Guest Zygote ready pid={pid} root=Guest uid=0 domain={} isolated_netns=true private_binder_fds={private_binder_fds} child_processes=0",
+                "Guest Zygote ready pid={pid} root=Guest uid=0 domain={} isolated_netns=true private_binder_fds={private_binder_fds}",
                 domain.trim_matches('\0').trim()
             );
             zygote.stop()?;
-            if fs::read_to_string("/proc/net/unix")?.contains(&format!("@{socket_name}")) {
-                return Err(io::Error::other("Guest Zygote socket remained after exit"));
-            }
+            fs::remove_file(root.join("dev/socket/zygote"))?;
+            fs::remove_file(root.join("dev/socket/usap_pool_primary"))?;
             println!("PHASE7A_ZYGOTE=PASS preload_complete=true socket_removed=true system_server=not_started");
         }
         if phase6a {
@@ -954,6 +991,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn zygote_socket_fds_survive_exec() -> io::Result<()> {
+        let root = std::env::temp_dir().join(format!("ssal-zygote-sockets-{}", std::process::id()));
+        fs::create_dir_all(root.join("dev/socket"))?;
+        let mut command = Command::new("/bin/sh");
+        unsafe {
+            command.pre_exec(ssal::unix::cloexec_unexpected_fds);
+        }
+        let sockets = zygote_sockets(&mut command, &root)?;
+        let status = command.args(["-c", "test -S /proc/self/fd/$ANDROID_SOCKET_zygote && test -S /proc/self/fd/$ANDROID_SOCKET_usap_pool_primary && test \"$ANDROID_SOCKET_zygote\" != \"$ANDROID_SOCKET_usap_pool_primary\""]).status()?;
+        assert!(status.success());
+        assert!(root.join("dev/socket/zygote").exists());
+        drop(sockets);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
     fn classpath_exports_keep_guest_runtime_classpaths_only() -> io::Result<()> {
         let (boot, dex2oat) = classpath_exports(
             "export SYSTEMSERVERCLASSPATH /system/framework/services.jar\nexport BOOTCLASSPATH /apex/com.android.art/javalib/core-oj.jar:/system/framework/framework.jar\nexport DEX2OATBOOTCLASSPATH /apex/com.android.art/javalib/core-oj.jar\n",
@@ -1010,7 +1064,9 @@ mod tests {
             crate::zygote_diagnostics::launch_time(),
             Instant::now(),
         )?);
-        assert!(service.wait_for_socket("ssal_7b_fixture_absent").is_err());
+        assert!(service
+            .wait_for_socket(Path::new("ssal_7b_fixture_absent"))
+            .is_err());
         drop(service);
         let metadata = fs::read_to_string(directory.join("metadata.jsonl"))?;
         let exit: serde_json::Value = serde_json::from_str(metadata.lines().last().unwrap())?;
