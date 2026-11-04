@@ -2,7 +2,7 @@
 use ssal::namespace_mounts::Mounts;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
@@ -75,22 +75,30 @@ pub(crate) fn command(
     Ok(command)
 }
 
-fn zygote_sockets(command: &mut Command, root: &Path) -> io::Result<Vec<UnixListener>> {
+fn zygote_sockets(command: &mut Command, directory: &Path) -> io::Result<Vec<UnixListener>> {
     let mut sockets = Vec::new();
     for name in ["zygote", "usap_pool_primary"] {
-        let socket = UnixListener::bind(root.join("dev/socket").join(name))?;
-        if name == "zygote" {
-            let path = root.join("dev/socket").join(name);
-            let cpath = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())?;
-            if unsafe { libc::chown(cpath.as_ptr(), !0, 1000) } != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            fs::set_permissions(path, fs::Permissions::from_mode(0o660))?;
+        let raw = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+        if raw < 0 {
+            return Err(io::Error::last_os_error());
         }
+        let socket = unsafe { UnixListener::from_raw_fd(raw) };
         let fd = socket.as_raw_fd();
+        let path = directory.join(name);
         command.env(format!("ANDROID_SOCKET_{name}"), fd.to_string());
         unsafe {
             command.pre_exec(move || {
+                let bound = UnixListener::bind(&path)?;
+                if name == "zygote" {
+                    let cpath = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())?;
+                    if libc::chown(cpath.as_ptr(), !0, 1000) != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    fs::set_permissions(&path, fs::Permissions::from_mode(0o660))?;
+                }
+                if libc::dup2(bound.as_raw_fd(), fd) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
                 if libc::fcntl(fd, libc::F_SETFD, 0) != 0 {
                     return Err(io::Error::last_os_error());
                 }
@@ -264,7 +272,7 @@ impl Service {
             command.stdout(output.try_clone()?).stderr(output);
         }
         let sockets = if is_zygote {
-            zygote_sockets(&mut command, root)?
+            zygote_sockets(&mut command, Path::new("/dev/socket"))?
         } else {
             Vec::new()
         };
@@ -1224,7 +1232,7 @@ mod tests {
         unsafe {
             command.pre_exec(ssal::unix::cloexec_unexpected_fds);
         }
-        let sockets = zygote_sockets(&mut command, &root)?;
+        let sockets = zygote_sockets(&mut command, &root.join("dev/socket"))?;
         let status = command.args(["-c", "test -S /proc/self/fd/$ANDROID_SOCKET_zygote && test -S /proc/self/fd/$ANDROID_SOCKET_usap_pool_primary && test \"$ANDROID_SOCKET_zygote\" != \"$ANDROID_SOCKET_usap_pool_primary\""]).status()?;
         assert!(status.success());
         assert!(root.join("dev/socket/zygote").exists());

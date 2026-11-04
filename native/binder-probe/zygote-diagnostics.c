@@ -10,6 +10,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/syscall.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <ucontext.h>
 #if defined(__ANDROID__)
 #include <sys/system_properties.h>
@@ -109,6 +111,22 @@ static void segv(int signal_number, siginfo_t *info, void *context) {
 
 __attribute__((constructor)) static void install_crash_capture(void) {
 #if defined(__ANDROID__)
+    const char *socket_names[] = {"zygote", "usap_pool_primary"};
+    for (size_t i = 0; i < 2; ++i) {
+        char key[80];
+        snprintf(key, sizeof(key), "ANDROID_SOCKET_%s", socket_names[i]);
+        const char *value = getenv(key);
+        if (!value) continue;
+        int fd = atoi(value), type = -1, listening = -1;
+        struct sockaddr_un address = {0};
+        socklen_t length = sizeof(address), option_length = sizeof(int);
+        int result = getsockname(fd, (struct sockaddr *)&address, &length);
+        int error = result ? errno : 0;
+        int type_result = getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &option_length);
+        option_length = sizeof(int);
+        int listen_result = getsockopt(fd, SOL_SOCKET, SO_ACCEPTCONN, &listening, &option_length);
+        dprintf(STDERR_FILENO, "SSAL_SOCKET pid=%d name=%s env=%s getsockname=%d errno=%d family=%d path=%.*s type_result=%d type=%d listen_result=%d listening=%d\n", getpid(), socket_names[i], value, result, error, address.sun_family, (int)sizeof(address.sun_path), address.sun_path, type_result, type, listen_result, listening);
+    }
     // Read in the actual Zygote process, through the same bionic area as Framework JNI.
     const char *keys[] = {"ro.build.version.sdk", "ro.build.version.codename",
                           "ro.build.version.all_codenames"};
