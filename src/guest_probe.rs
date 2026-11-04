@@ -2,7 +2,7 @@
 use std::collections::BTreeSet;
 use std::ffi::CString;
 use std::fs::{self, File};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -298,6 +298,13 @@ pub(crate) fn root_command(root: &Path, executable: &str, pivot: bool) -> io::Re
     let zygote = executable == "/system/bin/app_process64";
     let inherited = ssal::unix::inherited_fds()?;
     let expected = fs::metadata(root)?;
+    let pivot_log = if pivot && std::env::var_os("SSAL_PHASE7FB_FORK").is_some() {
+        Some(File::create(
+            root.parent().unwrap().join("phase7fb/pivot-transition.log"),
+        )?)
+    } else {
+        None
+    };
     if pivot {
         fs::create_dir(root.join(".ssal-old-root"))?;
     }
@@ -333,19 +340,35 @@ pub(crate) fn root_command(root: &Path, executable: &str, pivot: bool) -> io::Re
                     c".ssal-old-root".as_ptr(),
                 ) != 0
                 {
-                    return Err(io::Error::last_os_error());
+                    return Err(io::Error::other(format!(
+                        "Guest pivot_root: {}",
+                        io::Error::last_os_error()
+                    )));
                 }
                 if libc::chdir(c"/".as_ptr()) != 0 {
                     return Err(io::Error::last_os_error());
                 }
-                // Deliberate old-root detachment in this disposable child only.
-                // It includes inherited host submounts; this is not cleanup of
-                // the worker's tracked guest mounts or a claim of their release.
-                if libc::umount2(c"/.ssal-old-root".as_ptr(), libc::MNT_DETACH) != 0 {
-                    return Err(io::Error::last_os_error());
+                // Android may stack mounts at /; detach every old-root layer in this private child.
+                let layers = fs::read_to_string("/proc/self/mountinfo")?
+                    .lines()
+                    .filter(|line| line.split_whitespace().nth(4) == Some("/.ssal-old-root"))
+                    .count();
+                if layers == 0 {
+                    return Err(io::Error::other("old-root mount missing after pivot"));
+                }
+                for _ in 0..layers {
+                    if libc::umount2(c"/.ssal-old-root".as_ptr(), libc::MNT_DETACH) != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
                 }
                 if libc::rmdir(c"/.ssal-old-root".as_ptr()) != 0 {
                     return Err(io::Error::last_os_error());
+                }
+                if let Some(mut log) = pivot_log.as_ref() {
+                    writeln!(
+                        log,
+                        "old_root_layers_detached={layers} old_root_absent=true"
+                    )?;
                 }
             } else {
                 if libc::chroot(root_c.as_ptr()) != 0 {

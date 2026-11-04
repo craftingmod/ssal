@@ -10,6 +10,9 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+mod fork_probe;
+pub(crate) use fork_probe::client as fork_client;
+
 pub(crate) fn command(
     root: &Path,
     executable: &str,
@@ -17,7 +20,10 @@ pub(crate) fn command(
     guest_domain: bool,
 ) -> io::Result<Command> {
     crate::memory_cgroup::check_interrupted()?;
-    let mut command = crate::guest_probe::root_command(root, executable, false)?;
+    // A real Guest mount root also gives Zygote's FD allowlist Guest-relative proc paths.
+    let pivot = executable == "/system/bin/app_process64"
+        && std::env::var_os("SSAL_PHASE7FB_FORK").is_some();
+    let mut command = crate::guest_probe::root_command(root, executable, pivot)?;
     command.env("LD_LIBRARY_PATH", "/run/ssal");
     if executable == "/system/bin/bootstrap/linker64" {
         command.env("LD_LIBRARY_PATH", "/system/lib64/bootstrap:/system/lib64");
@@ -266,6 +272,10 @@ impl Service {
                 )
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
+            if std::env::var_os("SSAL_PHASE7FB_FORK").is_some() {
+                command.env("LD_PRELOAD", "/run/ssal/ssal-phase2-log.so:/run/ssal/ssal-zygote-diag.so:/run/ssal/ssal-zygote-fd-reopen.so")
+                    .env("SSAL_PHASE7FB_FD_REOPEN", "1");
+            }
         } else if diagnostic {
             command.stdout(Stdio::piped()).stderr(Stdio::piped());
         } else {
@@ -872,6 +882,10 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
         println!("PHASE5B=PASS shell=PASS private_aidl=PASS properties=PASS host_control_socket=ABSENT private_binder={major}:{minor}");
         if phase7a {
             server.stop()?;
+            let controlled_fork = std::env::var_os("SSAL_PHASE7FB_FORK").is_some();
+            if controlled_fork {
+                fork_probe::prepare(mounts, root, &bin)?;
+            }
             crate::guest_mounts::directory(root, "data/dalvik-cache", 0o771)?;
             let binary = run(
                 root,
@@ -898,18 +912,31 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
             if let Some(classpath) = dex2oat_classpath.as_deref() {
                 zygote_env.push(("DEX2OATBOOTCLASSPATH", classpath));
             }
+            if controlled_fork {
+                zygote_env.push(("CLASSPATH", "/system/framework/am.jar"));
+            }
             println!(
                 "Guest Zygote launch socket=/dev/socket/zygote start_system_server=false private_binder={major}:{minor}"
             );
             let mut zygote = Service::start(
                 root,
                 "/system/bin/app_process64",
-                &[
-                    "-Xzygote",
-                    "/system/bin",
-                    "--zygote",
-                    "--socket-name=zygote",
-                ],
+                &if controlled_fork {
+                    vec![
+                        "-Xzygote",
+                        "-XX:ForceJavaZygoteForkLoop=true",
+                        "/system/bin",
+                        "--zygote",
+                        "--socket-name=zygote",
+                    ]
+                } else {
+                    vec![
+                        "-Xzygote",
+                        "/system/bin",
+                        "--zygote",
+                        "--socket-name=zygote",
+                    ]
+                },
                 "guest-zygote",
                 0,
                 &zygote_env,
@@ -1064,6 +1091,9 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
                 Path::new(crate::guest_mounts::GUEST_CGROUPS[0].0),
             )?;
             println!("Guest Zygote residence pid={pid} starttime={starttime} seconds=5 membership=verified");
+            if controlled_fork {
+                fork_probe::run(root, &mut zygote)?;
+            }
             zygote.stop()?;
             fs::remove_file(root.join("dev/socket/zygote"))?;
             fs::remove_file(root.join("dev/socket/usap_pool_primary"))?;

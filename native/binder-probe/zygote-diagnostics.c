@@ -4,6 +4,7 @@
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 #include <unistd.h>
 #include <unwind.h>
@@ -19,6 +20,25 @@
 
 static struct sigaction previous_segv;
 static volatile sig_atomic_t capturing;
+
+int selinux_android_setcontext(uid_t uid, int server, const char *seinfo, const char *name) {
+    int (*real_setcontext)(uid_t, int, const char *, const char *) = dlsym(RTLD_NEXT, "selinux_android_setcontext");
+    int (*get_context)(char **) = dlsym(RTLD_NEXT, "getcon");
+    char *original = NULL;
+    int got = get_context ? get_context(&original) : -2;
+    int fd = open("/sys/fs/selinux/context", O_RDWR | O_CLOEXEC);
+    const char *expected = "u:r:ssal_guest_probe:s0";
+    int valid = fd < 0 ? -1 : (int)write(fd, expected, strlen(expected) + 1);
+    int check_error = errno;
+    if (fd >= 0) close(fd);
+    dprintf(2, "SSAL_ORIGINAL_CONTEXT pid=%d getcon=%d label=%s\n", getpid(), got, original ? original : "NULL");
+    free(original);
+    int result = real_setcontext ? real_setcontext(uid, server, seinfo, name) : -1;
+    int error = errno;
+    dprintf(2, "SSAL_SETCONTEXT pid=%d uid=%d server=%d seinfo=%s expected_context_check=%d check_errno=%d result=%d errno=%d\n", getpid(), uid, server, seinfo ? seinfo : "NULL", valid, check_error, result, error);
+    errno = error;
+    return result;
+}
 
 // No allocator, unwinder, or dynamic linker locks on the faulting thread.
 static void number(const char *name, uint64_t value) {
@@ -111,6 +131,17 @@ static void segv(int signal_number, siginfo_t *info, void *context) {
 
 __attribute__((constructor)) static void install_crash_capture(void) {
 #if defined(__ANDROID__)
+    for (unsigned i = 0; i < 2; ++i) {
+        const char *path = i ? "/system/framework/voip-common.jar" : "/run/ssal/fork-probe.jar";
+        int fd = open(path, O_RDONLY | O_CLOEXEC);
+        if (fd >= 0) {
+            char link[64], target[512] = {0};
+            snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+            ssize_t n = readlink(link, target, sizeof(target) - 1);
+            dprintf(STDERR_FILENO, "SSAL_FD_PATH pid=%d opened=%s fd=%d target=%.*s\n", getpid(), path, fd, n > 0 ? (int)n : 0, target);
+            close(fd);
+        }
+    }
     const char *socket_names[] = {"zygote", "usap_pool_primary"};
     for (size_t i = 0; i < 2; ++i) {
         char key[80];

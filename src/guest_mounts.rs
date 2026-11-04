@@ -838,6 +838,21 @@ impl Drop for GuestCgroups {
     }
 }
 
+// Only rmdir descendants of a subtree this worker created, after all children were reaped.
+fn remove_empty_cgroup_children(path: &Path) -> io::Result<()> {
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        if entry.file_type()?.is_symlink() {
+            return Err(io::Error::other("unexpected symlink in Guest cgroup"));
+        }
+        if entry.file_type()?.is_dir() {
+            remove_empty_cgroup_children(&entry.path())?;
+            fs::remove_dir(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
 fn memory_limit(value: Option<&str>) -> io::Result<Option<u64>> {
     value
         .map(|v| {
@@ -1327,6 +1342,14 @@ pub fn verify(
     } else {
         Ok(())
     };
+    let descendants = descendants.and_then(|()| {
+        if mode == "--guest-zygote-7a-worker" && std::env::var_os("SSAL_PHASE7FB_FORK").is_some() {
+            for path in &cgroups.created {
+                remove_empty_cgroup_children(path)?;
+            }
+        }
+        Ok(())
+    });
     if descendants.is_err() {
         cgroups.preserve = true;
     }
@@ -1438,6 +1461,26 @@ mod tests {
         let mut bad = controllers;
         bad["Cgroups"][0]["Path"] = json!("/sys/fs/cgroup/system");
         assert!(processgroup_config(bad, profiles).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn fork_cgroup_cleanup_uses_rmdir_and_rejects_symlinks() -> io::Result<()> {
+        let root = std::env::temp_dir().join(format!("ssal-fork-cgroups-{}", std::process::id()));
+        fs::create_dir_all(root.join("uid_10000/pid_42"))?;
+        remove_empty_cgroup_children(&root)?;
+        assert!(root.is_dir());
+        assert!(!root.join("uid_10000").exists());
+        fs::create_dir(root.join("occupied"))?;
+        fs::write(root.join("occupied/sentinel"), "keep")?;
+        assert!(remove_empty_cgroup_children(&root).is_err());
+        assert_eq!(fs::read_to_string(root.join("occupied/sentinel"))?, "keep");
+        fs::remove_file(root.join("occupied/sentinel"))?;
+        fs::remove_dir(root.join("occupied"))?;
+        symlink("/", root.join("unexpected"))?;
+        assert!(remove_empty_cgroup_children(&root).is_err());
+        fs::remove_file(root.join("unexpected"))?;
+        fs::remove_dir(root)?;
         Ok(())
     }
 
