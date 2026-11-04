@@ -3,7 +3,7 @@ use ssal::namespace_mounts::Mounts;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -79,6 +79,14 @@ fn zygote_sockets(command: &mut Command, root: &Path) -> io::Result<Vec<UnixList
     let mut sockets = Vec::new();
     for name in ["zygote", "usap_pool_primary"] {
         let socket = UnixListener::bind(root.join("dev/socket").join(name))?;
+        if name == "zygote" {
+            let path = root.join("dev/socket").join(name);
+            let cpath = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())?;
+            if unsafe { libc::chown(cpath.as_ptr(), !0, 1000) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            fs::set_permissions(path, fs::Permissions::from_mode(0o660))?;
+        }
         let fd = socket.as_raw_fd();
         command.env(format!("ANDROID_SOCKET_{name}"), fd.to_string());
         unsafe {
@@ -113,6 +121,77 @@ fn run(root: &Path, exe: &str, args: &[&str], uid: u32) -> io::Result<String> {
         )));
     }
     Ok(stdout.into_owned())
+}
+
+pub(crate) fn readiness_client() -> io::Result<()> {
+    let (uid, euid, gid, egid) = unsafe {
+        (
+            libc::getuid(),
+            libc::geteuid(),
+            libc::getgid(),
+            libc::getegid(),
+        )
+    };
+    if (uid, euid, gid, egid) != (1000, 1000, 1000, 1000) {
+        return Err(io::Error::other(format!(
+            "unexpected client credentials uid={uid} euid={euid} gid={gid} egid={egid}"
+        )));
+    }
+    let status = fs::read_to_string("/proc/self/status")?;
+    for name in ["CapInh:", "CapPrm:", "CapEff:", "CapAmb:"] {
+        let value = status
+            .lines()
+            .find_map(|line| line.strip_prefix(name))
+            .ok_or_else(|| io::Error::other("capability status missing"))?;
+        if u64::from_str_radix(value.trim(), 16).unwrap_or(u64::MAX) != 0 {
+            return Err(io::Error::other(format!(
+                "client capability {name}={value}"
+            )));
+        }
+    }
+    let mut socket = match UnixStream::connect("zygote") {
+        Ok(socket) => socket,
+        Err(e)
+            if e.kind() == io::ErrorKind::ConnectionRefused
+                || e.kind() == io::ErrorKind::NotFound =>
+        {
+            eprintln!("connect pending: {e}");
+            std::process::exit(2);
+        }
+        Err(e) => return Err(io::Error::other(format!("connect: {e}"))),
+    };
+    socket.set_read_timeout(Some(Duration::from_secs(30)))?;
+    socket.set_write_timeout(Some(Duration::from_secs(30)))?;
+    query_abi(&mut socket)?;
+    println!("Guest Zygote ABI socket query=arm64-v8a client_pid={} uid={uid} euid={euid} gid={gid} egid={egid} capabilities=0", std::process::id());
+    Ok(())
+}
+
+fn query_abi(socket: &mut UnixStream) -> io::Result<()> {
+    socket
+        .write_all(b"1\n--query-abi-list\n")
+        .map_err(|e| io::Error::other(format!("ABI request: {e}")))?;
+    let mut length = [0; 4];
+    socket
+        .read_exact(&mut length)
+        .map_err(|e| io::Error::other(format!("ABI length: {e}")))?;
+    if u32::from_be_bytes(length) != 9 {
+        return Err(io::Error::other(format!(
+            "invalid ABI response length {}",
+            u32::from_be_bytes(length)
+        )));
+    }
+    let mut abi = [0; 9];
+    socket
+        .read_exact(&mut abi)
+        .map_err(|e| io::Error::other(format!("ABI response: {e}")))?;
+    if &abi != b"arm64-v8a" {
+        return Err(io::Error::other(format!(
+            "unexpected ABI response: {:?}",
+            String::from_utf8_lossy(&abi)
+        )));
+    }
+    Ok(())
 }
 
 struct Service {
@@ -255,19 +334,42 @@ impl Service {
                     "Guest Zygote exited before socket readiness: {log}"
                 )));
             }
-            if let Ok(mut socket) = UnixStream::connect(socket_path) {
-                socket.set_read_timeout(Some(Duration::from_millis(200)))?;
-                socket.set_write_timeout(Some(Duration::from_millis(200)))?;
-                let mut length = [0; 4];
-                if socket.write_all(b"1\n--query-abi-list\n").is_ok()
-                    && socket.read_exact(&mut length).is_ok()
-                    && u32::from_be_bytes(length) == 9
-                {
-                    let mut abi = [0; 9];
-                    if socket.read_exact(&mut abi).is_ok() && &abi == b"arm64-v8a" {
-                        println!("Guest Zygote ABI socket query=arm64-v8a");
-                        return Ok(());
+            if socket_path.exists() {
+                let mut command = Command::new("/proc/self/exe");
+                command
+                    .arg("--zygote-readiness-client")
+                    .current_dir(
+                        socket_path
+                            .parent()
+                            .ok_or_else(|| io::Error::other("socket parent missing"))?,
+                    )
+                    .stdin(Stdio::null());
+                unsafe {
+                    command.pre_exec(|| {
+                        ssal::unix::cloexec_unexpected_fds()?;
+                        if libc::setgroups(0, std::ptr::null()) != 0
+                            || libc::setresgid(1000, 1000, 1000) != 0
+                            || libc::setresuid(1000, 1000, 1000) != 0
+                            || libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
+                        {
+                            return Err(io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+                let output = command.output()?;
+                if output.status.success() {
+                    if self.exited()? {
+                        return Err(io::Error::other("Guest Zygote exited after ABI response"));
                     }
+                    print!("{}", String::from_utf8_lossy(&output.stdout));
+                    return Ok(());
+                }
+                if output.status.code() != Some(2) {
+                    return Err(io::Error::other(format!(
+                        "Guest Zygote readiness client failed: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    )));
                 }
             }
             if Instant::now() >= deadline {
@@ -851,6 +953,109 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
                 "Guest Zygote ready pid={pid} root=Guest uid=0 domain={} isolated_netns=true private_binder_fds={private_binder_fds}",
                 domain.trim_matches('\0').trim()
             );
+            let process_stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
+            let starttime = process_stat
+                .rsplit_once(") ")
+                .and_then(|(_, fields)| fields.split_whitespace().nth(19))
+                .ok_or_else(|| io::Error::other("Zygote starttime missing"))?;
+            let socket = fs::metadata(root.join("dev/socket/zygote"))?;
+            println!(
+                "Guest Zygote socket file inode={} uid={} gid={} mode={:o}",
+                socket.ino(),
+                socket.uid(),
+                socket.gid(),
+                socket.mode() & 0o777
+            );
+            let environ = fs::read(format!("/proc/{pid}/environ"))?;
+            let inherited_sockets: Vec<_> = environ
+                .split(|b| *b == 0)
+                .filter_map(|entry| {
+                    [
+                        b"ANDROID_SOCKET_zygote=".as_slice(),
+                        b"ANDROID_SOCKET_usap_pool_primary=".as_slice(),
+                    ]
+                    .iter()
+                    .find_map(|prefix| {
+                        entry
+                            .strip_prefix(*prefix)
+                            .map(|fd| String::from_utf8_lossy(fd).into_owned())
+                    })
+                })
+                .collect();
+            if inherited_sockets.len() != 2 {
+                return Err(io::Error::other(
+                    "Guest inherited socket environment missing",
+                ));
+            }
+            let mut socket_fds = Vec::new();
+            for fd in fs::read_dir(format!("/proc/{pid}/fd"))? {
+                let fd = fd?;
+                if let Ok(target) = fs::read_link(fd.path()) {
+                    if target.to_string_lossy().starts_with("socket:[") {
+                        println!(
+                            "Guest Zygote fd={} target={}",
+                            fd.file_name().to_string_lossy(),
+                            target.display()
+                        );
+                        if inherited_sockets
+                            .contains(&fd.file_name().to_string_lossy().into_owned())
+                        {
+                            socket_fds.push((fd.file_name(), target));
+                        }
+                    }
+                }
+            }
+            if socket_fds.len() != 2 {
+                return Err(io::Error::other("Guest inherited socket FDs missing"));
+            }
+            for entry in environ
+                .split(|b| *b == 0)
+                .filter(|entry| entry.starts_with(b"ANDROID_SOCKET_"))
+            {
+                println!("Guest Zygote env={}", String::from_utf8_lossy(entry));
+            }
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                crate::memory_cgroup::check_interrupted()?;
+                if let Some(diagnostics) = &mut zygote.diagnostics {
+                    diagnostics.tick()?;
+                }
+                if zygote.exited()? {
+                    return Err(io::Error::other("Guest Zygote exited during residence"));
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            let end_stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
+            let end_starttime = end_stat
+                .rsplit_once(") ")
+                .and_then(|(_, fields)| fields.split_whitespace().nth(19));
+            if end_starttime != Some(starttime) {
+                return Err(io::Error::other(
+                    "Guest Zygote identity changed during residence",
+                ));
+            }
+            if fs::metadata(root.join("dev/socket/zygote"))?.ino() != socket.ino() {
+                return Err(io::Error::other(
+                    "Guest Zygote socket changed during residence",
+                ));
+            }
+            for (fd, target) in &socket_fds {
+                if fs::read_link(format!("/proc/{pid}/fd/{}", fd.to_string_lossy()))
+                    .ok()
+                    .as_ref()
+                    != Some(target)
+                {
+                    return Err(io::Error::other(
+                        "Guest Zygote socket FD changed during residence",
+                    ));
+                }
+            }
+            crate::memory_cgroup::verify_membership(
+                pid,
+                Path::new("/sys/fs/cgroup"),
+                Path::new(crate::guest_mounts::GUEST_CGROUPS[0].0),
+            )?;
+            println!("Guest Zygote residence pid={pid} starttime={starttime} seconds=5 membership=verified");
             zygote.stop()?;
             fs::remove_file(root.join("dev/socket/zygote"))?;
             fs::remove_file(root.join("dev/socket/usap_pool_primary"))?;
@@ -989,6 +1194,27 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn abi_query_requires_valid_response() -> io::Result<()> {
+        for reply in [
+            b"\0\0\0\x09arm64-v8a".as_slice(),
+            b"\0\0\0\x09wrong-abi",
+            b"\0\0\0\x09arm",
+        ] {
+            let (mut client, mut server) = UnixStream::pair()?;
+            server.write_all(reply)?;
+            server.shutdown(std::net::Shutdown::Write)?;
+            assert_eq!(
+                query_abi(&mut client).is_ok(),
+                reply.ends_with(b"arm64-v8a")
+            );
+            let mut request = [0; 19];
+            server.read_exact(&mut request)?;
+            assert_eq!(&request, b"1\n--query-abi-list\n");
+        }
+        Ok(())
+    }
 
     #[test]
     fn zygote_socket_fds_survive_exec() -> io::Result<()> {

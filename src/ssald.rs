@@ -681,6 +681,20 @@ mod daemon {
 #[cfg(unix)]
 fn main() {
     let args: Vec<_> = std::env::args_os().collect();
+    if args
+        .get(1)
+        .is_some_and(|arg| arg == "--zygote-readiness-client")
+    {
+        if args.len() != 2 {
+            eprintln!("invalid readiness client invocation");
+            std::process::exit(1);
+        }
+        if let Err(e) = guest_launcher::readiness_client() {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+        return;
+    }
     #[cfg(feature = "phase2c-diagnostic")]
     if args
         .get(1)
