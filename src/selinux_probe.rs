@@ -301,15 +301,14 @@ fn exec_identity(
     helper: &fs::File,
     expected_ns: &serde_json::Value,
 ) -> io::Result<serde_json::Value> {
+    crate::guest_mounts::require_guest_exec_admission()?;
     use std::os::unix::fs::MetadataExt;
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
     let meta = helper.metadata()?;
     let executable = format!("/proc/self/fd/{}", helper.as_raw_fd());
-    let inherited: Vec<i32> = fs::read_dir("/proc/self/fd")?
-        .filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
-        .filter(|fd| *fd > 2)
-        .collect();
+    let helper_fd = helper.as_raw_fd();
+    let inherited = ssal::unix::inherited_fds()?;
     let mut cmd = Command::new(executable);
     cmd.env_clear()
         .stdin(Stdio::null())
@@ -317,12 +316,7 @@ fn exec_identity(
         .stderr(Stdio::null());
     unsafe {
         cmd.pre_exec(move || {
-            for fd in &inherited {
-                let flags = libc::fcntl(*fd, libc::F_GETFD);
-                if flags >= 0 && libc::fcntl(*fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-            }
+            ssal::unix::close_inherited_fds(&inherited, &[helper_fd])?;
             let fd = libc::open(
                 c"/proc/thread-self/attr/exec".as_ptr(),
                 libc::O_WRONLY | libc::O_CLOEXEC,

@@ -6,6 +6,8 @@
 
 ## Android 빌드
 
+2026-11-04 공통 Guest Service Launcher에서도 기존 server/client를 재사용한다. 새 `inspect-data-service installd|artd` 모드는 Private Binder에서 서비스 조회 및 `INTERFACE_TRANSACTION` descriptor 응답만 검사한다. [공통 런처 결과](../../docs/guest-service-launcher-common-results.md) 참고.
+
 Windows PowerShell과 Android NDK r30 예시:
 
 ```powershell

@@ -60,8 +60,34 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         Some("client") => client(),
         Some("death-client") => death_client(),
         Some("check-absent") => check_absent(),
+        Some("inspect-data-service") => inspect_data_service(args.next().as_deref()),
         _ => Err("usage: phase3-ipc server|client|death-client|check-absent".into()),
     }
+}
+
+fn inspect_data_service(name: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    let (name, expected) = match name {
+        Some("installd") => ("installd", "android.os.IInstalld"),
+        Some("artd") => ("artd", "com.android.server.art.IArtd"),
+        _ => return Err("expected installd or artd".into()),
+    };
+    init()?;
+    let service = hub::default()?
+        .check_service(name)
+        .ok_or("Guest data service not registered")?;
+    let remote = service.as_remote().ok_or("expected remote service")?;
+    let mut reply = remote
+        .submit_transact(INTERFACE_TRANSACTION, &Parcel::new(), 0)?
+        .ok_or("descriptor transaction returned no reply")?;
+    let descriptor: String = reply.read()?;
+    if descriptor != expected {
+        return Err(format!("unexpected {name} descriptor: {descriptor}").into());
+    }
+    println!(
+        "{}",
+        json!({"event":"data_service_descriptor_passed", "service":name, "descriptor":descriptor, "identity":identity()})
+    );
+    Ok(())
 }
 
 fn init() -> Result<(), Box<dyn std::error::Error>> {

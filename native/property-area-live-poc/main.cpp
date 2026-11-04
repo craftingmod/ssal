@@ -311,6 +311,36 @@ struct ProcComponentResult {
   char target[256] = {};
 };
 
+struct HostProcBoundary {
+  unsigned int pid = 0;
+  int root_open_errno = -1;
+  int fd_dir_open_errno = -1;
+  int fd_read_errno = -1;
+  int signal_zero_errno = -1;
+  bool root_opened = false;
+  bool fd_dir_opened = false;
+  bool fd_read_succeeded = false;
+  bool signal_zero_allowed = false;
+};
+
+struct GuestRuntimeBoundary {
+  unsigned long long guest_data_dev = 0;
+  unsigned long long guest_data_ino = 0;
+  unsigned long long guest_binder_rdev = 0;
+  unsigned long long host_binder_rdev = 0;
+  int guest_data_errno = 0;
+  int guest_binder_errno = 0;
+  int property_area_errno = 0;
+  int property_socket_errno = 0;
+  bool guest_data_matches_profile = false;
+  bool guest_data_differs_host = false;
+  bool guest_data_write_read_unlink = false;
+  bool guest_binder_private = false;
+  bool guest_binder_opened = false;
+  bool guest_property_area_differs_host = false;
+  bool guest_property_socket_absent = false;
+};
+
 void json_string(const char* value) {
   putchar('"');
   for (const unsigned char* cursor = reinterpret_cast<const unsigned char*>(value);
@@ -399,6 +429,164 @@ void probe_proc_component(ProcComponentResult* result, bool is_symlink) {
   }
 }
 
+bool probe_host_proc_boundaries(HostProcBoundary* results, size_t capacity,
+                                size_t* result_count) {
+  // O_PATH and getdents inspect procfs reachability without opening Host FD targets.
+  const char* cursor = getenv("SSAL_HOST_CORE_PIDS");
+  if (cursor == nullptr || *cursor == '\0') return false;
+  *result_count = 0;
+  while (*cursor != '\0') {
+    if (*result_count == capacity) return false;
+    char* end = nullptr;
+    errno = 0;
+    const unsigned long parsed = strtoul(cursor, &end, 10);
+    if (errno != 0 || end == cursor || parsed == 0 || parsed > 0x7fffffffUL ||
+        (*end != '\0' && *end != ',')) {
+      return false;
+    }
+    HostProcBoundary& result = results[(*result_count)++];
+    result.pid = static_cast<unsigned int>(parsed);
+
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%u/root", result.pid);
+    const long root_fd = syscall(SYS_openat, AT_FDCWD, path, O_PATH | O_CLOEXEC, 0);
+    if (root_fd < 0) {
+      result.root_open_errno = errno;
+    } else {
+      result.root_opened = true;
+      result.root_open_errno = 0;
+      (void)syscall(SYS_close, static_cast<int>(root_fd));
+    }
+
+    snprintf(path, sizeof(path), "/proc/%u/fd", result.pid);
+    const long fd_dir = syscall(SYS_openat, AT_FDCWD, path,
+                                O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
+    if (fd_dir < 0) {
+      result.fd_dir_open_errno = errno;
+    } else {
+      result.fd_dir_opened = true;
+      result.fd_dir_open_errno = 0;
+      char entries[4096];
+      const long read_result = syscall(SYS_getdents64, static_cast<int>(fd_dir),
+                                       entries, sizeof(entries));
+      if (read_result < 0) {
+        result.fd_read_errno = errno;
+      } else {
+        result.fd_read_succeeded = true;
+        result.fd_read_errno = 0;
+      }
+      (void)syscall(SYS_close, static_cast<int>(fd_dir));
+    }
+
+    const long signal_check = syscall(SYS_kill, result.pid, 0);
+    result.signal_zero_errno = signal_check < 0 ? errno : 0;
+    result.signal_zero_allowed = signal_check == 0;
+    if (*end == ',') {
+      cursor = end + 1;
+      if (*cursor == '\0') return false;
+    } else {
+      cursor = end;
+    }
+  }
+  return *result_count != 0;
+}
+
+bool env_number(const char* name, unsigned long long* output) {
+  const char* value = getenv(name);
+  if (value == nullptr || *value == '\0') return false;
+  char* end = nullptr;
+  errno = 0;
+  const unsigned long long parsed = strtoull(value, &end, 10);
+  if (errno != 0 || end == value || *end != '\0') return false;
+  *output = parsed;
+  return true;
+}
+
+GuestRuntimeBoundary probe_guest_runtime_boundaries() {
+  GuestRuntimeBoundary result;
+  unsigned long long expected_data_dev = 0, expected_data_ino = 0;
+  unsigned long long host_data_dev = 0, host_data_ino = 0;
+  const bool expected_data = env_number("SSAL_GUEST_DATA_DEV", &expected_data_dev) &&
+                             env_number("SSAL_GUEST_DATA_INO", &expected_data_ino);
+  const bool host_data = env_number("SSAL_HOST_DATA_DEV", &host_data_dev) &&
+                         env_number("SSAL_HOST_DATA_INO", &host_data_ino);
+  struct stat data {};
+  if (expected_data && host_data && stat("/data", &data) == 0) {
+    result.guest_data_dev = static_cast<unsigned long long>(data.st_dev);
+    result.guest_data_ino = static_cast<unsigned long long>(data.st_ino);
+    result.guest_data_matches_profile = result.guest_data_dev == expected_data_dev &&
+                                        result.guest_data_ino == expected_data_ino;
+    result.guest_data_differs_host = result.guest_data_dev != host_data_dev ||
+                                     result.guest_data_ino != host_data_ino;
+  } else {
+    result.guest_data_errno = errno == 0 ? EINVAL : errno;
+  }
+
+  char marker[128];
+  snprintf(marker, sizeof(marker), "/data/local/tmp/.ssal-phase5a-child-%d", getpid());
+  const int marker_fd = open(marker, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600);
+  if (marker_fd < 0) {
+    result.guest_data_errno = errno;
+  } else {
+    constexpr char value[] = "guest-data-ok";
+    char readback[sizeof(value)] = {};
+    const bool wrote = write(marker_fd, value, sizeof(value) - 1) ==
+                           static_cast<ssize_t>(sizeof(value) - 1) &&
+                       fsync(marker_fd) == 0 && lseek(marker_fd, 0, SEEK_SET) == 0;
+    const bool read_ok = wrote && read(marker_fd, readback, sizeof(value) - 1) ==
+                                      static_cast<ssize_t>(sizeof(value) - 1) &&
+                         memcmp(readback, value, sizeof(value) - 1) == 0;
+    const int saved_errno = errno;
+    close(marker_fd);
+    const bool removed = unlink(marker) == 0;
+    result.guest_data_write_read_unlink = read_ok && removed;
+    if (!result.guest_data_write_read_unlink) {
+      result.guest_data_errno = saved_errno == 0 ? EIO : saved_errno;
+    }
+  }
+
+  if (!env_number("SSAL_HOST_BINDER_RDEV", &result.host_binder_rdev)) {
+    result.guest_binder_errno = EINVAL;
+  } else {
+    struct stat binder {};
+    if (stat("/dev/binder", &binder) != 0) {
+      result.guest_binder_errno = errno;
+    } else if (!S_ISCHR(binder.st_mode)) {
+      result.guest_binder_errno = ENODEV;
+    } else {
+      result.guest_binder_rdev = static_cast<unsigned long long>(binder.st_rdev);
+      result.guest_binder_private = result.guest_binder_rdev != result.host_binder_rdev;
+      const int binder_fd = open("/dev/binder", O_RDWR | O_CLOEXEC);
+      if (binder_fd < 0) {
+        result.guest_binder_errno = errno;
+      } else {
+        struct stat opened {};
+        result.guest_binder_opened = fstat(binder_fd, &opened) == 0 &&
+                                     static_cast<unsigned long long>(opened.st_rdev) ==
+                                         result.guest_binder_rdev;
+        close(binder_fd);
+      }
+    }
+  }
+
+  unsigned long long host_property_dev = 0, host_property_ino = 0;
+  struct stat property_area {};
+  if (!env_number("SSAL_HOST_DIR_DEV", &host_property_dev) ||
+      !env_number("SSAL_HOST_DIR_INO", &host_property_ino) ||
+      stat(kPropertyDirectory, &property_area) != 0) {
+    result.property_area_errno = errno == 0 ? EINVAL : errno;
+  } else {
+    result.guest_property_area_differs_host =
+        static_cast<unsigned long long>(property_area.st_dev) != host_property_dev ||
+        static_cast<unsigned long long>(property_area.st_ino) != host_property_ino;
+  }
+  struct stat property_socket {};
+  result.guest_property_socket_absent =
+      lstat("/dev/socket/property_service", &property_socket) != 0 && errno == ENOENT;
+  result.property_socket_errno = result.guest_property_socket_absent ? ENOENT : errno;
+  return result;
+}
+
 bool path_resolution_errno(int error) {
   return error == ENOENT || error == ENOTDIR || error == ELOOP;
 }
@@ -468,6 +656,11 @@ bool proc_only_probe() {
                             strcmp(components[i].path, "/proc/self") == 0;
     probe_proc_component(&components[i], is_symlink);
   }
+  HostProcBoundary host_paths[16] = {};
+  size_t host_path_count = 0;
+  const bool host_paths_valid = probe_host_proc_boundaries(
+      host_paths, sizeof(host_paths) / sizeof(host_paths[0]), &host_path_count);
+  const GuestRuntimeBoundary runtime = probe_guest_runtime_boundaries();
 
   char actual_sid[256] = "unavailable";
   for (const ProcPathResult& result : paths) {
@@ -508,8 +701,8 @@ bool proc_only_probe() {
   printf("{\"protocol\":1,\"pid\":%d,\"context\":", pid);
   json_string(actual_sid);
   printf(",\"executable_dev\":0,\"executable_ino\":0,\"proc_only\":{"
-         "\"status\":\"complete\",\"tid\":%ld,\"actual_sid\":",
-         tid);
+         "\"status\":\"%s\",\"tid\":%ld,\"actual_sid\":",
+         host_paths_valid ? "complete" : "incomplete", tid);
   json_string(actual_sid);
   printf(",\"first_open_errno\":%d,\"path_resolution_failure\":%s,"
          "\"failure_class\":\"%s\",\"results\":[",
@@ -544,7 +737,34 @@ bool proc_only_probe() {
     json_string(components[i].target);
     putchar('}');
   }
-  puts("]}}");
+  printf("],\"host_paths\":[");
+  for (size_t i = 0; i < host_path_count; ++i) {
+    if (i != 0) putchar(',');
+    const HostProcBoundary& result = host_paths[i];
+    printf("{\"pid\":%u,\"root_open_errno\":%d,\"root_opened\":%s,"
+           "\"fd_dir_open_errno\":%d,\"fd_dir_opened\":%s,"
+           "\"fd_read_errno\":%d,\"fd_read_succeeded\":%s,"
+           "\"signal_zero_errno\":%d,\"signal_zero_allowed\":%s}",
+           result.pid, result.root_open_errno, result.root_opened ? "true" : "false",
+           result.fd_dir_open_errno, result.fd_dir_opened ? "true" : "false",
+           result.fd_read_errno, result.fd_read_succeeded ? "true" : "false",
+           result.signal_zero_errno, result.signal_zero_allowed ? "true" : "false");
+  }
+  printf("],\"runtime\":{\"guest_data\":{\"dev\":%llu,\"ino\":%llu,"
+         "\"matches_profile\":%s,\"differs_host_data\":%s,\"write_read_unlink\":%s,\"errno\":%d},"
+         "\"guest_binder\":{\"rdev\":%llu,\"host_rdev\":%llu,\"private\":%s,\"opened\":%s,\"errno\":%d},"
+         "\"guest_property_area_differs_host\":%s,\"guest_property_socket_absent\":%s,"
+         "\"property_area_errno\":%d,\"property_socket_errno\":%d}}}\n",
+         runtime.guest_data_dev, runtime.guest_data_ino,
+         runtime.guest_data_matches_profile ? "true" : "false",
+         runtime.guest_data_differs_host ? "true" : "false",
+         runtime.guest_data_write_read_unlink ? "true" : "false", runtime.guest_data_errno,
+         runtime.guest_binder_rdev, runtime.host_binder_rdev,
+         runtime.guest_binder_private ? "true" : "false",
+         runtime.guest_binder_opened ? "true" : "false", runtime.guest_binder_errno,
+         runtime.guest_property_area_differs_host ? "true" : "false",
+         runtime.guest_property_socket_absent ? "true" : "false",
+         runtime.property_area_errno, runtime.property_socket_errno);
   return true;
 }
 

@@ -84,8 +84,10 @@ mod tests {
     fn probe_timeout_stops_background_process_group() -> io::Result<()> {
         let mut cmd = Command::new("/bin/sh");
         cmd.args(["-c", "sleep 30 & wait"]);
+        let inherited = ssal::unix::inherited_fds()?;
         unsafe {
-            cmd.pre_exec(|| {
+            cmd.pre_exec(move || {
+                ssal::unix::close_inherited_fds(&inherited, &[])?;
                 if libc::setsid() < 0 {
                     return Err(io::Error::last_os_error());
                 }
@@ -109,8 +111,20 @@ mod tests {
         let directory = File::open(&sentinel)?;
         let fd = directory.as_raw_fd();
         assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFD, 0) }, 0);
-        let mut cmd = command(Path::new("/"), "/bin/sh", false)?;
+        let root = cpath(Path::new("/"))?;
+        let inherited = ssal::unix::inherited_fds()?;
+        let mut cmd = Command::new("/bin/sh");
+        cmd.env_clear();
         cmd.args(["-c", "test \"$(pwd)\" = /; test ! /proc/self/fd/\"$1\" -ef \"$2\" || exit 1; printf 'root and inherited FD checks OK'", "probe", &fd.to_string(), sentinel.to_str().unwrap()]);
+        unsafe {
+            cmd.pre_exec(move || {
+                ssal::unix::close_inherited_fds(&inherited, &[])?;
+                if libc::chroot(root.as_ptr()) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                std::env::set_current_dir("/")
+            });
+        }
         let output = run(&mut cmd, "chroot FD regression")?;
         drop(directory);
         fs::remove_dir(sentinel)?;
@@ -217,12 +231,13 @@ fn cpath(path: &Path) -> io::Result<CString> {
 }
 
 pub(crate) fn command(root: &Path, executable: &str, pivot: bool) -> io::Result<Command> {
+    crate::guest_mounts::require_guest_exec_admission()?;
+    root_command(root, executable, pivot)
+}
+
+pub(crate) fn root_command(root: &Path, executable: &str, pivot: bool) -> io::Result<Command> {
     let root_c = cpath(root)?;
-    // Capture parent descriptors before spawn creates its own CLOEXEC pipes.
-    let inherited: Vec<i32> = fs::read_dir("/proc/self/fd")?
-        .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
-        .filter(|fd| *fd > 2)
-        .collect();
+    let inherited = ssal::unix::inherited_fds()?;
     let expected = fs::metadata(root)?;
     if pivot {
         fs::create_dir(root.join(".ssal-old-root"))?;
@@ -233,14 +248,10 @@ pub(crate) fn command(root: &Path, executable: &str, pivot: bool) -> io::Result<
         .env("PATH", "/system/bin:/apex/com.android.runtime/bin");
     unsafe {
         command.pre_exec(move || {
+            ssal::unix::close_inherited_fds(&inherited, &[])?;
+            ssal::unix::cloexec_unexpected_fds()?;
             if libc::setsid() < 0 {
                 return Err(io::Error::last_os_error());
-            }
-            for fd in &inherited {
-                let flags = libc::fcntl(*fd, libc::F_GETFD);
-                if flags >= 0 && libc::fcntl(*fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) < 0 {
-                    return Err(io::Error::last_os_error());
-                }
             }
             if pivot {
                 if libc::unshare(libc::CLONE_NEWNS) != 0 {
@@ -302,26 +313,20 @@ pub(crate) fn command(root: &Path, executable: &str, pivot: bool) -> io::Result<
 
 #[cfg(feature = "phase2c-diagnostic")]
 pub(crate) fn command_for_phase2c(root: &Path, executable: &str) -> io::Result<Command> {
+    crate::guest_mounts::require_guest_exec_admission()?;
     let root_c = cpath(root)?;
     let expected = fs::metadata(root)?;
-    let inherited: Vec<i32> = fs::read_dir("/proc/self/fd")?
-        .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
-        .filter(|fd| *fd > 2)
-        .collect();
+    let inherited = ssal::unix::inherited_fds()?;
     let mut command = Command::new(executable);
     command
         .env_clear()
         .env("PATH", "/system/bin:/apex/com.android.runtime/bin");
     unsafe {
         command.pre_exec(move || {
+            ssal::unix::close_inherited_fds(&inherited, &[])?;
+            ssal::unix::cloexec_unexpected_fds()?;
             if libc::setsid() < 0 {
                 return Err(io::Error::last_os_error());
-            }
-            for fd in &inherited {
-                let flags = libc::fcntl(*fd, libc::F_GETFD);
-                if flags >= 0 && libc::fcntl(*fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) < 0 {
-                    return Err(io::Error::last_os_error());
-                }
             }
             let context = c"u:r:shell:s0";
             let fd = libc::open(
@@ -605,23 +610,17 @@ fn diagnostics(root: &Path) -> io::Result<()> {
             Err(e) => println!("guest context /{relative}: unavailable: {e}"),
         }
     }
-    for relative in [
-        "dev/binder",
-        "dev/hwbinder",
-        "dev/vndbinder",
-        "dev/__properties__",
-    ] {
-        if let (Ok(host), Ok(guest)) = (
-            fs::metadata(Path::new("/").join(relative)),
-            crate::guest_mounts::guest_path(root, relative).and_then(fs::metadata),
-        ) {
-            println!(
-                "shared runtime /{relative}: same backing={}",
-                (host.dev(), host.ino(), host.rdev()) == (guest.dev(), guest.ino(), guest.rdev())
-            );
-        }
+    if root.join("dev/__properties__").exists()
+        || root.join("dev/socket/property_service").exists()
+        || root.join("dev/socket/property_service_for_system").exists()
+    {
+        return Err(io::Error::other(
+            "Host property area or socket is visible in Guest /dev",
+        ));
     }
-    println!("property area shared; /dev/socket/property_service masked={}; guest property service is not implemented", !root.join("dev/socket/property_service").exists());
+    println!(
+        "Host property area and sockets absent; Guest property service/area is not implemented"
+    );
     println!("service gate: Binder/property isolation, guest installd/artd/vold, FUSE permissions and init are NOT validated; no Android services started");
     Ok(())
 }

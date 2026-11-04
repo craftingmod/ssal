@@ -134,7 +134,10 @@ mod tests {
             "BBinder",
         ]
         .map(str::to_owned);
-        assert_eq!(parse_args(&guest_path).unwrap().expected_descriptor, "BBinder");
+        assert_eq!(
+            parse_args(&guest_path).unwrap().expected_descriptor,
+            "BBinder"
+        );
         assert!(validate_kind_path(ProbeKind::Guest, &parse_args(&guest_path).unwrap()).is_ok());
         assert!(validate_kind_path(ProbeKind::Host, &parse_args(&guest_path).unwrap()).is_err());
     }

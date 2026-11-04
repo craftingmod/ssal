@@ -4,4 +4,16 @@
 
 ## WARNING
 
-vendor/ code has huge codebase so don't read unless explicit request.
+vendor has huge codebase so don't read unless explicit request.
+
+## Rule
+
+- Run WSL and WSLc commands outside the sandbox.
+- Prioritize incremental runtime validation and first boot over exhaustive preemptive hardening. Avoid blocking all progress on unverified risks.
+
+### SELinux Experimental Policy
+
+- Missing Guest-only SELinux types, attributes, or permissions are implementation tasks, not automatic NO-GO conditions. Prepare the minimal policy delta and continue validation when Host isolation boundaries remain intact.
+- Prefer controlled runtime experiments with Guest-specific permissive domains for AVC collection. Keep Host enforcing and do not grant new broad permissions to existing Host domains.
+- Stop only for demonstrated Host safety violations, unresolved policy conflicts, or changes that cannot be safely contained under the approved experimental boundaries. Report static warnings separately from runtime failures.
+

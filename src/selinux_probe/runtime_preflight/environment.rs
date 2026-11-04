@@ -155,6 +155,7 @@ impl Drop for Masks {
 }
 
 fn run_identity(root: &Path, private_rdev: u64, host_rdev: u64) -> io::Result<Value> {
+    crate::guest_mounts::require_guest_exec_admission()?;
     let mut command = Command::new(std::env::current_exe()?);
     command
         .arg("--runtime-credentials-worker")
@@ -166,19 +167,11 @@ fn run_identity(root: &Path, private_rdev: u64, host_rdev: u64) -> io::Result<Va
         .env("ANDROID_ROOT", "/system")
         .env("ANDROID_DATA", "/data")
         .stdin(Stdio::null());
-    let inherited: Vec<i32> = fs::read_dir("/proc/self/fd")?
-        .filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
-        .filter(|fd| *fd > 2)
-        .collect();
+    let inherited = ssal::unix::inherited_fds()?;
     unsafe {
         command.pre_exec(move || {
             syscall_result(libc::setpgid(0, 0))?;
-            for fd in &inherited {
-                let flags = libc::fcntl(*fd, libc::F_GETFD);
-                if flags >= 0 {
-                    syscall_result(libc::fcntl(*fd, libc::F_SETFD, flags | libc::FD_CLOEXEC))?;
-                }
-            }
+            ssal::unix::close_inherited_fds(&inherited, &[])?;
             Ok(())
         });
     }

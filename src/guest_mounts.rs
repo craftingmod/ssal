@@ -5,10 +5,10 @@ pub(crate) use ssal::namespace_mounts::guest_path;
 use ssal::namespace_mounts::require_private_mounts;
 use ssal::namespace_mounts::{inject_compat_file, mount, Mounts};
 use std::ffi::CString;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{symlink, FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -19,6 +19,21 @@ fn cpath(path: &Path) -> io::Result<CString> {
 
 const PROFILE: &str = include_str!("../module/profiles/mounts/initial.json");
 pub const PROFILE_NAME: &str = "initial-shared-dev";
+const GUEST_DEVICE_NODES: [(&str, u32, u32); 4] = [
+    ("null", 1, 3),
+    ("zero", 1, 5),
+    ("random", 1, 8),
+    ("urandom", 1, 9),
+];
+const GUEST_DEV_ENTRIES: [&str; 7] = [
+    "binderfs", "block", "null", "random", "socket", "urandom", "zero",
+];
+
+pub(crate) fn require_guest_exec_admission() -> io::Result<()> {
+    Err(io::Error::other(
+        "Automatic Guest launch is disabled; use the explicit disposable --guest-service-worker launcher",
+    ))
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -73,7 +88,7 @@ fn profile() -> io::Result<Profile> {
             != [
                 ("system", "registered-image-ro"),
                 ("data", "profile-userdata-rw"),
-                ("dev", "host-rbind-private"),
+                ("dev", "guest-tmpfs-minimal"),
                 ("proc", "fresh-proc"),
                 ("sys", "fresh-sysfs-ro"),
                 ("apex", "payload-ext4-ro"),
@@ -105,7 +120,7 @@ fn profile() -> io::Result<Profile> {
 pub fn description() -> io::Result<String> {
     let p = profile()?;
     let services = crate::service_contract::blocked_summary()?;
-    Ok(format!("mount profile: {} (built-in v{})\nrootfs: composed system RO, profile userdata RW, private mnt/storage/data_mirror\nruntime: tmp/cache RW tmpfs; metadata/config empty RO tmpfs; no host metadata/configfs\ndevices: shared host /dev, isolated socket/block paths; Binder/properties/cgroups/BPF shared\nAPEX: guest/vendor payload ext4 RO; guest linkerconfig required\nprepare requires chroot/pivot_root shell and profile write/read checks\nguest services, FUSE access control, VINTF and SELinux compatibility: not certified\n{services}", p.name, p.version))
+    Ok(format!("mount profile: {} (built-in v{})\nrootfs: composed system RO, profile userdata RW, private mnt/storage/data_mirror\nruntime: tmp/cache RW tmpfs; metadata/config empty RO tmpfs; no host metadata/configfs\ndevices: fresh Guest /dev with null/zero/random/urandom; Guest child/cgroup workers additionally bind Guest-only cgroup subtrees; no Host Binder, properties, sockets, cgroup roots or BPF bind\nGuest executable admission: BLOCKED until Host proc/root, exec-FD and signal/ptrace boundaries pass\nAPEX: guest/vendor payload ext4 RO; Guest linkerconfig not executed\nGuest property service, Android services, FUSE access control, VINTF and SELinux compatibility: not certified\n{services}", p.name, p.version))
 }
 
 // Reject symlinks at every directory component, including persistent userdata.
@@ -151,6 +166,105 @@ fn same_directory(source: &Path, target: &Path) -> io::Result<()> {
             target.display()
         )));
     }
+    Ok(())
+}
+
+fn bind_guest_device(
+    mounts: &mut Mounts,
+    dev: &Path,
+    name: &str,
+    major: u32,
+    minor: u32,
+) -> io::Result<()> {
+    let source = Path::new("/dev").join(name);
+    let source_entry = fs::symlink_metadata(&source)?;
+    if !source_entry.file_type().is_char_device()
+        || source_entry.rdev() != libc::makedev(major, minor)
+        || (
+            source_entry.uid(),
+            source_entry.gid(),
+            source_entry.mode() & 0o7777,
+        ) != (0, 0, 0o666)
+    {
+        return Err(io::Error::other(format!(
+            "unsafe Host /dev/{name}: expected char {major}:{minor}, root:root 0666"
+        )));
+    }
+    let source_file = File::open(&source)?;
+    let source_mount = ssal::unix::fd_mount_id(&source_file)?;
+    let target = dev.join(name);
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&target)?;
+    mounts.bind(&source, &target, false, false)?;
+    let guest_file = File::open(&target)?;
+    let guest = guest_file.metadata()?;
+    let host = source_file.metadata()?;
+    let guest_mount = ssal::unix::fd_mount_id(&guest_file)?;
+    if !guest.file_type().is_char_device()
+        || (
+            guest.dev(),
+            guest.ino(),
+            guest.rdev(),
+            guest.uid(),
+            guest.gid(),
+            guest.mode() & 0o7777,
+        ) != (
+            host.dev(),
+            host.ino(),
+            host.rdev(),
+            host.uid(),
+            host.gid(),
+            host.mode() & 0o7777,
+        )
+        || source_mount == guest_mount
+    {
+        return Err(io::Error::other(format!(
+            "Guest /dev/{name} identity, permissions or bind-mount scope mismatch"
+        )));
+    }
+    let label = ssal::unix::image_context(&guest_file)
+        .unwrap_or_else(|error| format!("unavailable: {error}"));
+    println!(
+        "Guest device /dev/{name}: rdev={major}:{minor} uid={} gid={} mode={:o} label={label} host_mount={source_mount} guest_mount={guest_mount}",
+        guest.uid(),
+        guest.gid(),
+        guest.mode() & 0o7777
+    );
+    Ok(())
+}
+
+fn prepare_guest_dev(mounts: &mut Mounts, root: &Path) -> io::Result<()> {
+    let dev = root.join("dev");
+    mounts.attach(
+        Path::new("tmpfs"),
+        &dev,
+        Some("tmpfs"),
+        libc::MS_NOSUID | libc::MS_NOEXEC,
+        "mode=0755,size=4m",
+    )?;
+    for path in ["socket", "block", "binderfs"] {
+        directory(&dev, path, 0o755)?;
+    }
+    for (name, major, minor) in GUEST_DEVICE_NODES {
+        bind_guest_device(mounts, &dev, name, major, minor)?;
+    }
+    let actual: std::collections::BTreeSet<String> = fs::read_dir(&dev)?
+        .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
+        .collect::<io::Result<_>>()?;
+    let expected = GUEST_DEV_ENTRIES.into_iter().map(str::to_owned).collect();
+    if actual != expected
+        || fs::read_dir(dev.join("socket"))?.next().is_some()
+        || dev.join("__properties__").exists()
+        || dev.join("binder-control").exists()
+        || dev.join("binderfs/binder-control").exists()
+    {
+        return Err(io::Error::other(
+            "Guest /dev contains an unapproved entry or Host property endpoint",
+        ));
+    }
+    println!("Guest /dev allowlist verified: null, zero, random, urandom; Host Binder/property/Binder-control/HAL nodes absent");
     Ok(())
 }
 
@@ -458,7 +572,7 @@ fn apex(
     Ok(())
 }
 
-fn linkerconfig_binary(root: &Path) -> io::Result<&'static str> {
+pub(crate) fn linkerconfig_binary(root: &Path) -> io::Result<&'static str> {
     for binary in [
         "/apex/com.android.runtime/bin/linkerconfig",
         "/system/bin/linkerconfig",
@@ -482,18 +596,9 @@ fn linkerconfig_binary(root: &Path) -> io::Result<&'static str> {
 fn linkerconfig(root: &Path) -> io::Result<()> {
     let binary = linkerconfig_binary(root)?;
     println!("guest linkerconfig executable: {binary}");
-    let guest_root = cpath(root)?;
-    let mut command = Command::new(binary);
+    let mut command = crate::guest_probe::command(root, binary, false)?;
     command.args(["--target", "/linkerconfig"]);
-    unsafe {
-        command.pre_exec(move || {
-            if libc::chroot(guest_root.as_ptr()) != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            std::env::set_current_dir("/")
-        });
-    }
-    let output = command.env_clear().env("PATH", "/system/bin").output()
+    let output = command.output()
         .map_err(|e| io::Error::new(e.kind(), format!("execute {binary} inside {}: {e}; guest executable was found; check its ELF interpreter path and chroot setup", root.display())))?;
     if !output.status.success()
         || fs::metadata(root.join("linkerconfig/ld.config.txt"))
@@ -623,6 +728,280 @@ fn code_bridges(mounts: &mut Mounts, root: &Path, patch_dir: &Path) -> io::Resul
     Ok(())
 }
 
+pub(crate) const GUEST_CGROUPS: [(&str, &str); 4] = [
+    ("/sys/fs/cgroup/apps/ssal_guest", "sys/fs/cgroup"),
+    ("/dev/cpuctl/ssal_guest", "dev/cpuctl"),
+    ("/dev/cpuset/ssal_guest", "dev/cpuset"),
+    ("/dev/blkio/ssal_guest", "dev/blkio"),
+];
+
+#[derive(Default)]
+struct GuestCgroups {
+    created: Vec<PathBuf>,
+}
+
+impl GuestCgroups {
+    fn create(&mut self, path: &Path) -> io::Result<()> {
+        // Never adopt an existing subtree: it may belong to another session.
+        fs::create_dir(path)?;
+        self.created.push(path.to_owned());
+        Ok(())
+    }
+
+    fn prepare(&mut self, mounts: &mut Mounts, root: &Path) -> io::Result<()> {
+        ssal::namespace_mounts::require_private_mounts(&fs::read_to_string(
+            "/proc/self/mountinfo",
+        )?)?;
+        for (source, target) in GUEST_CGROUPS {
+            let source = Path::new(source);
+            let parent = source.parent().unwrap();
+            if fs::canonicalize(parent)? != parent {
+                return Err(io::Error::other("cgroup parent contains a symlink"));
+            }
+            self.create(source)?;
+            if target == "dev/cpuset" {
+                for name in ["cpus", "mems"] {
+                    let value = fs::read_to_string(parent.join(name))?;
+                    if value.trim().is_empty() {
+                        return Err(io::Error::other("empty parent cpuset configuration"));
+                    }
+                    fs::write(source.join(name), value)?;
+                }
+            }
+            // sysfs is read-only; its existing cgroup mountpoint needs no mkdir.
+            let target = if target == "sys/fs/cgroup" {
+                guest_path(root, target)?
+            } else {
+                directory(root, target, 0o755)?
+            };
+            mounts.bind(source, &target, false, false)?;
+            same_directory(source, &target)?;
+            println!(
+                "Guest cgroup bind: {} -> {}",
+                source.display(),
+                target.display()
+            );
+        }
+        Ok(())
+    }
+
+    fn cleanup(&mut self) -> io::Result<()> {
+        let mut errors = Vec::new();
+        for path in std::mem::take(&mut self.created).into_iter().rev() {
+            // rmdir only: occupied or unexpected child groups must remain visible as failures.
+            if let Err(error) = fs::remove_dir(&path) {
+                errors.push(format!("{}: {error}", path.display()));
+                self.created.push(path);
+            }
+        }
+        self.created.reverse();
+        if !errors.is_empty() {
+            return Err(io::Error::other(errors.join("; ")));
+        }
+        Ok(())
+    }
+}
+
+fn guest_cgroup_probe(root: &Path) -> io::Result<()> {
+    let poc = std::env::var("SSAL_GUEST_CHILD_POC")
+        .map_err(|_| io::Error::other("SSAL_GUEST_CHILD_POC is required"))?;
+    let inherited = ssal::unix::inherited_fds()?;
+    let mut command = Command::new(poc);
+    command
+        .args(["--cgroup-mount-check"])
+        .arg(root)
+        .env_clear()
+        .stdin(Stdio::null());
+    unsafe {
+        command.pre_exec(move || {
+            ssal::unix::close_inherited_fds(&inherited, &[])?;
+            ssal::unix::cloexec_unexpected_fds()
+        });
+    }
+    if !command.status()?.success() {
+        return Err(io::Error::other("Guest cgroup read-only diagnostic failed"));
+    }
+    Ok(())
+}
+
+fn processgroup_config(
+    mut controllers: serde_json::Value,
+    mut profiles: serde_json::Value,
+) -> io::Result<(serde_json::Value, serde_json::Value)> {
+    let invalid = || io::Error::other("unexpected Guest cgroup/task profile schema");
+    let paths: std::collections::BTreeMap<_, _> = controllers["Cgroups"]
+        .as_array()
+        .ok_or_else(invalid)?
+        .iter()
+        .map(|entry| {
+            (
+                entry["Controller"].as_str().unwrap_or(""),
+                entry["Path"].as_str().unwrap_or(""),
+            )
+        })
+        .collect();
+    if paths
+        != [
+            ("blkio", "/dev/blkio"),
+            ("cpu", "/dev/cpuctl"),
+            ("cpuset", "/dev/cpuset"),
+        ]
+        .into_iter()
+        .collect()
+        || controllers["Cgroups2"]["Path"] != "/sys/fs/cgroup"
+    {
+        return Err(invalid());
+    }
+    // No Host memory-controller delegation; preserve profile names as explicit no-ops.
+    controllers["Cgroups2"]["Controllers"]
+        .as_array_mut()
+        .ok_or_else(invalid)?
+        .retain(|entry| entry["Controller"] != "memory");
+    let attributes = profiles["Attributes"].as_array_mut().ok_or_else(invalid)?;
+    let memory: std::collections::BTreeSet<String> = attributes
+        .iter()
+        .filter(|entry| entry["Controller"] == "memory")
+        .filter_map(|entry| entry["Name"].as_str().map(str::to_owned))
+        .collect();
+    attributes.retain(|entry| entry["Controller"] != "memory");
+    for profile in profiles["Profiles"].as_array_mut().ok_or_else(invalid)? {
+        profile["Actions"]
+            .as_array_mut()
+            .ok_or_else(invalid)?
+            .retain(|action| {
+                !(action["Name"] == "JoinCgroup" && action["Params"]["Controller"] == "memory"
+                    || action["Name"] == "SetAttribute"
+                        && memory.contains(action["Params"]["Name"].as_str().unwrap_or("")))
+            });
+    }
+    // Reject traversal before creating any task-profile group.
+    for action in profiles["Profiles"]
+        .as_array()
+        .ok_or_else(invalid)?
+        .iter()
+        .flat_map(|p| p["Actions"].as_array().into_iter().flatten())
+    {
+        if action["Name"] == "JoinCgroup" {
+            let controller = action["Params"]["Controller"]
+                .as_str()
+                .ok_or_else(invalid)?;
+            let path = action["Params"]["Path"].as_str().ok_or_else(invalid)?;
+            if !matches!(controller, "cpu" | "cpuset" | "blkio")
+                || (!path.is_empty() && !relative(path))
+            {
+                return Err(invalid());
+            }
+        }
+    }
+    Ok((controllers, profiles))
+}
+
+fn processgroup_probe(
+    mounts: &mut Mounts,
+    cgroups: &mut GuestCgroups,
+    root: &Path,
+) -> io::Result<()> {
+    let helper = std::env::var("SSAL_PROCESSGROUP_PROBE")
+        .map_err(|_| io::Error::other("SSAL_PROCESSGROUP_PROBE is required"))?;
+    let (controllers, profiles) = processgroup_config(
+        serde_json::from_slice(&fs::read(guest_path(root, "system/etc/cgroups.json")?)?)?,
+        serde_json::from_slice(&fs::read(guest_path(
+            root,
+            "system/etc/task_profiles.json",
+        )?)?)?,
+    )?;
+    let runtime = directory(root, "run/ssal/processgroup", 0o755)?;
+    for (name, value) in [
+        ("cgroups.json", &controllers),
+        ("task_profiles.json", &profiles),
+    ] {
+        let source = runtime.join(name);
+        fs::write(&source, serde_json::to_vec_pretty(value)?)?;
+        mounts.bind(
+            &source,
+            &guest_path(root, &format!("system/etc/{name}"))?,
+            true,
+            false,
+        )?;
+    }
+    let mut groups = std::collections::BTreeSet::new();
+    for profile in profiles["Profiles"].as_array().unwrap() {
+        for action in profile["Actions"].as_array().unwrap() {
+            if action["Name"] == "JoinCgroup" {
+                let controller = action["Params"]["Controller"].as_str().unwrap();
+                let path = action["Params"]["Path"].as_str().unwrap();
+                let source = GUEST_CGROUPS
+                    .iter()
+                    .find(|(_, target)| {
+                        *target
+                            == match controller {
+                                "cpu" => "dev/cpuctl",
+                                "cpuset" => "dev/cpuset",
+                                _ => "dev/blkio",
+                            }
+                    })
+                    .unwrap()
+                    .0;
+                let mut group = PathBuf::from(source);
+                for part in Path::new(path).components() {
+                    group.push(part);
+                    groups.insert(group.clone());
+                }
+            }
+        }
+    }
+    for path in groups {
+        cgroups.create(&path)?;
+        if path.starts_with("/dev/cpuset/ssal_guest") {
+            for name in ["cpus", "mems"] {
+                fs::write(
+                    path.join(name),
+                    fs::read(path.parent().unwrap().join(name))?,
+                )?;
+            }
+        }
+    }
+    for name in ["apps", "system"] {
+        cgroups.create(&Path::new(GUEST_CGROUPS[0].0).join(name))?;
+    }
+    for path in &cgroups.created {
+        for entry in [
+            path.clone(),
+            path.join("cgroup.procs"),
+            path.join("tasks"),
+            path.join("cgroup.threads"),
+        ] {
+            if entry.exists() {
+                if unsafe { libc::chown(cpath(&entry)?.as_ptr(), 1000, 1000) } != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                fs::set_permissions(
+                    &entry,
+                    fs::Permissions::from_mode(if entry == *path { 0o755 } else { 0o664 }),
+                )?;
+            }
+        }
+    }
+    let target = runtime.join("probe");
+    File::create(&target)?;
+    mounts.bind(Path::new(&helper), &target, true, false)?;
+    println!("Guest libprocessgroup config: original image JSON bound with memory actions disabled; Guest-only v1 groups initialized; vendor/property overrides absent; launcher uid/gid=1000");
+    let mut command =
+        crate::guest_launcher::command(root, "/system/bin/bootstrap/linker64", 1000, false)?;
+    command
+        .arg("/run/ssal/processgroup/probe")
+        .env_clear()
+        .env("LD_LIBRARY_PATH", "/system/lib64/bootstrap:/system/lib64")
+        .stdin(Stdio::null());
+    let status = command.status()?;
+    if !status.success() {
+        return Err(io::Error::other(format!(
+            "Guest libprocessgroup helper: {status}"
+        )));
+    }
+    Ok(())
+}
+
 pub fn verify(
     system: &Path,
     userdata: &Path,
@@ -635,6 +1014,7 @@ pub fn verify(
     let cache = base.join("apex-cache");
     fs::create_dir(&root)?;
     let mut mounts = Mounts::new();
+    let mut cgroups = GuestCgroups::default();
     let result = (|| {
         if mode == "--guest-data-worker" {
             crate::guest_data_probe::fresh(userdata)?;
@@ -660,24 +1040,9 @@ pub fn verify(
             libc::MS_BIND | libc::MS_REMOUNT | libc::MS_NOSUID | libc::MS_NODEV,
             "",
         )?;
-        // This intentionally shares devices, properties, Binder and cgroups.
-        mounts.bind(Path::new("/dev"), &root.join("dev"), false, true)?;
-        mount(
-            Path::new("none"),
-            &root.join("dev"),
-            None,
-            libc::MS_PRIVATE | libc::MS_REC,
-            "",
-        )?;
-        // Never mkdir/chmod through the shared /dev tree.
+        prepare_guest_dev(&mut mounts, &root)?;
         for path in &profile.tmpfs {
-            if path.starts_with("dev/") {
-                if !root.join(path).is_dir() {
-                    return Err(io::Error::other(format!("host /{path} mountpoint missing")));
-                }
-            } else {
-                directory(&root, path, 0o755)?;
-            }
+            directory(&root, path, 0o755)?;
             mounts.tmpfs(&root.join(path), 0o755)?;
         }
         for entry in &profile.runtime_tmpfs {
@@ -709,6 +1074,22 @@ pub fn verify(
             libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
             "",
         )?;
+        if matches!(
+            mode,
+            "--guest-cgroup-worker"
+                | "--guest-child-worker"
+                | "--guest-processgroup-worker"
+                | "--guest-service-worker"
+                | "--guest-services-6a-worker"
+        ) {
+            cgroups.prepare(&mut mounts, &root)?;
+        }
+        if mode == "--guest-cgroup-worker" {
+            return guest_cgroup_probe(&root);
+        }
+        if mode == "--guest-processgroup-worker" {
+            return processgroup_probe(&mut mounts, &mut cgroups, &root);
+        }
         for path in &profile.host_readonly {
             let source = Path::new("/").join(path);
             if source.is_dir() {
@@ -794,33 +1175,46 @@ pub fn verify(
         println!("guest stage: APEX patches");
         patches(&mut mounts, &profile, &patch_dir, &root, true)?;
         permission_controller(&mut mounts, &patch_dir, &root)?;
-        println!("guest stage: linkerconfig generation");
-        linkerconfig(&root)?;
-        let probe = crate::guest_probe::verify(&root, userdata)?;
-        crate::service_contract::report(&root, &probe)?;
-        if mode == "--binder-probe-worker" {
-            crate::binder_probe::verify(&root)?;
+        if matches!(
+            mode,
+            "--guest-child-worker" | "--guest-service-worker" | "--guest-services-6a-worker"
+        ) {
+            return crate::guest_launcher::verify(
+                &mut mounts,
+                &root,
+                userdata,
+                mode == "--guest-services-6a-worker",
+            );
         }
-        if mode == "--selinux-probe-worker" {
-            crate::selinux_probe::verify(&root)?;
-        }
-        if mode == "--servicemanager-preflight-worker" {
-            crate::selinux_probe::preflight::verify(&root)?;
-        }
-        if mode == "--servicemanager-runtime-preflight-worker" {
-            crate::selinux_probe::runtime_preflight::verify(&root)?;
-        }
-        if mode == "--enforcing-binder-worker" {
-            crate::selinux_probe::enforcing::verify(&root)?;
-        }
-        if mode == "--servicemanager-worker" {
-            crate::selinux_probe::servicemanager::verify(&root)?;
-        }
-        if mode == "--guest-data-worker" {
-            crate::selinux_probe::servicemanager::verify_phase2(&root, userdata)?;
+        {
+            println!("guest stage: linkerconfig generation");
+            linkerconfig(&root)?;
+            let probe = crate::guest_probe::verify(&root, userdata)?;
+            crate::service_contract::report(&root, &probe)?;
+            if mode == "--binder-probe-worker" {
+                crate::binder_probe::verify(&root)?;
+            }
+            if mode == "--selinux-probe-worker" {
+                crate::selinux_probe::verify(&root)?;
+            }
+            if mode == "--servicemanager-preflight-worker" {
+                crate::selinux_probe::preflight::verify(&root)?;
+            }
+            if mode == "--servicemanager-runtime-preflight-worker" {
+                crate::selinux_probe::runtime_preflight::verify(&root)?;
+            }
+            if mode == "--enforcing-binder-worker" {
+                crate::selinux_probe::enforcing::verify(&root)?;
+            }
+            if mode == "--servicemanager-worker" {
+                crate::selinux_probe::servicemanager::verify(&root)?;
+            }
+            if mode == "--guest-data-worker" {
+                crate::selinux_probe::servicemanager::verify_phase2(&root, userdata)?;
+            }
         }
         same_directory(userdata, &root.join("data"))?;
-        println!("mount profile: {}\nrootfs: {}\nmedia views: verified against guest /data/media\nshared /dev: Binder/properties/devices shared; sockets and block paths masked\nchroot/pivot_root dynamic shell and userdata write/read: verified\nAPEX activation, guest services, FUSE permissions, SELinux compatibility: NOT validated", profile.name, root.display());
+        println!("mount profile: {}\nrootfs: {}\nmedia views: verified against guest /data/media\nGuest /dev: isolated tmpfs; only checked pseudo-devices and opt-in Guest cgroup subtrees; Host Binder, property, Binder-control, HAL, cgroup roots and BPF paths absent\nGuest execution: {}\nAPEX activation, full Guest property service, Android services, FUSE permissions, SELinux compatibility: NOT validated", profile.name, root.display(), if mode == "--guest-child-worker" { "limited diagnostic child completed; Android services remain blocked" } else { "blocked pending Host proc/root, exec-FD and signal/ptrace boundary evidence" });
         let info = fs::read_to_string("/proc/self/mountinfo")?;
         for path in &mounts.paths {
             let line = info
@@ -834,6 +1228,15 @@ pub fn verify(
         Ok(())
     })();
     let cleanup = mounts.cleanup();
+    let cgroup_cleanup = cgroups.cleanup();
+    println!(
+        "Guest cgroup cleanup: {}",
+        if cgroup_cleanup.is_ok() {
+            "passed"
+        } else {
+            "failed"
+        }
+    );
     let residual = fs::read_to_string("/proc/self/mountinfo").and_then(|info| {
         if info
             .lines()
@@ -846,7 +1249,16 @@ pub fn verify(
             Ok(())
         }
     });
-    let cleanup = cleanup.and(residual);
+    let cleanup = [cleanup, cgroup_cleanup, residual]
+        .into_iter()
+        .filter_map(Result::err)
+        .map(|error| error.to_string())
+        .collect::<Vec<_>>();
+    let cleanup = if cleanup.is_empty() {
+        Ok(())
+    } else {
+        Err(io::Error::other(cleanup.join("; ")))
+    };
     if mode == "--servicemanager-worker" || mode == "--guest-data-worker" {
         if let Err(error) = &cleanup {
             crate::selinux_probe::servicemanager::mark_recovery(
@@ -880,6 +1292,71 @@ pub fn verify(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn processgroup_config_preserves_profiles_and_rejects_host_path_escape() -> io::Result<()> {
+        use serde_json::json;
+        let controllers = json!({"Cgroups":[
+            {"Controller":"cpu","Path":"/dev/cpuctl"},
+            {"Controller":"cpuset","Path":"/dev/cpuset"},
+            {"Controller":"blkio","Path":"/dev/blkio"}],
+            "Cgroups2":{"Path":"/sys/fs/cgroup","Controllers":[
+                {"Controller":"freezer","Path":"."},
+                {"Controller":"memory","Path":".","NeedsActivation":true}]}});
+        let profiles = json!({"Attributes":[{"Name":"MemLimit","Controller":"memory"}],
+            "Profiles":[{"Name":"memory-disabled","Actions":[
+                {"Name":"SetAttribute","Params":{"Name":"MemLimit"}},
+                {"Name":"JoinCgroup","Params":{"Controller":"memory","Path":"system"}}]},
+                {"Name":"cpu-kept","Actions":[{"Name":"JoinCgroup","Params":{"Controller":"cpu","Path":"foreground"}}]}],
+            "AggregateProfiles":[{"Name":"CPUSET_SP_FOREGROUND","Profiles":["cpu-kept"]}]});
+        let (config, actual) = processgroup_config(controllers.clone(), profiles.clone())?;
+        assert_eq!(config["Cgroups"], controllers["Cgroups"]);
+        assert_eq!(
+            config["Cgroups2"]["Controllers"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(actual["Profiles"][0]["Actions"], json!([]));
+        assert_eq!(actual["Profiles"][1], profiles["Profiles"][1]);
+        assert_eq!(actual["AggregateProfiles"], profiles["AggregateProfiles"]);
+        for path in ["../host", "/host", "foreground/../../host"] {
+            let mut bad = profiles.clone();
+            bad["Profiles"][1]["Actions"][0]["Params"]["Path"] = json!(path);
+            assert!(processgroup_config(controllers.clone(), bad).is_err());
+        }
+        let mut bad = controllers;
+        bad["Cgroups"][0]["Path"] = json!("/sys/fs/cgroup/system");
+        assert!(processgroup_config(bad, profiles).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn cgroup_cleanup_only_removes_owned_empty_directories() -> io::Result<()> {
+        let root = std::env::temp_dir().join(format!("ssal-cgroups-{}", std::process::id()));
+        fs::create_dir(&root)?;
+        let existing = root.join("existing");
+        fs::create_dir(&existing)?;
+        let mut groups = GuestCgroups::default();
+        assert_eq!(
+            groups.create(&existing).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        let guest = root.join("ssal_guest");
+        groups.create(&guest)?;
+        let second = root.join("second_guest");
+        groups.create(&second)?;
+        fs::create_dir(guest.join("unexpected"))?;
+        assert!(groups.cleanup().is_err());
+        assert!(!second.exists());
+        assert_eq!(groups.created, [guest.clone()]);
+        assert!(guest.join("unexpected").is_dir());
+        fs::remove_dir(guest.join("unexpected"))?;
+        groups.cleanup()?;
+        assert!(!guest.exists());
+        assert!(existing.is_dir());
+        assert!(groups.created.is_empty());
+        fs::remove_dir(&existing)?;
+        fs::remove_dir(root)
+    }
 
     #[test]
     fn private_propagation_requires_complete_mountinfo() {
@@ -968,8 +1445,24 @@ mod tests {
     fn profile_preserves_data_boundary() -> io::Result<()> {
         let p = profile()?;
         assert_eq!(p.media_views.len(), 4);
+        assert_eq!(p.core["dev"], "guest-tmpfs-minimal");
+        assert_eq!(
+            GUEST_DEVICE_NODES,
+            [
+                ("null", 1, 3),
+                ("zero", 1, 5),
+                ("random", 1, 8),
+                ("urandom", 1, 9)
+            ]
+        );
+        assert!(p.tmpfs.iter().all(|path| !path.starts_with("dev/")));
+        assert!(p
+            .host_runtime
+            .iter()
+            .all(|entry| !matches!(entry.path.as_str(), "sys/fs/cgroup" | "sys/fs/bpf")));
         assert!(p.tmpfs.iter().any(|s| s == "mnt"));
-        assert!(p.tmpfs.iter().any(|s| s == "dev/socket"));
+        assert!(GUEST_DEV_ENTRIES.contains(&"socket"));
+        assert!(GUEST_DEV_ENTRIES.contains(&"binderfs"));
         assert!(p
             .runtime_tmpfs
             .iter()
@@ -990,6 +1483,12 @@ mod tests {
         assert!(!relative("../data"));
         assert!(!relative("/data"));
         Ok(())
+    }
+
+    #[test]
+    fn automatic_launch_requires_explicit_disposable_worker() {
+        let error = require_guest_exec_admission().unwrap_err();
+        assert!(error.to_string().contains("--guest-service-worker"));
     }
 
     #[test]

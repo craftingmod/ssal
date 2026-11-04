@@ -154,8 +154,19 @@ impl Session {
                 "private Binder identity verification failed",
             ));
         }
-        println!("private Binder original node: created_by={created_by}; dev={} inode={} rdev={}; label={}", meta.dev(), meta.ino(), meta.rdev(), ssal::unix::image_context(&device).unwrap_or_else(|e| format!("unavailable: {e}")));
-        let alias = crate::guest_mounts::guest_path(root, "dev/binder")?;
+        println!("private Binder original node: created_by={created_by}; dev={} inode={} rdev={} mode=0{:o} uid={} gid={} label={}", meta.dev(), meta.ino(), meta.rdev(), meta.mode() & 0o7777, meta.uid(), meta.gid(), ssal::unix::image_context(&device).unwrap_or_else(|e| format!("unavailable: {e}")));
+        let alias = crate::guest_mounts::guest_path(root, "dev")?.join("binder");
+        match fs::symlink_metadata(&alias) {
+            Ok(meta) if !meta.file_type().is_symlink() => (),
+            Ok(_) => return Err(io::Error::other("Guest Binder alias is a symlink")),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&alias)?;
+            }
+            Err(error) => return Err(error),
+        }
         if fs::metadata(&alias)?.rdev() != meta.rdev() {
             if unsafe {
                 libc::mount(

@@ -3,6 +3,8 @@ mod binder_probe;
 #[cfg(unix)]
 mod guest_data_probe;
 #[cfg(unix)]
+mod guest_launcher;
+#[cfg(unix)]
 mod guest_mounts;
 #[cfg(unix)]
 mod guest_probe;
@@ -754,6 +756,11 @@ fn main() {
             || arg == "--enforcing-binder-worker"
             || arg == "--servicemanager-worker"
             || arg == "--guest-data-worker"
+            || arg == "--guest-child-worker"
+            || arg == "--guest-cgroup-worker"
+            || arg == "--guest-processgroup-worker"
+            || arg == "--guest-service-worker"
+            || arg == "--guest-services-6a-worker"
     }) {
         if args.len() != 5 || unsafe { libc::geteuid() } != 0 {
             eprintln!("invalid prepare worker invocation");

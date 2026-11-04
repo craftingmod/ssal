@@ -205,7 +205,7 @@ fn load() -> io::Result<Contract> {
 
 pub fn blocked_summary() -> io::Result<String> {
     let contract = load()?;
-    Ok(format!("service contract {}: launch DISABLED; requires private properties/framework Binder, per-service execution/SELinux proof, device HAL and restore plan; contract specified, runtime backends not implemented", contract.name))
+    Ok(format!("service contract {}: Guest executable and service launch DISABLED until Host proc/root, exec-FD and signal/ptrace boundaries are verified; also requires private properties/framework Binder, per-service SELinux proof, device HAL and restore plan", contract.name))
 }
 
 #[derive(Serialize, Debug, PartialEq, Eq)]
@@ -268,7 +268,7 @@ fn entrypoint(root: &Path, executable: &str) -> Entrypoint {
 pub fn report(root: &Path, probe: &crate::guest_probe::ProbeReport) -> io::Result<()> {
     let contract = load()?;
     println!("{}", blocked_summary()?);
-    println!("target property contract: guest initial values, private area+service, guest /data/property, no host reads/writes or ctl forwarding; current shared probe environment does NOT implement this contract");
+    println!("target property contract: guest initial values, private area+service, guest /data/property, no host reads/writes or ctl forwarding; current profile hides Host properties but has no Guest area/service");
     println!("target Binder contract: private framework context; per-interface host HAL bridge (allowlist empty); no registration on host contexts");
     println!("service admission: blocked; probe VINTF={}; root shell/fscrypt observations do not satisfy service domain, guest FBE or HAL prerequisites", serde_json::to_string(&probe.vintf)?);
     let order = startup_order(&contract)?;

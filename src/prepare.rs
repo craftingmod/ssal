@@ -488,6 +488,7 @@ pub(crate) fn mount_image(source: &Path, target: &Path, readonly: bool) -> io::R
 
 pub fn worker(system: &Path, userdata: &Path, base: &Path, mode: &str) -> io::Result<()> {
     crate::selinux_probe::servicemanager::check_recovery()?;
+    let host_mount_namespace = fs::read_link("/proc/self/ns/mnt")?;
     if unsafe { libc::unshare(libc::CLONE_NEWNS) } != 0 {
         return Err(io::Error::last_os_error());
     }
@@ -503,6 +504,17 @@ pub fn worker(system: &Path, userdata: &Path, base: &Path, mode: &str) -> io::Re
     {
         return Err(io::Error::last_os_error());
     }
+    let guest_mount_namespace = fs::read_link("/proc/self/ns/mnt")?;
+    if host_mount_namespace == guest_mount_namespace {
+        return Err(io::Error::other(
+            "mount namespace did not separate from Host",
+        ));
+    }
+    println!(
+        "host_mount_namespace={} guest_mount_namespace={}",
+        host_mount_namespace.display(),
+        guest_mount_namespace.display()
+    );
     let system_target = base.join("system");
     let mut loop_nodes = LoopNodes::new(base.join("loop-devices"))?;
     let data_target = base.join("data");
@@ -628,7 +640,10 @@ pub fn worker(system: &Path, userdata: &Path, base: &Path, mode: &str) -> io::Re
         cleanup.push(e.to_string());
     }
     if !cleanup.is_empty() {
-        if mode == "--servicemanager-worker" || mode == "--guest-data-worker" {
+        if mode == "--servicemanager-worker"
+            || mode == "--guest-data-worker"
+            || mode == "--guest-child-worker"
+        {
             crate::selinux_probe::servicemanager::mark_recovery(
                 &base.display().to_string(),
                 &cleanup.join("; "),
@@ -640,6 +655,7 @@ pub fn worker(system: &Path, userdata: &Path, base: &Path, mode: &str) -> io::Re
             || mode == "--enforcing-binder-worker"
             || mode == "--servicemanager-worker"
             || mode == "--guest-data-worker"
+            || mode == "--guest-child-worker"
         {
             println!(
                 "SELinux transition resource summary: {}",
@@ -658,6 +674,7 @@ pub fn worker(system: &Path, userdata: &Path, base: &Path, mode: &str) -> io::Re
         || mode == "--enforcing-binder-worker"
         || mode == "--servicemanager-worker"
         || mode == "--guest-data-worker"
+        || mode == "--guest-child-worker"
     {
         println!(
             "SELinux transition resource summary: {}",

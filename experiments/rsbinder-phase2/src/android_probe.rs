@@ -51,33 +51,45 @@ pub(super) fn initialize_private_properties(path: &Path) -> std::io::Result<Stri
 
     fs::create_dir(path)?;
     set_label(path, "u:object_r:properties_device:s0")?;
-    let entry = rsproperties::PropertyInfoEntry::new(
-        "ro.build.version.sdk".to_owned(),
-        "u:object_r:build_prop:s0".to_owned(),
-        "int",
-        true,
-    )
-    .map_err(std::io::Error::other)?;
+    let seeds = [
+        ("ro.build.version.sdk", sdk),
+        ("servicemanager.ready", "true"),
+        ("ro.product.cpu.abilist64", "arm64-v8a"),
+        ("ro.build.version.codename", "REL"),
+        ("dalvik.vm.dex2oat64.enabled", "true"),
+    ];
+    let entries = seeds
+        .iter()
+        .map(|(name, _)| {
+            rsproperties::PropertyInfoEntry::new(
+                (*name).to_owned(),
+                "u:object_r:build_prop:s0".to_owned(),
+                "string",
+                true,
+            )
+            .map_err(std::io::Error::other)
+        })
+        .collect::<std::io::Result<Vec<_>>>()?;
     let property_info = path.join("property_info");
     fs::write(
         &property_info,
-        rsproperties::build_trie(&[entry], "u:object_r:default_prop:s0", "string")
+        rsproperties::build_trie(&entries, "u:object_r:default_prop:s0", "string")
             .map_err(std::io::Error::other)?,
     )?;
     set_label(&property_info, "u:object_r:property_info:s0")?;
 
-    let mut properties = rsproperties::SystemProperties::new_area(path)
-        .map_err(std::io::Error::other)?;
-    properties
-        .add("ro.build.version.sdk", sdk)
-        .map_err(std::io::Error::other)?;
+    let mut properties =
+        rsproperties::SystemProperties::new_area(path).map_err(std::io::Error::other)?;
+    for (name, value) in seeds {
+        properties.add(name, value).map_err(std::io::Error::other)?;
+    }
     drop(properties);
     rsproperties::try_init(rsproperties::PropertyConfig::with_properties_dir(
         path.to_path_buf(),
     ))
     .map_err(std::io::Error::other)?;
-    let observed = rsproperties::get::<String>("ro.build.version.sdk")
-        .map_err(std::io::Error::other)?;
+    let observed =
+        rsproperties::get::<String>("ro.build.version.sdk").map_err(std::io::Error::other)?;
     if observed != sdk {
         return Err(std::io::Error::other(format!(
             "rsproperties read {observed}, Guest build.prop says {sdk}"
@@ -96,7 +108,8 @@ pub(super) fn initialize_private_properties(path: &Path) -> std::io::Result<Stri
 }
 
 fn set_label(path: &Path, label: &str) -> std::io::Result<()> {
-    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(std::io::Error::other)?;
+    let path =
+        std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(std::io::Error::other)?;
     let label = std::ffi::CString::new(label).map_err(std::io::Error::other)?;
     if unsafe {
         libc::setxattr(
