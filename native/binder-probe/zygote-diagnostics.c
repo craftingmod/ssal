@@ -11,6 +11,9 @@
 #include <fcntl.h>
 #include <sys/syscall.h>
 #include <ucontext.h>
+#if defined(__ANDROID__)
+#include <sys/system_properties.h>
+#endif
 
 static struct sigaction previous_segv;
 static volatile sig_atomic_t capturing;
@@ -105,6 +108,18 @@ static void segv(int signal_number, siginfo_t *info, void *context) {
 }
 
 __attribute__((constructor)) static void install_crash_capture(void) {
+#if defined(__ANDROID__)
+    // Read in the actual Zygote process, through the same bionic area as Framework JNI.
+    const char *keys[] = {"ro.build.version.sdk", "ro.build.version.codename",
+                          "ro.build.version.all_codenames"};
+    for (unsigned i = 0; i < sizeof(keys) / sizeof(keys[0]); ++i) {
+        char value[PROP_VALUE_MAX] = {0}, line[256];
+        __system_property_get(keys[i], value);
+        int n = snprintf(line, sizeof(line), "SSAL_ZYGOTE_PROPERTY pid=%d key=%s present=%d value=%s\n",
+                         getpid(), keys[i], __system_property_find(keys[i]) != NULL, value);
+        if (n > 0 && (size_t)n < sizeof(line)) (void)write(STDERR_FILENO, line, (size_t)n);
+    }
+#endif
     struct sigaction action = {.sa_sigaction = segv, .sa_flags = SA_SIGINFO | SA_ONSTACK};
     sigemptyset(&action.sa_mask);
     if (sigaction(SIGSEGV, &action, &previous_segv) < 0) number("SSAL_CAPTURE_INSTALL_ERRNO", errno);

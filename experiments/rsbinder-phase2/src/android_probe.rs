@@ -62,11 +62,13 @@ pub(super) fn initialize_private_properties(path: &Path) -> std::io::Result<Stri
         )));
     }
 
+    let all_codenames = crate::guest_all_codenames(&build)?;
     fs::create_dir(path)?;
     set_label(path, "u:object_r:properties_device:s0")?;
     let seeds = [
         ("ro.build.version.sdk", sdk),
         ("ro.build.version.sdk_full", sdk_full),
+        ("ro.build.version.all_codenames", all_codenames),
         ("servicemanager.ready", "true"),
         ("ro.product.cpu.abilist64", "arm64-v8a"),
         ("ro.build.version.codename", "REL"),
@@ -110,11 +112,20 @@ pub(super) fn initialize_private_properties(path: &Path) -> std::io::Result<Stri
             "rsproperties read {observed}, Guest build.prop says {sdk}"
         )));
     }
+    let observed_codenames = rsproperties::get::<String>("ro.build.version.all_codenames")
+        .map_err(std::io::Error::other)?;
+    if observed_codenames != all_codenames {
+        return Err(std::io::Error::other(
+            "Guest all_codenames property readback mismatch",
+        ));
+    }
     Ok(json!({
         "event":"private_property_area_initialized",
         "sdk_source":"Guest /system/build.prop",
         "guest_sdk":sdk,
         "guest_sdk_full":sdk_full,
+        "guest_all_codenames":all_codenames,
+        "rsproperties_all_codenames":observed_codenames,
         "rsproperties_sdk":observed,
         "property_area":path.display().to_string(),
         "property_info_context":"u:object_r:property_info:s0",

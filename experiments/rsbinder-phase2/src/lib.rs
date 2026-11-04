@@ -21,6 +21,17 @@ struct Args {
     expected_descriptor: String,
 }
 
+#[cfg(any(target_os = "android", test))]
+fn guest_all_codenames(build: &str) -> std::io::Result<&str> {
+    build
+        .lines()
+        .find_map(|line| line.strip_prefix("ro.build.version.all_codenames="))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            std::io::Error::other("Guest /system/build.prop has no nonempty all_codenames value")
+        })
+}
+
 fn parse_args(args: &[String]) -> Result<Args, &'static str> {
     if args.len() != 6
         || args[0] != "--device"
@@ -97,7 +108,21 @@ mod android_probe;
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_args, validate_kind_path, ProbeKind};
+    use super::{guest_all_codenames, parse_args, validate_kind_path, ProbeKind};
+
+    #[test]
+    fn all_codenames_comes_from_guest_build_without_a_fallback() {
+        assert_eq!(
+            guest_all_codenames("ro.build.version.all_codenames=REL\n").unwrap(),
+            "REL"
+        );
+        assert_eq!(
+            guest_all_codenames("ro.build.version.all_codenames=Baklava\n").unwrap(),
+            "Baklava"
+        );
+        assert!(guest_all_codenames("ro.build.version.codename=REL\n").is_err());
+        assert!(guest_all_codenames("ro.build.version.all_codenames=\n").is_err());
+    }
 
     #[test]
     fn device_service_and_descriptor_must_be_explicit() {
