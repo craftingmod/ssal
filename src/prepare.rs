@@ -33,18 +33,14 @@ pub fn check(root: &Path, name: &str) -> io::Result<CheckedProfile> {
     let profile: serde_json::Value = serde_json::from_slice(&fs::read(dir.join("profile.json"))?)?;
     // Compatibility resources cannot authorize service execution or migrate data.
     ssal::guest_lock_compat::Config::from_profile(&profile)?.runtime_gate()?;
-    if profile["version"] == 1 {
+    if profile["version"] != 3 {
         return Err(io::Error::other(
-            "legacy userdata image profile is unsupported; create a new profile",
+            "unsupported userdata profile version; remove and recreate the profile (no migration)",
         ));
     }
-    if profile["version"] != 2
-        || profile["name"].as_str() != Some(name)
-        || profile["userdata"]["path"] != "userdata"
-    {
+    if profile["name"].as_str() != Some(name) || profile["userdata"]["path"] != "userdata.img" {
         return Err(io::Error::other("unsupported or invalid profile"));
     }
-    // Existing directory profiles predate this field and use the same default.
     if profile
         .get("mount_profile")
         .is_some_and(|value| value.as_str() != Some(crate::guest_mounts::PROFILE_NAME))
@@ -57,7 +53,7 @@ pub fn check(root: &Path, name: &str) -> io::Result<CheckedProfile> {
         .ok_or_else(|| io::Error::other("invalid profile image id"))?;
     let image_dir = root.join("images").join(id);
     let system = image_dir.join("system.img");
-    let userdata = dir.join("userdata");
+    let userdata = dir.join("userdata.img");
     let manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(image_dir.join("manifest.json"))?)?;
     if manifest["id"].as_str() != Some(id) || manifest["format"] != "raw-ext4" {
@@ -95,8 +91,10 @@ pub fn check(root: &Path, name: &str) -> io::Result<CheckedProfile> {
     if !ext4_magic(&system)? {
         return Err(io::Error::other("system does not have ext4 magic"));
     }
-    let data_meta = fs::symlink_metadata(&userdata)?;
-    if !data_meta.is_dir() || profile["userdata"]["format"] != "directory" {
+    let data_file = crate::userdata::open(&userdata)?;
+    if profile["userdata"]["format"] != "raw-ext4"
+        || profile["userdata"]["size"].as_u64() != Some(data_file.metadata()?.len())
+    {
         return Err(io::Error::other("userdata metadata mismatch"));
     }
     let loop_control =
@@ -126,7 +124,7 @@ pub fn check(root: &Path, name: &str) -> io::Result<CheckedProfile> {
     } else {
         "unavailable".into()
     };
-    let report = format!("profile: {name}\nimage: {id}\nimage SELinux context: {image_label}\nimage size and SHA-256: OK\nsystem ext4 magic: OK\nuserdata directory: {}\nspace: {space}\nmount namespace: {}\nloop control: {}\ndevice: {device}\nvendor VINTF manifest: {}\nAndroid version, VINTF, HAL and service compatibility: not verified\n{}", userdata.display(), if namespace { "available" } else { "missing" }, if loop_control { "available" } else { "missing" }, if Path::new("/vendor/etc/vintf/manifest.xml").exists() { "present" } else { "not found at standard path" }, crate::guest_mounts::description()?);
+    let report = format!("profile: {name}\nimage: {id}\nimage SELinux context: {image_label}\nimage size and SHA-256: OK\nsystem ext4 magic: OK\nuserdata raw ext4 image: {}\nspace: {space}\nmount namespace: {}\nloop control: {}\ndevice: {device}\nvendor VINTF manifest: {}\nAndroid version, VINTF, HAL and service compatibility: not verified\n{}", userdata.display(), if namespace { "available" } else { "missing" }, if loop_control { "available" } else { "missing" }, if Path::new("/vendor/etc/vintf/manifest.xml").exists() { "present" } else { "not found at standard path" }, crate::guest_mounts::description()?);
     Ok(CheckedProfile {
         system,
         userdata,
@@ -518,34 +516,27 @@ pub fn worker(system: &Path, userdata: &Path, base: &Path, mode: &str) -> io::Re
     let system_target = base.join("system");
     let mut loop_nodes = LoopNodes::new(base.join("loop-devices"))?;
     let data_target = base.join("data");
-    let source = cpath(userdata)?;
-    let target = cpath(&data_target)?;
-    if unsafe {
-        libc::mount(
-            source.as_ptr(),
-            target.as_ptr(),
-            std::ptr::null(),
-            libc::MS_BIND,
-            std::ptr::null(),
-        )
-    } != 0
-    {
-        return Err(io::Error::other(format!(
-            "userdata bind mount failed: {}",
-            io::Error::last_os_error()
-        )));
-    }
+    let profile_dir = userdata
+        .parent()
+        .ok_or_else(|| io::Error::other("profile parent missing"))?;
+    let data_file = crate::userdata::open(userdata)?;
+    crate::userdata::lock(&data_file)?;
+    crate::userdata::check_filesystem(userdata)?;
+    let mut data_mounted = false;
     let mut system_mounted = false;
     let result = (|| {
-        let source_meta = fs::metadata(userdata)?;
+        let (data_loop, data_dev) = loop_device(userdata, false, &loop_nodes)?;
+        check_loop_read(&data_loop, &data_dev, userdata)?;
+        mount_image(&data_dev, &data_target, false)
+            .map_err(|e| io::Error::other(format!("userdata mount failed: {e}")))?;
+        data_mounted = true;
         let target_meta = fs::metadata(&data_target)?;
-        if (source_meta.dev(), source_meta.ino()) != (target_meta.dev(), target_meta.ino()) {
-            return Err(io::Error::other(
-                "userdata mount does not refer to the profile directory",
-            ));
+        if target_meta.dev() != data_loop.metadata()?.rdev()
+            || target_meta.dev() == fs::metadata("/data")?.dev()
+        {
+            return Err(io::Error::other("userdata filesystem identity mismatch"));
         }
-        let probe_name = format!(".ssal-prepare-probe-{}", std::process::id());
-        let probe = data_target.join(&probe_name);
+        let probe = data_target.join(format!(".ssal-prepare-probe-{}", std::process::id()));
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -554,10 +545,8 @@ pub fn worker(system: &Path, userdata: &Path, base: &Path, mode: &str) -> io::Re
         let probe_result = (|| {
             file.write_all(b"ssal prepare probe")?;
             file.sync_all()?;
-            if fs::read(userdata.join(&probe_name))? != b"ssal prepare probe" {
-                return Err(io::Error::other(
-                    "userdata probe did not reach backing directory",
-                ));
+            if fs::read(&probe)? != b"ssal prepare probe" {
+                return Err(io::Error::other("userdata write/read mismatch"));
             }
             Ok(())
         })();
@@ -568,16 +557,22 @@ pub fn worker(system: &Path, userdata: &Path, base: &Path, mode: &str) -> io::Re
         let data_info = fs::read_to_string("/proc/self/mountinfo")?;
         let data_line = data_info
             .lines()
-            .find(|line| line.split_whitespace().nth(4) == Some(data_target.to_str().unwrap_or("")))
+            .find(|line| line.split_whitespace().nth(4) == data_target.to_str())
             .ok_or_else(|| io::Error::other("userdata mount missing from mountinfo"))?;
         if !data_line
-            .split_whitespace()
-            .nth(5)
-            .is_some_and(|options| options.split(',').any(|option| option == "rw"))
+            .split_once(" - ")
+            .is_some_and(|(_, fs)| fs.starts_with("ext4 "))
+            || !data_line.split_whitespace().nth(5).is_some_and(|options| {
+                ["rw", "nosuid", "nodev"]
+                    .iter()
+                    .all(|required| options.split(',').any(|o| o == *required))
+            })
         {
-            return Err(io::Error::other("userdata mount is not writable"));
+            return Err(io::Error::other(
+                "userdata mount must be ext4 rw,nosuid,nodev",
+            ));
         }
-        println!("mount namespace: {}\nuserdata backing: {}\nuserdata bind and write/read probe: OK\nuserdata mountinfo: {data_line}", fs::read_link("/proc/self/ns/mnt")?.display(), userdata.display());
+        println!("mount namespace: {}\nuserdata backing: {}\nuserdata ext4 write/read probe: OK\nuserdata mountinfo: {data_line}", fs::read_link("/proc/self/ns/mnt")?.display(), userdata.display());
         let (system_loop, system_dev) = loop_device(system, true, &loop_nodes)?;
         check_loop_read(&system_loop, &system_dev, system)?;
         mount_image(&system_dev, &system_target, true)
@@ -623,14 +618,21 @@ pub fn worker(system: &Path, userdata: &Path, base: &Path, mode: &str) -> io::Re
             userdata.display(),
             matches.join("\n")
         );
-        crate::guest_mounts::verify(&system_target, userdata, base, &loop_nodes, mode)?;
+        crate::guest_mounts::verify(
+            &system_target,
+            &data_target,
+            profile_dir,
+            base,
+            &loop_nodes,
+            mode,
+        )?;
         Ok(())
     })();
     let mut cleanup = Vec::new();
     if system_mounted && unsafe { libc::umount2(cpath(&system_target)?.as_ptr(), 0) } != 0 {
         cleanup.push(format!("system unmount: {}", io::Error::last_os_error()));
     }
-    if unsafe { libc::umount2(cpath(&data_target)?.as_ptr(), 0) } != 0 {
+    if data_mounted && unsafe { libc::umount2(cpath(&data_target)?.as_ptr(), 0) } != 0 {
         cleanup.push(format!("userdata unmount: {}", io::Error::last_os_error()));
     }
     if let Err(e) = loop_nodes.verify_released() {
@@ -720,7 +722,10 @@ mod tests {
             .map(|b| format!("{b:02x}"))
             .collect::<String>();
         fs::write(root.join("images/id-1/system.img"), &bytes)?;
-        fs::create_dir(root.join("guests/profile1/userdata"))?;
+        let data_path = root.join("guests/profile1/userdata.img");
+        fs::write(&data_path, &bytes)?;
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&data_path, fs::Permissions::from_mode(0o600))?;
         fs::write(
             root.join("images/id-1/manifest.json"),
             serde_json::to_vec(
@@ -730,7 +735,7 @@ mod tests {
         fs::write(
             root.join("guests/profile1/profile.json"),
             serde_json::to_vec(
-                &serde_json::json!({"version":2, "name":"profile1", "image_id":"id-1", "userdata":{"path":"userdata", "format":"directory"}}),
+                &serde_json::json!({"version":3, "name":"profile1", "image_id":"id-1", "userdata":{"path":"userdata.img", "format":"raw-ext4", "size":2048}}),
             )?,
         )?;
         assert!(check(&root, "profile1").is_ok());
@@ -743,9 +748,21 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("offline preparation only"));
-        assert!(fs::read_dir(root.join("guests/profile1/userdata"))?
-            .next()
-            .is_none());
+        assert_eq!(fs::metadata(&data_path)?.len(), 2048);
+        let mut legacy: serde_json::Value = serde_json::from_slice(&original)?;
+        for version in [1, 2] {
+            legacy["version"] = serde_json::json!(version);
+            fs::write(&profile_path, serde_json::to_vec(&legacy)?)?;
+            assert!(check(&root, "profile1")
+                .unwrap_err()
+                .to_string()
+                .contains("no migration"));
+        }
+        fs::write(&profile_path, &original)?;
+        let mut invalid: serde_json::Value = serde_json::from_slice(&original)?;
+        invalid["userdata"]["size"] = serde_json::json!(4096);
+        fs::write(&profile_path, serde_json::to_vec(&invalid)?)?;
+        assert!(check(&root, "profile1").is_err());
         fs::write(&profile_path, original)?;
         bytes[0] = 1;
         fs::write(root.join("images/id-1/system.img"), bytes)?;
@@ -756,5 +773,70 @@ mod tests {
         assert!(check(&root, "../profile1").is_err());
         fs::remove_dir_all(root)?;
         Ok(())
+    }
+    #[test]
+    #[ignore = "requires Linux CAP_SYS_ADMIN in a disposable container"]
+    fn real_ext4_remount_preserves_data_and_releases_loops() -> io::Result<()> {
+        use crate::userdata::{check_filesystem, create, detached, fresh, lock, open};
+        use std::ffi::CString;
+        use std::io::Write;
+        if unsafe { libc::unshare(libc::CLONE_NEWNS) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if unsafe {
+            libc::mount(
+                std::ptr::null(),
+                c"/".as_ptr(),
+                std::ptr::null(),
+                libc::MS_REC | libc::MS_PRIVATE,
+                std::ptr::null(),
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let base = std::env::temp_dir().join(format!("ssal-ext4-remount-{}", std::process::id()));
+        fs::create_dir(&base)?;
+        let path = base.join("userdata.img");
+        create(&path, 32 * 1024 * 1024)?;
+        let file = open(&path)?;
+        lock(&file)?;
+        let target = base.join("data");
+        fs::create_dir(&target)?;
+        let mut nodes = LoopNodes::new(base.join("loop-devices"))?;
+        for pass in 0..2 {
+            check_filesystem(&path)?;
+            let (device, source) = loop_device(&path, false, &nodes)?;
+            mount_image(&source, &target, false)?;
+            let result: io::Result<()> = (|| {
+                assert!(detached(&path).is_err());
+                assert!(check_filesystem(&path).is_err());
+                assert_eq!(fs::metadata(&target)?.dev(), device.metadata()?.rdev());
+                if pass == 0 {
+                    assert!(fresh(&target)?);
+                    let mut marker = File::create(target.join("persistent"))?;
+                    marker.write_all(b"ssal ext4 persistence")?;
+                    marker.sync_all()?;
+                } else {
+                    assert_eq!(
+                        fs::read(target.join("persistent"))?,
+                        b"ssal ext4 persistence"
+                    );
+                }
+                Ok(())
+            })();
+            let name = CString::new(target.as_os_str().as_encoded_bytes())?;
+            let unmounted = unsafe { libc::umount2(name.as_ptr(), 0) };
+            drop(device);
+            if unmounted != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            nodes.verify_released()?;
+            result?;
+        }
+        check_filesystem(&path)?;
+        nodes.cleanup()?;
+        drop(file);
+        fs::remove_dir_all(base)
     }
 }

@@ -17,6 +17,8 @@ mod selinux_probe;
 #[cfg(unix)]
 mod service_contract;
 #[cfg(unix)]
+mod userdata;
+#[cfg(unix)]
 mod zygote_diagnostics;
 #[cfg(unix)]
 mod daemon {
@@ -181,6 +183,7 @@ mod daemon {
         root: &Path,
         image_name: &str,
         requested: Option<&str>,
+        userdata_size: u64,
     ) -> io::Result<String> {
         if !valid_image_name(image_name) || requested.is_some_and(|name| !valid_image_name(name)) {
             return Err(io::Error::new(
@@ -214,10 +217,8 @@ mod daemon {
         let temp = profiles.join(format!(".create-{name}"));
         fs::create_dir(&temp)?;
         let result = (|| {
-            let data = temp.join("userdata");
-            fs::create_dir(&data)?;
-            fs::set_permissions(&data, fs::Permissions::from_mode(0o700))?;
-            File::open(&data)?.sync_all()?;
+            let data = temp.join("userdata.img");
+            super::userdata::create(&data, userdata_size)?;
             let property = |key: &str| -> Option<String> {
                 let output = Command::new("/system/bin/getprop").arg(key).output().ok()?;
                 if !output.status.success() {
@@ -226,12 +227,12 @@ mod daemon {
                 let value = String::from_utf8(output.stdout).ok()?.trim().to_owned();
                 (!value.is_empty()).then_some(value)
             };
-            let manifest = serde_json::json!({"version": 2, "name": name, "image_name": image_name, "image_id": id,
+            let manifest = serde_json::json!({"version": 3, "name": name, "image_name": image_name, "image_id": id,
                 "mount_profile": super::guest_mounts::PROFILE_NAME,
                 "guest_lock_compat": ssal::guest_lock_compat::Config::default(),
                 "guest_lock_compat_creation": {"version": 1, "userdata_state": "empty-at-creation", "application_phase": "before-first-service", "migration_allowed": false},
                 "device": {"product_device": property("ro.product.device"), "product_model": property("ro.product.model"), "build_fingerprint": property("ro.build.fingerprint"), "configuration": null},
-                "userdata": {"path": "userdata", "format": "directory"}, "compatibility": "unverified"});
+                "userdata": {"path": "userdata.img", "format": "raw-ext4", "size": userdata_size}, "compatibility": "unverified"});
             atomic(
                 &temp.join("profile.json"),
                 serde_json::to_vec_pretty(&manifest)?.as_slice(),
@@ -239,7 +240,7 @@ mod daemon {
             File::open(&temp)?.sync_all()?;
             fs::rename(&temp, &destination)?;
             File::open(&profiles)?.sync_all()?;
-            Ok(format!("created profile {name} for {image_name} ({id}); userdata: directory; device compatibility unverified"))
+            Ok(format!("created profile {name} for {image_name} ({id}); userdata: {userdata_size} bytes ext4 image; device compatibility unverified"))
         })();
         if result.is_err() {
             let _ = fs::remove_dir_all(&temp);
@@ -283,6 +284,21 @@ mod daemon {
                 "not a profile directory",
             ));
         }
+        let data_lock = if path.join("userdata.img").exists() {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+                .open(path.join("userdata.img"))?;
+            if !file.metadata()?.is_file() {
+                return Err(io::Error::other("userdata image is not a regular file"));
+            }
+            super::userdata::lock(&file)?;
+            super::userdata::detached(&path.join("userdata.img"))?;
+            Some(file)
+        } else {
+            None
+        };
         let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
         let prefix = format!("{}/", path.display());
         if mountinfo
@@ -295,6 +311,7 @@ mod daemon {
             ));
         }
         fs::remove_dir_all(&path)?;
+        drop(data_lock);
         File::open(profiles)?.sync_all()?;
         Ok(())
     }
@@ -363,7 +380,7 @@ mod daemon {
                 if req.profile_name.as_deref().is_some_and(|name| !valid_image_name(name)) { return reply(&mut stream, false, "invalid profile name"); }
                 let guard = busy.lock().unwrap();
                 if *guard { return reply(&mut stream, false, "another operation is running"); }
-                let result = create_profile(&root, image_name, req.profile_name.as_deref());
+                let result = create_profile(&root, image_name, req.profile_name.as_deref(), super::userdata::SIZE);
                 match result { Ok(message) => reply(&mut stream, true, message), Err(e) => reply(&mut stream, false, format!("profile creation failed: {e}")) }
             }
             "add" => {
@@ -577,12 +594,14 @@ mod daemon {
             fs::create_dir_all(root.join("guests"))?;
             fs::write(root.join("images/id-1/system.img"), b"image")?;
             fs::write(root.join("state/image-refs/lineage"), b"id-1")?;
-            create_profile(&root, "lineage", None)?;
-            create_profile(&root, "lineage", None)?;
+            create_profile(&root, "lineage", None, 32 * 1024 * 1024)?;
+            create_profile(&root, "lineage", None, 32 * 1024 * 1024)?;
             let profile: serde_json::Value =
                 serde_json::from_slice(&fs::read(root.join("guests/profile1/profile.json"))?)?;
             assert_eq!(profile["image_id"], "id-1");
-            assert_eq!(profile["userdata"]["format"], "directory");
+            assert_eq!(profile["version"], 3);
+            assert_eq!(profile["userdata"]["format"], "raw-ext4");
+            assert_eq!(profile["userdata"]["size"], 32 * 1024 * 1024);
             assert_eq!(profile["guest_lock_compat"]["enabled"], false);
             assert_eq!(profile["guest_lock_compat"]["require_fresh_userdata"], true);
             assert_eq!(profile["guest_lock_compat_creation"]["version"], 1);
@@ -594,16 +613,26 @@ mod daemon {
                 profile["mount_profile"],
                 super::super::guest_mounts::PROFILE_NAME
             );
-            assert!(root.join("guests/profile1/userdata").is_dir());
+            assert!(
+                super::super::userdata::open(&root.join("guests/profile1/userdata.img")).is_ok()
+            );
             assert!(root.join("guests/profile2/profile.json").exists());
-            assert!(create_profile(&root, "lineage", Some("profile1")).is_err());
-            assert!(create_profile(&root, "missing", Some("other")).is_err());
-            assert!(create_profile(&root, "lineage", Some("../bad")).is_err());
-            fs::write(root.join("guests/profile1/userdata/example"), b"data")?;
+            assert!(create_profile(&root, "lineage", Some("profile1"), 32 * 1024 * 1024).is_err());
+            assert!(create_profile(&root, "missing", Some("other"), 32 * 1024 * 1024).is_err());
+            assert!(create_profile(&root, "lineage", Some("../bad"), 32 * 1024 * 1024).is_err());
+            assert!(create_profile(&root, "lineage", Some("failed"), 0).is_err());
+            assert!(!root.join("guests/failed").exists());
+            assert!(!root.join("guests/.create-failed").exists());
             std::os::unix::fs::symlink(
                 root.join("images/id-1"),
-                root.join("guests/profile1/userdata/link"),
+                root.join("guests/profile1/link"),
             )?;
+            let active = super::super::userdata::open(&root.join("guests/profile1/userdata.img"))?;
+            super::super::userdata::lock(&active)?;
+            assert!(remove_profile(&root, "profile1").is_err());
+            drop(active);
+            // A damaged filesystem can still be explicitly discarded.
+            fs::write(root.join("guests/profile1/userdata.img"), b"damaged")?;
             remove_profile(&root, "profile1")?;
             assert!(!root.join("guests/profile1").exists());
             assert!(root.join("guests/profile2/profile.json").exists());

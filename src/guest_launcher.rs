@@ -679,7 +679,7 @@ fn isolated(root: &Path, userdata: &Path) -> io::Result<()> {
         Ok((m.dev(), m.ino()))
     };
     if identity(&root.join("data"))? != identity(userdata)?
-        || identity(userdata)? == identity(Path::new("/data"))?
+        || identity(userdata)?.0 == identity(Path::new("/data"))?.0
     {
         return Err(io::Error::other("Guest userdata identity mismatch"));
     }

@@ -1,4 +1,4 @@
-//! Phase 2 directory-backed userdata admission. Never imports Host application data.
+//! Phase 2 mounted Guest userdata admission. Never imports Host application data.
 use serde_json::{json, Value};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -42,7 +42,7 @@ fn real_directory(path: &Path) -> io::Result<()> {
 pub fn fresh(userdata: &Path) -> io::Result<()> {
     real_directory(userdata)?;
     let meta = fs::metadata(userdata)?;
-    if meta.uid() != 0 || meta.mode() & 0o022 != 0 || fs::read_dir(userdata)?.next().is_some() {
+    if meta.uid() != 0 || meta.mode() & 0o022 != 0 || !crate::userdata::fresh(userdata)? {
         return Err(io::Error::other("Phase 2 requires new empty root-owned userdata, not writable by group/others; create a new profile"));
     }
     Ok(())
@@ -81,7 +81,7 @@ pub fn verify_bind(root: &Path, userdata: &Path) -> io::Result<Value> {
     let host = fs::metadata("/data")?;
     if !actual.is_dir()
         || (actual.dev(), actual.ino()) != (expected.dev(), expected.ino())
-        || (actual.dev(), actual.ino()) == (host.dev(), host.ino())
+        || actual.dev() == host.dev()
         || fs::read_link("/proc/self/ns/mnt")? == fs::read_link("/proc/1/ns/mnt")?
     {
         return Err(io::Error::other(

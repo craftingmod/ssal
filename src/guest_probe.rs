@@ -679,7 +679,7 @@ fn encryption_diagnostics(root: &Path) -> PolicyComparison {
             serde_json::to_string(&compare_policies(a, b)).expect("comparison serialization")
         );
     }
-    println!("fscrypt scope: inherited host filesystem policies only; guest FBE, CE/DE key ownership and lock/unlock lifecycle NOT verified");
+    println!("fscrypt scope: Host and Guest directory policy observations only; distinct ext4 userdata does not implement Guest FBE, CE/DE key ownership or lock/unlock lifecycle");
     compare_policies(&states[2], &states[3])
 }
 

@@ -2,7 +2,7 @@
 
 `initial-shared-dev`는 기존 profile metadata와의 호환성을 위해 유지한 식별자다. 현재 구성은 `ssal prepare PROFILE_NAME`에서 마운트를 조립하지만, 검증되지 않은 Host proc/root, exec-FD, signal/ptrace 경계 때문에 Guest GSI 바이너리 실행 직전에 fail-closed로 중단하고 마운트를 해제한다. 따라서 현재 `prepare`는 성공하지 않으며 chroot·pivot_root 검사도 실행하지 않는다. 게스트 Android 서비스 시작과 hot-switch는 수행하지 않는다.
 
-정의는 [`initial.json`](../module/profiles/mounts/initial.json), 구현은 [`guest_mounts.rs`](../src/guest_mounts.rs)에 있다. JSON은 빌드 시 바이너리에 포함하고 모듈에도 참고용으로 배포한다. 설치된 JSON만 바꾸면 실행 설정이 변경되는 구조는 아니며 재빌드가 필요하다. 새 게스트 `profile.json`에는 `mount_profile` 이름을 기록한다. 이 필드가 없는 기존 디렉터리 프로필에도 같은 기본값을 사용한다.
+정의는 [`initial.json`](../module/profiles/mounts/initial.json), 구현은 [`guest_mounts.rs`](../src/guest_mounts.rs)에 있다. JSON은 빌드 시 바이너리에 포함하고 모듈에도 참고용으로 배포한다. 설치된 JSON만 바꾸면 실행 설정이 변경되는 구조는 아니며 재빌드가 필요하다. 새 게스트 `profile.json`에는 `mount_profile` 이름을 기록한다. userdata는 버전 3 프로필의 `userdata.img`만 지원하며 이전 프로필은 삭제 후 재생성한다.
 
 ## 마운트 표
 
@@ -11,7 +11,7 @@
 | 대상 | 원본·방식 | 정책 |
 |---|---|---|
 | `/` | 새 tmpfs + system 이미지 항목별 RO bind | system-as-root와 system-only 이미지를 구분. system loop/ext4는 RO,noload,nosuid,nodev. 조립용 루트 tmpfs는 RW |
-| `/data` | 프로필 `userdata/` 일반 bind | RW,nosuid,nodev. 호스트 `/data` 전체 연결이나 역방향 bind 없음 |
+| `/data` | 프로필 `userdata.img` → 세션 `data/` RW loop/ext4 → 일반 bind | RW,nosuid,nodev. Host `/data`와 다른 filesystem. backing 이미지와 loop 노드는 Guest에 노출하지 않음 |
 | `/data/{adb,apex,media,...}` | 게스트 userdata 내부 | 호스트 데이터 브리지 없음. 필요한 디렉터리는 게스트 서비스가 추가 생성 |
 | `/dev` | Guest 전용 4 MiB tmpfs, nosuid,noexec | `/dev/null`, `zero`, `random`, `urandom`만 개별 bind. 각 원본의 character-device major/minor, root:root 0666 권한과 Guest mount ID를 검사 |
 | `/dev/socket`, `/dev/block`, `/dev/binderfs` | Guest `/dev` tmpfs 내부 빈 디렉터리 | Host socket, block, `binder-control`, Binder, property area, kmsg, input, DRM, HAL 노드는 전달하지 않음. private Binder probe만 독립 binderfs를 임시 구성 |
@@ -62,11 +62,11 @@ ssal prepare PROFILE_NAME
 ssal logs
 ```
 
-worker는 새 namespace를 만든 직후 `/` 전체를 재귀 private으로 바꾼다. userdata 쓰기/읽기와 system loop mount를 검사한 뒤 위 구조를 구성한다. Android의 절대 symlink는 준비 중인 게스트 root 안에서 해석한다. userdata·미디어의 device/inode, primary 저장소 경로, 실제 mountinfo를 확인한다.
+worker는 새 namespace를 만든 직후 `/` 전체를 재귀 private으로 바꾼다. userdata 이미지의 배타 잠금과 기존 loop 연결 부재를 확인하고 `e2fsck -p`가 0 또는 1로 종료한 경우에만 RW 마운트한다. userdata 쓰기/읽기와 system loop mount를 검사한 뒤 위 구조를 구성한다. Android의 절대 symlink는 준비 중인 게스트 root 안에서 해석한다. userdata·미디어의 device/inode, primary 저장소 경로, 실제 mountinfo를 확인한다.
 
 커널이 할당한 loop 번호에 대응하는 호스트 `/dev/block/loopN`·`/dev/loopN` 노드가 없으면 세션 `loop-devices/`의 private tmpfs에 노드를 만든다. 이 tmpfs는 장치 접근을 위해 nodev를 지정하지 않고 nosuid,noexec,mode=0700으로 구성하며 게스트 root에는 노출하지 않는다. major/minor는 `/sys/block/loopN/dev`에서 읽고 실제 노드의 rdev를 확인한다. Android에서는 기존 loop 블록 노드의 SELinux 라벨을 복사한다. 호스트 `/dev`에 mknod하거나 기존 노드를 삭제·변경하지 않는다. 모든 이미지 mount 해제 후 이 tmpfs도 일반 unmount한다.
 
-성공·실패 모두 역순으로 일반 unmount하며 Guest `/dev`와 선택 device bind를 포함해 mount를 추적한다. 정리 실패는 오류로 보고하고 lazy unmount로 성공 처리하지 않는다. worker 종료 후 전용 scratch만 삭제한다. userdata에 생성한 기본 미디어·앱·mirror 디렉터리는 유지한다.
+성공·실패 모두 역순으로 일반 unmount하며 Guest `/dev`와 선택 device bind를 포함해 mount를 추적한다. 정리 실패는 오류로 보고하고 lazy unmount로 성공 처리하지 않는다. rootfs의 data bind들을 해제한 뒤 외부 ext4 mount와 loop를 해제한다. worker 종료 후 전용 scratch만 삭제한다. userdata에 생성한 기본 미디어·앱·mirror 디렉터리는 유지한다.
 
 ## 게스트 실행 검사와 서비스 기동 조건
 
@@ -107,3 +107,15 @@ cargo test --locked --bin ssald real_mounts_preserve_host_and_cleanup_recursivel
 `real_pivot_probe_detaches_old_root`는 CAP_SYS_ADMIN이 있는 폐기 가능한 Linux 컨테이너용 회귀 테스트다. 작은 tmpfs 루트에서 동적 shell을 실행하고 이전 root 분리와 worker root 보존을 확인한다. 기본 WSLc 환경에서는 실행하지 못했다.
 
 참고: [AOSP init.rc](https://android.googlesource.com/platform/system/core/+/refs/heads/android14-gsi/rootdir/init.rc), [APEX manifest 형식](https://android.googlesource.com/platform/system/apex/+/refs/heads/main/proto/apex_manifest.proto).
+
+## ext4 userdata 검증
+
+`ssal create`는 8 GiB 이미지를 미리 할당하고 journal을 포함한 고정 ext4 feature 집합으로 포맷한다. backing 파일은 root:root 0600, SELinux `ssal_userdata_image_file`이며 kernel의 backing 쓰기는 이 Guest 전용 타입에 한정한다. 프로필 디렉터리의 `profile.json`과 `patches/`는 이미지 바깥에 유지한다. 신규 데이터 검사는 빈 `lost+found`만 예외로 허용한다. 암호화된 Host 저장소 안의 이미지라는 사실은 Guest FBE·CE/DE 키 수명주기 구현을 의미하지 않는다.
+
+기본 Rust 테스트는 실제 32 MiB ext4 포맷·오프라인 검사, 덮어쓰기 거부, 파일 잠금, 실패 후 이미지 보존·생성 정리, 구버전 거부 및 사용 중 삭제 거부를 확인한다. 재마운트 영속성 검사는 폐기 가능한 CAP_SYS_ADMIN 환경에서 실행한다.
+
+```sh
+cargo test --locked --bin ssald real_ext4_remount_preserves_data_and_releases_loops -- --ignored --test-threads=1
+```
+
+실기기에서는 새 프로필로 mount/unmount 및 기존 launcher 회귀를 먼저 확인하고, 그 다음 하드 재부팅 후 One UI 복귀와 이미지 재마운트를 검증한다. 기존 실측 문서의 directory-backed 결과는 새 이미지 경로의 통과 증거가 아니다.

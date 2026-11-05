@@ -12,5 +12,7 @@ if [ -e "$output" ]; then
 fi
 mkdir -p "$(dirname "$output")"
 truncate -s "$size" "$output"
-mkfs.ext4 -F -b 4096 -m 0 -L ssal-data "$output"
+mkfs.ext4 -F -b 4096 -m 0 -L ssal-data \
+  -O none,has_journal,ext_attr,extent,filetype,sparse_super,large_file,huge_file,dir_nlink,extra_isize \
+  -E nodiscard,lazy_itable_init=0,lazy_journal_init=0 "$output"
 e2fsck -fn "$output"

@@ -30,7 +30,7 @@ fi
 export SSAL_PHASE7D_FIX_HELPER="$base/helper-final"
 "/dev/ssal-common-launcher/ssald" --guest-memory-worker \
     /data/local/ssal/images/1793366406758-25627/system.img \
-    /data/local/ssal/guests/phase5a-bringup-20261104/userdata "$stage/worker" > "$stage/worker.log" 2>&1 &
+    /data/local/ssal/guests/phase5a-bringup-20261104/userdata.img "$stage/worker" > "$stage/worker.log" 2>&1 &
 worker=$!
 trap 'if kill -0 "$worker" 2>/dev/null; then kill -TERM "$worker" 2>/dev/null || true; wait "$worker" 2>/dev/null || true; fi' EXIT
 ready=0

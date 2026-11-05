@@ -320,11 +320,13 @@ fn compose_system(mounts: &mut Mounts, system: &Path, root: &Path) -> io::Result
     Ok(())
 }
 
-fn prepare_lock_compat(mounts: &mut Mounts, root: &Path, userdata: &Path) -> io::Result<()> {
-    let profile_path = userdata
-        .parent()
-        .ok_or_else(|| io::Error::other("profile parent missing"))?
-        .join("profile.json");
+fn prepare_lock_compat(
+    mounts: &mut Mounts,
+    root: &Path,
+    userdata: &Path,
+    profile_dir: &Path,
+) -> io::Result<()> {
+    let profile_path = profile_dir.join("profile.json");
     let profile: serde_json::Value = serde_json::from_slice(&fs::read(profile_path)?)?;
     let config = ssal::guest_lock_compat::Config::from_profile(&profile)?;
     // This stage is offline-only until the recorded runtime blockers are resolved.
@@ -332,7 +334,7 @@ fn prepare_lock_compat(mounts: &mut Mounts, root: &Path, userdata: &Path) -> io:
     let plan = config.plan(
         profile["guest_lock_compat_creation"]["version"] == 1,
         if config.enabled {
-            fs::read_dir(userdata)?.next().is_none()
+            crate::userdata::fresh(userdata)?
         } else {
             false
         },
@@ -1067,6 +1069,7 @@ fn processgroup_probe(
 pub fn verify(
     system: &Path,
     userdata: &Path,
+    profile_dir: &Path,
     base: &Path,
     loop_nodes: &crate::prepare::LoopNodes,
     mode: &str,
@@ -1096,7 +1099,7 @@ pub fn verify(
         }
         mounts.tmpfs(&root, 0o755)?;
         compose_system(&mut mounts, system, &root)?;
-        prepare_lock_compat(&mut mounts, &root, userdata)?;
+        prepare_lock_compat(&mut mounts, &root, userdata, profile_dir)?;
         for name in ["product", "system_ext"] {
             if root.join(name).symlink_metadata().is_err()
                 && guest_path(&root, &format!("system/{name}")).is_ok()
@@ -1257,10 +1260,7 @@ pub fn verify(
         if root.join("sdcard").symlink_metadata().is_err() {
             symlink("/storage/self/primary", root.join("sdcard"))?;
         }
-        let patch_dir = userdata
-            .parent()
-            .ok_or_else(|| io::Error::other("userdata parent missing"))?
-            .join("patches");
+        let patch_dir = profile_dir.join("patches");
         patches(&mut mounts, &profile, &patch_dir, &root, false)?;
         code_bridges(&mut mounts, &root, &patch_dir)?;
         println!("guest stage: APEX preparation");

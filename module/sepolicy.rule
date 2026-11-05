@@ -2,6 +2,10 @@ type ssal_image_file file_type
 typeattribute ssal_image_file data_file_type
 allow kernel ssal_image_file file read
 allow ksu ssal_image_file file { open read write getattr setattr relabelto unlink }
+type ssal_userdata_image_file file_type
+typeattribute ssal_userdata_image_file data_file_type
+allow kernel ssal_userdata_image_file file { read write }
+allow ksu ssal_userdata_image_file file { open read write getattr setattr relabelto unlink lock ioctl }
 allow aidl_lazy_test_server aidl_lazy_test_server_exec file { entrypoint execute open read getattr map }
 allow aidl_lazy_test_server aidl_lazy_test_service service_manager add
 allow aidl_lazy_test_server servicemanager binder { call transfer }

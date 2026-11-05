@@ -191,9 +191,6 @@ fn dac_allows(meta: &fs::Metadata, required: u32) -> bool {
 
 fn protections(root: &Path) -> io::Result<Value> {
     let media = observe(root, "data/media");
-    // Directory-backed userdata can legitimately reside on the same filesystem.
-    // Distinct inode identity and absence of nested mounts are the relevant
-    // checks, not different st_dev values.
     let media_path = crate::guest_mounts::guest_path(root, "data/media")?;
     let nested_mounts: Vec<_> = fs::read_to_string("/proc/self/mountinfo")?
         .lines()
@@ -202,6 +199,7 @@ fn protections(root: &Path) -> io::Result<Value> {
         .map(str::to_owned)
         .collect();
     let media_ok = media["same_host_object"] == false
+        && media["guest"]["dev"] != media["host"]["dev"]
         && media["guest"]["directory"] == true
         && media["host"]["directory"] == true
         && nested_mounts.is_empty();
@@ -237,7 +235,7 @@ fn protections(root: &Path) -> io::Result<Value> {
         same_ns.insert(name.into(), json!({"same": host.as_ref().ok().zip(worker.as_ref().ok()).map(|(a,b)| a == b), "host_error": host.err().map(|e| e.to_string()), "worker_error": worker.err().map(|e| e.to_string())}));
     }
     Ok(
-        json!({"status": "blocked", "media": {"status": if media_ok { "passed" } else { "failed" }, "observation": media, "nested_mounts": nested_mounts, "scope": "directory identity and mount topology; directory-backed userdata may share filesystem; no file content scan"},
+        json!({"status": "blocked", "media": {"status": if media_ok { "passed" } else { "failed" }, "observation": media, "nested_mounts": nested_mounts, "scope": "distinct filesystem, directory identity and mount topology; no file content scan"},
         "paths": paths, "namespaces": ns, "shares_host_init_namespace": same_ns,
         "proc_magic_host_binder": {"observation": proc_binder.as_ref().ok(), "error": proc_binder.err().map(|e| e.to_string()), "same_host_object": proc_host_shared, "scope": "observed by privileged worker through kernel magic link, not proof of target-domain access"},
         "fallback": {"status": "blocked", "default_driver": "see private_binder stage identity; never accepted without successful provisioning", "remaining": "host PID/proc root and inherited FD escape routes, other dev aliases and exact binary fallback closure not excluded"},

@@ -29,7 +29,7 @@ snapshot > "$stage/before.txt"
 set +e
 "$bin/ssald" "${1:---guest-service-worker}" \
     /data/local/ssal/images/1793366406758-25627/system.img \
-    /data/local/ssal/guests/phase5a-bringup-20261104/userdata \
+    /data/local/ssal/guests/phase5a-bringup-20261104/userdata.img \
     "$stage/worker" > "$stage/worker.log" 2>&1
 status=$?
 set -e
