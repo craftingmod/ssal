@@ -1,0 +1,16 @@
+# Review-only Phase 8B-2 transition delta. Never apply live from this file.
+# The transition source is the Guest Zygote's existing ssal_guest_probe domain.
+# Keep only these new Guest domains permissive during AVC collection.
+# Remove both permissive statements before any enforcing acceptance run.
+type ssal_guest_system_server_startup domain
+typeattribute ssal_guest_system_server_startup coredomain
+type ssal_guest_system_server domain
+typeattribute ssal_guest_system_server coredomain
+permissive ssal_guest_system_server_startup
+permissive ssal_guest_system_server
+allow ssal_guest_probe self process setcurrent
+allow ssal_guest_probe ssal_guest_system_server_startup process dyntransition
+allow ssal_guest_system_server_startup self process setcurrent
+allow ssal_guest_system_server_startup ssal_guest_system_server process dyntransition
+allow ssal_guest_system_server_startup ssal_guest_probe process sigchld
+allow ssal_guest_system_server ssal_guest_probe process sigchld

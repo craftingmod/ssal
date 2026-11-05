@@ -16,6 +16,14 @@ pub(crate) use fork_probe::client as fork_client;
 const GUEST_PROBE_CONTEXT: &[u8] = b"u:r:ssal_guest_probe:s0\0";
 const PROPERTY_SERVICE_CONTEXT: &[u8] = b"u:r:ssal_property:s0\0";
 
+#[derive(Debug, PartialEq, Eq)]
+struct GuestClasspaths {
+    boot: String,
+    dex2oat: Option<String>,
+    system_server: String,
+    standalone_system_server: Option<String>,
+}
+
 pub(crate) fn command(
     root: &Path,
     executable: &str,
@@ -279,6 +287,18 @@ impl Service {
             if std::env::var_os("SSAL_PHASE7FB_FORK").is_some() {
                 command.env("LD_PRELOAD", "/run/ssal/ssal-phase2-log.so:/run/ssal/ssal-zygote-diag.so:/run/ssal/ssal-zygote-fd-reopen.so")
                     .env("SSAL_PHASE7FB_FD_REOPEN", "1");
+            }
+            if std::env::var_os("SSAL_PHASE8B3B_NOOP").is_some() {
+                let preload = command
+                    .get_envs()
+                    .find_map(|(key, value)| {
+                        (key == "LD_PRELOAD").then_some(value.unwrap().to_string_lossy().into_owned())
+                    })
+                    .unwrap();
+                command
+                    .env("LD_PRELOAD", format!("/run/ssal/ssal-zygote-selinux-noop.so:{preload}"))
+                    .env("SSAL_PHASE8B3B_NOOP", "1")
+                    .env_remove("SSAL_PHASE7FC_BYPASS_SETCONTEXT");
             }
         } else if diagnostic {
             command.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -612,36 +632,103 @@ impl Drop for Service {
     }
 }
 
-fn classpath_exports(content: &str) -> io::Result<(String, Option<String>)> {
+fn classpath_exports(content: &str) -> io::Result<GuestClasspaths> {
     let mut boot = None;
     let mut dex2oat = None;
+    let mut system_server = None;
+    let mut standalone_system_server = None;
+    let mut standalone_seen = false;
     for line in content.lines() {
         let mut fields = line.split_whitespace();
         if fields.next() != Some("export") {
             continue;
         }
-        let (Some(name), Some(value)) = (fields.next(), fields.next()) else {
+        let Some(name) = fields.next() else {
             continue;
         };
-        if fields.next().is_some() || value.is_empty() {
+        let value = fields.next();
+        if fields.next().is_some() {
             return Err(io::Error::other("invalid Guest classpath export"));
         }
         let destination = match name {
             "BOOTCLASSPATH" => &mut boot,
             "DEX2OATBOOTCLASSPATH" => &mut dex2oat,
+            "SYSTEMSERVERCLASSPATH" => &mut system_server,
+            "STANDALONE_SYSTEMSERVER_JARS" => {
+                if standalone_seen {
+                    return Err(io::Error::other(
+                        "duplicate Guest STANDALONE_SYSTEMSERVER_JARS",
+                    ));
+                }
+                standalone_seen = true;
+                standalone_system_server =
+                    value.filter(|value| !value.is_empty()).map(str::to_owned);
+                continue;
+            }
             _ => continue,
         };
+        let value = value
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| io::Error::other(format!("Guest {name} missing")))?;
         if destination.replace(value.to_owned()).is_some() {
             return Err(io::Error::other(format!("duplicate Guest {name}")));
         }
     }
-    Ok((
-        boot.ok_or_else(|| io::Error::other("Guest BOOTCLASSPATH missing"))?,
+    Ok(GuestClasspaths {
+        boot: boot.ok_or_else(|| io::Error::other("Guest BOOTCLASSPATH missing"))?,
         dex2oat,
-    ))
+        system_server: system_server
+            .ok_or_else(|| io::Error::other("Guest SYSTEMSERVERCLASSPATH missing"))?,
+        standalone_system_server,
+    })
 }
 
-fn derive_guest_classpath(root: &Path) -> io::Result<(String, Option<String>)> {
+fn checked_guest_classpath_paths(classpaths: &GuestClasspaths) -> io::Result<Vec<String>> {
+    let mut paths = Vec::new();
+    for classpath in std::iter::once(classpaths.boot.as_str())
+        .chain(classpaths.dex2oat.iter().map(String::as_str))
+        .chain(std::iter::once(classpaths.system_server.as_str()))
+        .chain(
+            classpaths
+                .standalone_system_server
+                .iter()
+                .map(String::as_str),
+        )
+    {
+        for path in classpath.split(':') {
+            if !["/apex/", "/product/", "/system/", "/system_ext/"]
+                .iter()
+                .any(|prefix| path.starts_with(prefix))
+                || path
+                    .split('/')
+                    .skip(1)
+                    .any(|part| part.is_empty() || part == "." || part == "..")
+                || path
+                    .bytes()
+                    .any(|byte| byte.is_ascii_whitespace() || byte == b'\\' || byte == 0)
+            {
+                return Err(io::Error::other(format!(
+                    "Guest classpath escaped system/APEX roots: {path}"
+                )));
+            }
+            paths.push(path.to_owned());
+        }
+    }
+    paths.extend([
+        "/system/framework/services.jar".to_owned(),
+        "/system/lib64/libandroid_servers.so".to_owned(),
+    ]);
+    Ok(paths)
+}
+
+fn guest_env_value<'a>(environ: &'a [u8], name: &str) -> Option<&'a [u8]> {
+    let prefix = format!("{name}=");
+    environ
+        .split(|byte| *byte == 0)
+        .find_map(|entry| entry.strip_prefix(prefix.as_bytes()))
+}
+
+fn derive_guest_classpath(root: &Path) -> io::Result<GuestClasspaths> {
     const OUTPUT: &str = "/run/ssal/phase7a-classpath.env";
     run(
         root,
@@ -657,25 +744,26 @@ fn derive_guest_classpath(root: &Path) -> io::Result<(String, Option<String>)> {
         root.join(OUTPUT.trim_start_matches('/')),
     )?);
     fs::remove_file(root.join(OUTPUT.trim_start_matches('/')))?;
-    let (boot, dex2oat) = result?;
-    for classpath in std::iter::once(&boot).chain(dex2oat.iter()) {
-        for path in classpath.split(':') {
-            if !["/apex/", "/product/", "/system/", "/system_ext/"]
-                .iter()
-                .any(|prefix| path.starts_with(prefix))
-            {
-                return Err(io::Error::other(format!(
-                    "Guest classpath escaped system/APEX roots: {path}"
-                )));
-            }
-        }
-    }
+    let classpaths = result?;
+    let paths = checked_guest_classpath_paths(&classpaths)?;
+    let mut args = vec![
+        "-c",
+        "set -eu; for path do test -f \"$path\" || { echo \"missing Guest classpath file: $path\" >&2; exit 1; }; done",
+        "ssal-classpath-preflight",
+    ];
+    args.extend(paths.iter().map(String::as_str));
+    run(root, "/system/bin/sh", &args, 0)?;
     println!(
-        "Guest classpath source=derive_classpath(Guest SDK 36, REL) boot_entries={} dex2oat_entries={}",
-        boot.split(':').count(),
-        dex2oat.as_deref().map_or(0, |v| v.split(':').count())
+        "Guest classpath source=derive_classpath(Guest SDK 36, REL) boot_entries={} dex2oat_entries={} system_server_entries={} standalone_system_server_entries={}",
+        classpaths.boot.split(':').count(),
+        classpaths.dex2oat.as_deref().map_or(0, |v| v.split(':').count()),
+        classpaths.system_server.split(':').count(),
+        classpaths
+            .standalone_system_server
+            .as_deref()
+            .map_or(0, |v| v.split(':').count())
     );
-    Ok((boot, dex2oat))
+    Ok(classpaths)
 }
 
 fn start_property_service(
@@ -872,6 +960,9 @@ pub(crate) fn verify(
     ];
     if phase7i_properties {
         runtime_bins.push("ssal-property-service");
+    }
+    if phase7a && std::env::var_os("SSAL_PHASE8B3B_NOOP").is_some() {
+        runtime_bins.extend(["ssal-zygote-selinux-noop.so", "ssal-selinux-startup-probe"]);
     }
     for name in runtime_bins {
         if name == "ssal-zygote-diag.so" && !phase7a {
@@ -1071,6 +1162,30 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
         println!("PHASE5B=PASS shell=PASS private_aidl=PASS properties=PASS host_control_socket=ABSENT private_binder={major}:{minor}");
         if phase7a {
             let controlled_fork = std::env::var_os("SSAL_PHASE7FB_FORK").is_some();
+            if std::env::var_os("SSAL_PHASE8B3B_NOOP").is_some() {
+                // Separate native process, stock Guest seapp rules, no ART or SystemServer.main.
+                let output = crate::guest_probe::run_with_timeout(
+                    command(
+                        root,
+                        "/run/ssal/ssal-selinux-startup-probe",
+                        1000,
+                        Some(GUEST_PROBE_CONTEXT),
+                    )?
+                    .env("LD_LIBRARY_PATH", "/run/ssal:/system/lib64")
+                    .env("LD_PRELOAD", "/run/ssal/ssal-zygote-selinux-noop.so"),
+                    "SELinux startup diagnostic",
+                    Duration::from_secs(10),
+                )?;
+                println!(
+                    "Guest isolated SELinux startup diagnostic exit={}\n{}{}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                if !output.status.success() {
+                    return Err(io::Error::other("SELinux startup diagnostic failed to execute"));
+                }
+            }
             if controlled_fork {
                 fork_probe::prepare(mounts, root, &bin, phase7i_properties)?;
             }
@@ -1085,11 +1200,11 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
                 0,
             )?;
             println!("Guest Zygote binary preflight:\n{binary}");
-            let (boot_classpath, dex2oat_classpath) = derive_guest_classpath(root)?;
+            let classpaths = derive_guest_classpath(root)?;
             let boot_classpath = if controlled_fork {
-                format!("{boot_classpath}:/system/framework/am.jar")
+                format!("{}:/system/framework/am.jar", classpaths.boot)
             } else {
-                boot_classpath
+                classpaths.boot.clone()
             };
             let mut zygote_env = vec![
                 ("ANDROID_BOOTLOGO", "1"),
@@ -1101,9 +1216,13 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
                     "/run/ssal:/apex/com.android.adbd/lib64:/system/lib64:/apex/com.android.os.statsd/lib64:/apex/com.android.i18n/lib64",
                 ),
                 ("BOOTCLASSPATH", boot_classpath.as_str()),
+                ("SYSTEMSERVERCLASSPATH", classpaths.system_server.as_str()),
             ];
-            if let Some(classpath) = dex2oat_classpath.as_deref() {
+            if let Some(classpath) = classpaths.dex2oat.as_deref() {
                 zygote_env.push(("DEX2OATBOOTCLASSPATH", classpath));
+            }
+            if let Some(jars) = classpaths.standalone_system_server.as_deref() {
+                zygote_env.push(("STANDALONE_SYSTEMSERVER_JARS", jars));
             }
             if phase7i_properties {
                 zygote_env.push(("SSAL_PHASE7I_PROPERTIES", "1"));
@@ -1201,6 +1320,29 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
                 socket.mode() & 0o777
             );
             let environ = fs::read(format!("/proc/{pid}/environ"))?;
+            let standalone_env_matches = match classpaths.standalone_system_server.as_deref() {
+                Some(expected) => {
+                    guest_env_value(&environ, "STANDALONE_SYSTEMSERVER_JARS")
+                        == Some(expected.as_bytes())
+                }
+                None => guest_env_value(&environ, "STANDALONE_SYSTEMSERVER_JARS").is_none(),
+            };
+            if guest_env_value(&environ, "SYSTEMSERVERCLASSPATH")
+                != Some(classpaths.system_server.as_bytes())
+                || !standalone_env_matches
+            {
+                return Err(io::Error::other(
+                    "Guest system-server classpath environment mismatch",
+                ));
+            }
+            println!(
+                "Guest Zygote classpath environment verified system_server_entries={} standalone_entries={}",
+                classpaths.system_server.split(':').count(),
+                classpaths
+                    .standalone_system_server
+                    .as_deref()
+                    .map_or(0, |v| v.split(':').count())
+            );
             let inherited_sockets: Vec<_> = environ
                 .split(|b| *b == 0)
                 .filter_map(|entry| {
@@ -1499,23 +1641,51 @@ mod tests {
     }
 
     #[test]
-    fn classpath_exports_keep_guest_runtime_classpaths_only() -> io::Result<()> {
-        let (boot, dex2oat) = classpath_exports(
-            "export SYSTEMSERVERCLASSPATH /system/framework/services.jar\nexport BOOTCLASSPATH /apex/com.android.art/javalib/core-oj.jar:/system/framework/framework.jar\nexport DEX2OATBOOTCLASSPATH /apex/com.android.art/javalib/core-oj.jar\n",
+    fn classpath_exports_include_guest_system_server_jars() -> io::Result<()> {
+        let classpaths = classpath_exports(
+            "export SYSTEMSERVERCLASSPATH /system/framework/services.jar\nexport BOOTCLASSPATH /apex/com.android.art/javalib/core-oj.jar:/system/framework/framework.jar\nexport DEX2OATBOOTCLASSPATH /apex/com.android.art/javalib/core-oj.jar\nexport STANDALONE_SYSTEMSERVER_JARS /apex/com.android.os.statsd/javalib/service-statsd.jar\n",
         )?;
         assert_eq!(
-            boot,
+            classpaths.boot,
             "/apex/com.android.art/javalib/core-oj.jar:/system/framework/framework.jar"
         );
         assert_eq!(
-            dex2oat.as_deref(),
+            classpaths.dex2oat.as_deref(),
             Some("/apex/com.android.art/javalib/core-oj.jar")
+        );
+        assert_eq!(classpaths.system_server, "/system/framework/services.jar");
+        assert_eq!(
+            classpaths.standalone_system_server.as_deref(),
+            Some("/apex/com.android.os.statsd/javalib/service-statsd.jar")
+        );
+        assert!(
+            classpath_exports("export BOOTCLASSPATH /system/framework/framework.jar\n").is_err()
         );
         assert!(
             classpath_exports("export SYSTEMSERVERCLASSPATH /system/framework/services.jar\n")
                 .is_err()
         );
-        assert!(classpath_exports("export BOOTCLASSPATH\n").is_err());
+        assert!(classpath_exports(
+            "export BOOTCLASSPATH /system/framework/framework.jar\nexport BOOTCLASSPATH /system/framework/framework.jar\nexport SYSTEMSERVERCLASSPATH /system/framework/services.jar\n"
+        )
+        .is_err());
+
+        let optional_standalone = classpath_exports(
+            "export BOOTCLASSPATH /system/framework/framework.jar\nexport SYSTEMSERVERCLASSPATH /system/framework/services.jar\nexport STANDALONE_SYSTEMSERVER_JARS\n",
+        )?;
+        assert_eq!(optional_standalone.standalone_system_server, None);
+        assert!(checked_guest_classpath_paths(&optional_standalone).is_ok());
+        let escaped = classpath_exports(
+            "export BOOTCLASSPATH /system/../data/host.jar\nexport SYSTEMSERVERCLASSPATH /system/framework/services.jar\n",
+        )?;
+        assert!(checked_guest_classpath_paths(&escaped).is_err());
+        assert_eq!(
+            guest_env_value(
+                b"BOOTCLASSPATH=/guest.jar\0SYSTEMSERVERCLASSPATH=/guest/services.jar\0",
+                "SYSTEMSERVERCLASSPATH"
+            ),
+            Some(b"/guest/services.jar".as_slice())
+        );
         Ok(())
     }
 

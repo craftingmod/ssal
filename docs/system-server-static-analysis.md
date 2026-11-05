@@ -4,6 +4,8 @@
 - 범위: 읽기 전용 소스·이미지 정적 분석. Guest `system_server` 실행, Host 서비스/HAL 조작, 정책 변경, SSAL 수정은 하지 않았다.
 - 판정 기준: `SAFE`는 격리된 실행 경로가 근거로 확인된 경우에만 쓴다. `UNKNOWN`은 안전하다는 뜻이 아니다.
 
+> **역사적 상태 스냅샷:** 이 문서는 Phase 7I 통합 전인 2026-11-04 자료다. Guest Property Service, Private Binder/AIDL, Zygote fork 및 Java `ForkProbe.main()`은 이후 Phase 7I에서 PoC 범위로 검증됐다. 해당 기능의 현재 증거와 `system_server` 미검증 항목은 [Phase 8A 결과](system-server-phase8a-results.md) 및 [Host 경계](system-server-phase8a-host-boundaries.md)를 따른다. `system_server`는 여전히 실행되지 않았고 `launch_enabled=false`, `switch`/`return` 차단은 유지된다.
+
 ## 1. Executive Summary
 
 **현재 SSAL에서 Android 16 LineageOS `system_server`를 Host One UI에 영향을 주지 않게 실행할 조건은 아직 충족되지 않았다.** 현재 코드와 검증은 `system_server` 실행을 의도적으로 막는다. `launch_enabled=false`이며 `switch`와 `return`도 거부된다. 공유 PID 조사는 완료했고 PID namespace 부재는 blocker가 아니다. 아직 private property/framework Binder, 실행 런처·cgroup 경로와 HAL 조건이 검증되지 않았다.

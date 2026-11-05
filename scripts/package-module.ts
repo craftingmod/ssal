@@ -33,6 +33,8 @@ const entries: { name: string; path: string; mode: number }[] = [
     "ssal-phase2-log.so",
     "ssal-zygote-diag.so",
     "ssal-zygote-fd-reopen.so",
+    "ssal-zygote-selinux-noop.so",
+    "ssal-selinux-startup-probe",
     "fork-probe.jar",
   ].map((name) => ({
     name: `bin/${name}`,

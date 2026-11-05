@@ -24,7 +24,12 @@ static volatile sig_atomic_t guest_context_precheck_ok;
 static volatile sig_atomic_t guest_context_precheck_errno;
 
 int selinux_android_setcontext(uid_t uid, int server, const char *seinfo, const char *name) {
+    int incoming = errno;
     int (*real_setcontext)(uid_t, int, const char *, const char *) = dlsym(RTLD_NEXT, "selinux_android_setcontext");
+    if (getenv("SSAL_PHASE8B3B_NOOP")) {
+        errno = real_setcontext ? incoming : ENOSYS;
+        return real_setcontext ? real_setcontext(uid, server, seinfo, name) : -1;
+    }
     int (*get_context)(char **) = dlsym(RTLD_NEXT, "getcon");
     char *original = NULL;
     int got = get_context ? get_context(&original) : -2;

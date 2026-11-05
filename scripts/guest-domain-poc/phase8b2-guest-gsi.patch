@@ -1,0 +1,24 @@
+diff --git a/private/seapp_contexts b/private/seapp_contexts
+--- a/private/seapp_contexts
++++ b/private/seapp_contexts
+@@ -126,4 +126,8 @@
+ neverallow isSystemServer=false domain=system_server
+ neverallow isSystemServer=false domain=system_server_startup
++neverallow isSystemServer=false domain=ssal_guest_system_server_startup
++neverallow isSystemServer=false domain=ssal_guest_system_server
+ neverallow isSystemServer="" domain=system_server
+ neverallow isSystemServer="" domain=system_server_startup
++neverallow isSystemServer="" domain=ssal_guest_system_server_startup
++neverallow isSystemServer="" domain=ssal_guest_system_server
+@@ -164,1 +168,1 @@
+-isSystemServer=true domain=system_server_startup
++isSystemServer=true domain=ssal_guest_system_server_startup
+diff --git a/core/jni/com_android_internal_os_Zygote.cpp b/core/jni/com_android_internal_os_Zygote.cpp
+--- a/core/jni/com_android_internal_os_Zygote.cpp
++++ b/core/jni/com_android_internal_os_Zygote.cpp
+@@ -1450,4 +1450,4 @@
+-    static const char* kSystemServerLabel = "u:r:system_server:s0";
++    static const char* kSystemServerLabel = "u:r:ssal_guest_system_server:s0";
+     if (selinux_android_setcon(kSystemServerLabel) != 0) {
+         fail_fn(CREATE_ERROR("selinux_android_setcon(%s)", kSystemServerLabel));
+     }
