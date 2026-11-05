@@ -8,6 +8,8 @@
 
 별도의 [Binder Test A](binder-probe.md)는 전용 private binderfs와 관리 도메인의 C++ context manager·클라이언트를 실행한다. 그 시험에서의 IPC 성공을 본 계약의 servicemanager·SELinux·호스트 레지스트리 격리 통과로 간주하지 않는다.
 
+2026-11-05: [실험용 Guest property server](guest-property-service.md)에 area 쓰기·읽기와 Android protobuf `/data/property/persistent_properties` 저장·복구를 구현했다. 전용 production 도메인과 supervisor 통합 검증은 남아 있으며 운영 서비스 실행은 활성화하지 않는다.
+
 ## 1. 현재 상태와 목표
 
 | 대상 | 현재 prepare | 서비스 실행에 적용할 목표 |

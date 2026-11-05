@@ -19,7 +19,7 @@ KernelSU 모듈과 Android arm64 CLI의 초기 구현입니다. `ssald`가 root 
 
 `prepare`는 linkerconfig 생성 이후 게스트 chroot·별도 자식의 `pivot_root`에서 동적 shell과 경로·userdata 쓰기/읽기를 검사합니다. `/tmp`·`/cache`는 RW tmpfs, `/metadata`·`/config`는 빈 RO tmpfs로 구성합니다. SELinux·fscrypt·VINTF와 Binder/property 공유 상태를 진단하고 정리 후 잔여 mount·세션 loop backing을 확인합니다. 진단 결과는 Android 서비스·FUSE·암호화·HAL 호환성이나 부팅 성공을 보장하지 않습니다.
 
-서비스 실행의 목표와 기동·종료·복구 조건은 [서비스 실행 계약](docs/service-execution-contract.md)에 정의했습니다. prepare는 linkerconfig 구조 요약, 식별자를 노출하지 않는 CE/DE 경로 정책 비교, shell 전용 SELinux 관찰과 VINTF의 `passed/failed/unavailable/error`를 출력하고 서비스별 기동 차단 사유를 확인합니다. 계약 검증은 구현했지만 private property/Binder·HAL 중계·서비스 런처는 아직 없으며 Android 서비스를 시작하지 않습니다.
+서비스 실행의 목표와 기동·종료·복구 조건은 [서비스 실행 계약](docs/service-execution-contract.md)에 정의했습니다. prepare는 linkerconfig 구조 요약, 식별자를 노출하지 않는 CE/DE 경로 정책 비교, shell 전용 SELinux 관찰과 VINTF의 `passed/failed/unavailable/error`를 출력하고 서비스별 기동 차단 사유를 확인합니다. [실험용 Guest property server](docs/guest-property-service.md)는 private area 쓰기·읽기와 Android protobuf `/data/property/persistent_properties` 저장·복구를 구현했습니다. 전용 production 도메인 검증과 전체 서비스 supervisor 통합은 남아 있으며 prepare에서 Android 서비스를 시작하지 않습니다.
 
 `ssal probe-binder PROFILE_NAME`은 별도 [독립 Binder 시험](docs/binder-probe.md)을 실행합니다. 새 binderfs 장치 생성·열기·최소 IPC·정리를 각각 기록하며 AOSP servicemanager나 HAL은 실행하지 않습니다. IPC 헬퍼는 게스트 플랫폼 라이브러리와 별도 빌드하고 이미지 일치 해시를 검사합니다. 일반 prepare와 Android 서비스 기동 차단은 유지합니다.
 

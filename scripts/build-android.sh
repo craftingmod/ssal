@@ -18,3 +18,4 @@ install -m 755 "$CARGO_TARGET_DIR/aarch64-linux-android/release/ssal-selinux-ide
 install -m 755 "$CARGO_TARGET_DIR/aarch64-linux-android/release/ssal-guest-domain-poc" out/bin/ssal-guest-domain-poc
 install -m 755 "$CARGO_TARGET_DIR/aarch64-linux-android/release/ssal-binder-access" out/bin/ssal-binder-access
 install -m 755 "$CARGO_TARGET_DIR/aarch64-linux-android/release/ssal-enforcing-binder" out/bin/ssal-enforcing-binder
+install -m 755 "$CARGO_TARGET_DIR/aarch64-linux-android/release/ssal-property-service" out/bin/ssal-property-service

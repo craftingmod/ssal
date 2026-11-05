@@ -1,0 +1,32 @@
+# Experimental fixture only; check before loading. No permissions are added to Host domains.
+# For AVC collection an operator may separately mark only ssal_property permissive.
+type ssal_property domain
+type ssal_property_exec file_type
+type ssal_guest_property_dir file_type
+type ssal_guest_property_area file_type
+typeattribute ssal_guest_property_area property_type
+type ssal_guest_property_info file_type
+type ssal_guest_property_serial file_type
+type ssal_guest_property_socket file_type
+type ssal_guest_property_data_file file_type
+typeattribute ssal_guest_property_data_file data_file_type
+allow ssal_property ssal_property_exec file { entrypoint execute open read getattr map }
+allow ssal_property ssal_property unix_stream_socket { create bind listen accept read write getattr getopt setopt shutdown }
+allow ssal_property ssal_guest_property_dir dir { search getattr open read write add_name remove_name relabelfrom relabelto }
+allow ssal_property ssal_guest_property_area file { create open read write getattr map lock unlink relabelfrom relabelto }
+allow ssal_property ssal_guest_property_info file { create open read write getattr map unlink relabelfrom relabelto }
+allow ssal_property ssal_guest_property_serial file { create open read write getattr map unlink relabelfrom relabelto }
+allow ssal_property ssal_guest_property_socket sock_file { create getattr setattr unlink relabelfrom relabelto }
+allow ssal_property ssal_guest_property_data_file dir { search getattr open read write add_name remove_name }
+allow ssal_property ssal_guest_property_data_file file { create open read write getattr lock rename unlink }
+allow ssal_property ssal_guest_property_area property_service set
+allow ssal_guest_property_dir tmpfs filesystem associate
+allow ssal_guest_property_area tmpfs filesystem associate
+allow ssal_guest_property_info tmpfs filesystem associate
+allow ssal_guest_property_serial tmpfs filesystem associate
+allow ssal_guest_property_socket tmpfs filesystem associate
+type_transition ssal_property ssal_guest_property_dir file ssal_guest_property_area
+type_transition ssal_property ssal_guest_property_data_file file ssal_guest_property_data_file
+# Launcher-specific exec, stdio, proc/current SID, selinuxfs transactions, input reads,
+# socket-parent labels and userdata filesystem association need exact Guest-subject rules.
+# GSI contexts also need their individual Guest writer/readers and valid kernel types.
