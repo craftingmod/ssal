@@ -3,6 +3,10 @@
 감사일: 2026-11-06 (KST)  
 범위: 기존 GSI의 ELF 바이너리·공유 라이브러리, APEX payload, APK 내 ELF에 대한 읽기 전용 정적 분석. 이미지 재빌드, 기기 정책 변경, Guest 서비스 실행은 하지 않았다.
 
+후속 [Phase 8B SID 분리 실험](phase8b-guest-system-server-sid.md)에서는 arm64 final literal과 Guest startup selector를 별도 산출물로 패치했다. 원본 GSI는 유지했다. 새 Guest context에 대한 native `setcon()`은 EINVAL로 실패했으며, patched GSI의 실제 `forkSystemServer()` 및 Host canary 검사는 미실행이다. 아래 표의 미호출 표기는 원본 GSI 경로에 대한 감사 결과다.
+
+추가 후속: KernelSU Guest-only policy 추가 후 [native startup→final SID 획득과 canary 접근 차단은 PASS](phase8b-guest-system-server-sid-ksu.md)했다. 실제 patched GSI `forkSystemServer()`는 여전히 미검증이다.
+
 ## 요약
 
 - 대상은 `out/LineageOS-23.2-20260524-VANILLA-EXT4-GSI.img` (SHA-256 `7b9ba62e8b48b6e40432be949ae0858a8971175c79502550e74691222d3889ff`, Android 16 / SDK 36)이다.

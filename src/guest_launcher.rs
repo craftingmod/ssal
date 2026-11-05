@@ -11,6 +11,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 mod fork_probe;
+mod system_server_preflight;
 pub(crate) use fork_probe::client as fork_client;
 
 const GUEST_PROBE_CONTEXT: &[u8] = b"u:r:ssal_guest_probe:s0\0";
@@ -926,6 +927,17 @@ pub(crate) fn verify(
     host_mount_namespace: &Path,
 ) -> io::Result<()> {
     let phase7i_properties = phase7a && std::env::var_os("SSAL_PHASE7I_PROPERTIES").is_some();
+    let system_server_preflight = system_server_preflight::enabled()?;
+    if system_server_preflight
+        && (!phase7i_properties
+            || ["SSAL_PHASE8B3B_NOOP", "SSAL_PHASE8B3D_TRACE", "SSAL_PHASE8B3D_SAME_CONTEXT"]
+                .iter()
+                .any(|key| std::env::var_os(key).is_some()))
+    {
+        return Err(io::Error::other(
+            "8B-4B-1 requires Phase 7I and unmodified Guest SELinux libraries",
+        ));
+    }
     if fs::read_to_string("/sys/fs/selinux/enforce")?.trim() != "1" {
         return Err(io::Error::other("Host global Enforcing required"));
     }
@@ -972,7 +984,18 @@ pub(crate) fn verify(
         File::create(&target)?;
         mounts.bind(&bin.join(name), &target, true, false)?;
     }
+    if phase7a && std::env::var_os("SSAL_PHASE8B3D_SAME_CONTEXT").is_some() {
+        mounts.bind(
+            &bin.join("ssal-libselinux-same-context.so"),
+            &root.join("system/lib64/libselinux.so"),
+            true,
+            false,
+        )?;
+    }
     let mut binder = crate::binder_probe::Session::new();
+    if system_server_preflight {
+        system_server_preflight::prepare(mounts, root, &bin)?;
+    }
     let mut property_service = None;
     let result = (|| {
         // Reuse the established servicemanager view: libselinux rejects an RO root.
@@ -1162,32 +1185,41 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
         println!("PHASE5B=PASS shell=PASS private_aidl=PASS properties=PASS host_control_socket=ABSENT private_binder={major}:{minor}");
         if phase7a {
             let controlled_fork = std::env::var_os("SSAL_PHASE7FB_FORK").is_some();
+            let app_trace = std::env::var_os("SSAL_PHASE8B3D_TRACE").is_some();
+            if controlled_fork && app_trace {
+                fork_probe::prepare(mounts, root, &bin, phase7i_properties)?;
+            }
             if std::env::var_os("SSAL_PHASE8B3B_NOOP").is_some() {
-                // Separate native process, stock Guest seapp rules, no ART or SystemServer.main.
-                let output = crate::guest_probe::run_with_timeout(
-                    command(
-                        root,
-                        "/run/ssal/ssal-selinux-startup-probe",
-                        1000,
-                        Some(GUEST_PROBE_CONTEXT),
-                    )?
-                    .env("LD_LIBRARY_PATH", "/run/ssal:/system/lib64")
-                    .env("LD_PRELOAD", "/run/ssal/ssal-zygote-selinux-noop.so"),
-                    "SELinux startup diagnostic",
-                    Duration::from_secs(10),
-                )?;
-                println!(
-                    "Guest isolated SELinux startup diagnostic exit={}\n{}{}",
-                    output.status,
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                );
-                if !output.status.success() {
-                    return Err(io::Error::other("SELinux startup diagnostic failed to execute"));
+                // App trace uses the same overlay as Zygote; startup diagnostic uses stock rules.
+                for probe_uid in if app_trace { &[0, 1000, 10000][..] } else { &[1000][..] } {
+                    let output = crate::guest_probe::run_with_timeout(
+                        command(
+                            root,
+                            "/run/ssal/ssal-selinux-startup-probe",
+                            *probe_uid,
+                            Some(GUEST_PROBE_CONTEXT),
+                        )?
+                        .env("LD_LIBRARY_PATH", "/run/ssal:/system/lib64")
+                        .env("LD_PRELOAD", "/run/ssal/ssal-zygote-selinux-noop.so"),
+                        "SELinux startup diagnostic",
+                        Duration::from_secs(10),
+                    )?;
+                    println!(
+                        "Guest isolated SELinux startup diagnostic exit={}\n{}{}",
+                        output.status,
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    if !output.status.success() {
+                        return Err(io::Error::other("SELinux startup diagnostic failed to execute"));
+                    }
                 }
             }
-            if controlled_fork {
+            if controlled_fork && !app_trace {
                 fork_probe::prepare(mounts, root, &bin, phase7i_properties)?;
+            }
+            if system_server_preflight {
+                system_server_preflight::run(root, &bin)?;
             }
             crate::guest_mounts::directory(root, "data/dalvik-cache", 0o771)?;
             let binary = run(

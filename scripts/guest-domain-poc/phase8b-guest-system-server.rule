@@ -1,0 +1,19 @@
+# Guest-only live delta authorized for the Phase 8B SID acquisition diagnostic.
+# ssal_guest_ss is the equal-length binary-patch name for Guest system_server.
+type ssal_guest_ss_startup domain
+typeattribute ssal_guest_ss_startup coredomain
+type ssal_guest_ss domain
+typeattribute ssal_guest_ss coredomain
+enforce ssal_guest_ss_startup
+enforce ssal_guest_ss
+allow ssal_guest_probe ssal_guest_probe process setcurrent
+allow ssal_guest_probe ssal_guest_ss_startup process dyntransition
+allow ssal_guest_ss_startup ssal_guest_ss_startup process setcurrent
+allow ssal_guest_ss_startup ssal_guest_ss process dyntransition
+allow ssal_guest_ss_startup ssal_guest_probe process sigchld
+allow ssal_guest_ss ssal_guest_probe process sigchld
+# KernelSU resolves literal type names here. Spell out same-domain targets.
+allow ssal_guest_ss_startup ssal_guest_ss_startup dir search
+allow ssal_guest_ss_startup ssal_guest_ss_startup file { open read write }
+allow ssal_guest_ss ssal_guest_ss dir search
+allow ssal_guest_ss ssal_guest_ss file { open read }

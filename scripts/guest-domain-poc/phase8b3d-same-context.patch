@@ -1,0 +1,27 @@
+--- a/libselinux/src/android/android_device.c
++++ b/libselinux/src/android/android_device.c
+@@ -116,15 +116,19 @@
+ 	if (!ctx_str)
+ 		goto oom;
+ 
++	/* An unchanged SID needs neither revalidation nor a setter. */
++	if (!strcmp(ctx_str, orig_ctx_str)) {
++		rc = 0;
++		goto out;
++	}
++
+ 	rc = security_check_context(ctx_str);
+ 	if (rc < 0)
+ 		goto err;
+ 
+-	if (strcmp(ctx_str, orig_ctx_str)) {
+-		rc = selinux_android_setcon(ctx_str);
+-		if (rc < 0)
+-			goto err;
+-	}
++	rc = selinux_android_setcon(ctx_str);
++	if (rc < 0)
++		goto err;
+ 
+ 	rc = 0;
+ out:
