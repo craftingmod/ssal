@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 mod fork_probe;
 mod system_server_preflight;
+mod system_server_runtime_sid;
 pub(crate) use fork_probe::client as fork_client;
 
 const GUEST_PROBE_CONTEXT: &[u8] = b"u:r:ssal_guest_probe:s0\0";
@@ -300,6 +301,9 @@ impl Service {
                     .env("LD_PRELOAD", format!("/run/ssal/ssal-zygote-selinux-noop.so:{preload}"))
                     .env("SSAL_PHASE8B3B_NOOP", "1")
                     .env_remove("SSAL_PHASE7FC_BYPASS_SETCONTEXT");
+            }
+            if std::env::var_os("SSAL_PHASE8B5_ONCE").is_some() {
+                command.env("LD_PRELOAD", "/run/ssal/ssal-system-server-runtime-sid.so:/run/ssal/ssal-phase2-log.so:/run/ssal/ssal-zygote-diag.so:/run/ssal/ssal-zygote-fd-reopen.so");
             }
         } else if diagnostic {
             command.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -928,6 +932,7 @@ pub(crate) fn verify(
 ) -> io::Result<()> {
     let phase7i_properties = phase7a && std::env::var_os("SSAL_PHASE7I_PROPERTIES").is_some();
     let system_server_preflight = system_server_preflight::enabled()?;
+    let runtime_sid = system_server_runtime_sid::enabled(phase7i_properties)?;
     if system_server_preflight
         && (!phase7i_properties
             || ["SSAL_PHASE8B3B_NOOP", "SSAL_PHASE8B3D_TRACE", "SSAL_PHASE8B3D_SAME_CONTEXT"]
@@ -1221,6 +1226,9 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
             if system_server_preflight {
                 system_server_preflight::run(root, &bin)?;
             }
+            if runtime_sid {
+                system_server_runtime_sid::prepare(mounts, root, &bin)?;
+            }
             crate::guest_mounts::directory(root, "data/dalvik-cache", 0o771)?;
             let binary = run(
                 root,
@@ -1263,6 +1271,9 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
                 && std::env::var_os("SSAL_PHASE7FC_BYPASS_SETCONTEXT").is_some()
             {
                 zygote_env.push(("SSAL_PHASE7FC_BYPASS_SETCONTEXT", "1"));
+            }
+            if runtime_sid {
+                return system_server_runtime_sid::run(root, &bin, &zygote_env);
             }
             println!(
                 "Guest Zygote launch socket=/dev/socket/zygote start_system_server=false private_binder={major}:{minor}"
