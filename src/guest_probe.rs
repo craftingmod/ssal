@@ -299,8 +299,16 @@ pub(crate) fn root_command(root: &Path, executable: &str, pivot: bool) -> io::Re
     let inherited = ssal::unix::inherited_fds()?;
     let expected = fs::metadata(root)?;
     let pivot_log = if pivot && std::env::var_os("SSAL_PHASE7FB_FORK").is_some() {
+        let phase = if std::env::var_os("SSAL_PHASE7I_PROPERTIES").is_some() {
+            "phase7fc"
+        } else {
+            "phase7fb"
+        };
         Some(File::create(
-            root.parent().unwrap().join("phase7fb/pivot-transition.log"),
+            root.parent()
+                .unwrap()
+                .join(phase)
+                .join("pivot-transition.log"),
         )?)
     } else {
         None

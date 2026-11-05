@@ -43,7 +43,7 @@ worker는 시작 시 3 이상 상속 FD를 닫는다. supervisor가 stdin/로그
 
 읽기는 Bionic RO mmap, 쓰기는 Guest `/dev/socket/property_service`다. UID/GID/PID와 SO_PEERSEC를 얻고 context/type lookup 및 selinuxfs property_service:set을 검사한다. 소켓 0666은 연결만 허용한다. 요청 전체 읽기는 2초, V2 name/value는 1024/8192바이트로 제한하며 쓰기는 직렬화한다. `ctl.*`, `sys.powerctl`, `selinux.restorecon_recursive`는 거부하고 Host로 전달하지 않는다.
 
-최초 fixture는 context 파일에 `persist.ssal_probe u:object_r:ssal_guest_property_area:s0 exact uint`, build.prop에 `persist.ssal_probe=1`을 사용한다. [정책 후보](../scripts/guest-domain-poc/property-service-candidate.rule)는 이 fixture용 Guest delta이며 완성된 GSI 정책이 아니다. 누락된 Guest 타입은 최소 정책으로 보완하며 Host 도메인에 broad allow를 추가하거나 전역 permissive로 바꾸지 않는다. 실행 정책은 이번 작업에서 변경하지 않았다.
+최초 fixture는 context 파일에 `persist.ssal_probe u:object_r:ssal_guest_property_area:s0 exact uint`, build.prop에 `persist.ssal_probe=1`을 사용한다. [정책 후보](../scripts/guest-domain-poc/property-service-candidate.rule)는 이 fixture용 Guest delta이며 완성된 GSI 정책이 아니다. 누락된 Guest 타입은 최소 정책으로 보완하며 Host 도메인에 broad allow를 추가하거나 전역 permissive로 바꾸지 않는다. 이 문서의 standalone 검증에서는 실행 정책을 변경하지 않았다. Supervisor 통합용 실험 delta 및 미적용 상태는 [Phase 7I 보고서](guest-property-supervisor-integration.md)를 참조한다.
 
 ## 검증과 한계
 

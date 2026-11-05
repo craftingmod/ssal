@@ -13,11 +13,14 @@ use std::time::{Duration, Instant};
 mod fork_probe;
 pub(crate) use fork_probe::client as fork_client;
 
+const GUEST_PROBE_CONTEXT: &[u8] = b"u:r:ssal_guest_probe:s0\0";
+const PROPERTY_SERVICE_CONTEXT: &[u8] = b"u:r:ssal_property:s0\0";
+
 pub(crate) fn command(
     root: &Path,
     executable: &str,
     uid: u32,
-    guest_domain: bool,
+    exec_context: Option<&'static [u8]>,
 ) -> io::Result<Command> {
     crate::memory_cgroup::check_interrupted()?;
     // A real Guest mount root also gives Zygote's FD allowlist Guest-relative proc paths.
@@ -66,8 +69,8 @@ pub(crate) fn command(
                 Path::new("/sys/fs/cgroup"),
                 Path::new("/sys/fs/cgroup"),
             )?;
-            if guest_domain {
-                fs::write("/proc/thread-self/attr/exec", b"u:r:ssal_guest_probe:s0\0")?;
+            if let Some(context) = exec_context {
+                fs::write("/proc/thread-self/attr/exec", context)?;
             }
             if libc::setgroups(0, std::ptr::null()) != 0
                 || libc::setresgid(uid, uid, uid) != 0
@@ -118,7 +121,7 @@ fn zygote_sockets(command: &mut Command, directory: &Path) -> io::Result<Vec<Uni
 
 fn run(root: &Path, exe: &str, args: &[&str], uid: u32) -> io::Result<String> {
     let output = crate::guest_probe::run_with_timeout(
-        command(root, exe, uid, true)?.args(args),
+        command(root, exe, uid, Some(GUEST_PROBE_CONTEXT))?.args(args),
         exe,
         Duration::from_secs(20),
     )?;
@@ -236,11 +239,12 @@ impl Service {
         args: &[&str],
         name: &str,
         uid: u32,
+        exec_context: Option<&'static [u8]>,
         env: &[(&str, &str)],
     ) -> io::Result<Self> {
         let log = root.join(format!("run/ssal/{name}.log"));
         let output = File::create(&log)?;
-        let mut command = command(root, exe, uid, true)?;
+        let mut command = command(root, exe, uid, exec_context)?;
         command.env("LD_PRELOAD", "/run/ssal/ssal-phase2-log.so");
         if name == "memory-probe" {
             command.env_remove("LD_PRELOAD");
@@ -442,6 +446,7 @@ pub(crate) fn memory_probe(root: &Path, hierarchy_test: bool) -> io::Result<()> 
         },
         "memory-probe",
         1000,
+        Some(GUEST_PROBE_CONTEXT),
         &[],
     )?;
     let pid = service.child.id();
@@ -673,6 +678,124 @@ fn derive_guest_classpath(root: &Path) -> io::Result<(String, Option<String>)> {
     Ok((boot, dex2oat))
 }
 
+fn start_property_service(
+    mounts: &mut Mounts,
+    root: &Path,
+    bin: &Path,
+    host_mount_namespace: &Path,
+) -> io::Result<Service> {
+    let runtime = crate::guest_mounts::directory(root, "run/ssal", 0o755)?;
+    let contexts = runtime.join("guest_property_contexts");
+    fs::write(
+        &contexts,
+        "persist.ssal_probe u:object_r:ssal_guest_property_area:s0 exact uint\n",
+    )?;
+    let overrides = runtime.join("guest_build.prop");
+    fs::write(
+        &overrides,
+        [
+            "servicemanager.ready=true",
+            "ro.product.cpu.abilist64=arm64-v8a",
+            "ro.build.version.codename=REL",
+            "dalvik.vm.dex2oat64.enabled=true",
+            "ro.zygote.disable_gl_preload=1",
+            "persist.ssal_probe=1",
+        ]
+        .join("\n")
+            + "\n",
+    )?;
+    if !root.join("system/build.prop").is_file() {
+        return Err(io::Error::other("Guest /system/build.prop missing"));
+    }
+    let identity = |path: &Path| -> io::Result<[u64; 2]> {
+        let metadata = fs::metadata(path)?;
+        Ok([metadata.dev(), metadata.ino()])
+    };
+    let host_property_identity = identity(Path::new("/dev/__properties__"))?;
+    let host_socket_identity = identity(Path::new("/dev/socket"))?;
+    let host_data_identity = identity(Path::new("/data"))?;
+    let host_persistent_identity = identity(Path::new("/data/property"))?;
+    let config = serde_json::json!({
+        "host_mount_namespace": host_mount_namespace.display().to_string(),
+        "host_property_identity": host_property_identity,
+        "host_socket_identity": host_socket_identity,
+        "host_data_identity": host_data_identity,
+        "host_persistent_identity": host_persistent_identity,
+        "property_contexts": ["/run/ssal/guest_property_contexts"],
+        "build_props": ["/system/build.prop", "/run/ssal/guest_build.prop"],
+    });
+    fs::write(
+        runtime.join("property-service.json"),
+        serde_json::to_vec(&config).map_err(io::Error::other)?,
+    )?;
+
+    let property_dir = crate::guest_mounts::directory(root, "data/property", 0o700)?;
+    let metadata = fs::metadata(&property_dir)?;
+    if metadata.uid() != 0 || metadata.mode() & 0o077 != 0 {
+        return Err(io::Error::other("Guest /data/property must be root-owned mode 0700"));
+    }
+    let area = crate::guest_mounts::directory(root, "dev/__properties__", 0o755)?;
+    if fs::read_dir(&area)?.next().is_some() {
+        return Err(io::Error::other("Guest property area is not fresh"));
+    }
+    let executable = runtime.join("property-service");
+    File::create(&executable)?;
+    mounts.bind(&bin.join("ssal-property-service"), &executable, true, false)?;
+    let mut service = Service::start(
+        root,
+        "/system/bin/bootstrap/linker64",
+        &[
+            "/run/ssal/property-service",
+            "--config",
+            "/run/ssal/property-service.json",
+        ],
+        "guest-property-service",
+        0,
+        Some(PROPERTY_SERVICE_CONTEXT),
+        &[],
+    )?;
+    service.wait_text("guest_property_service_ready")?;
+    let process_context = fs::read_to_string(format!("/proc/{}/attr/current", service.child.id()))?;
+    if process_context.trim_matches('\0').trim() != "u:r:ssal_property:s0" {
+        return Err(io::Error::other(format!(
+            "Guest property service SID mismatch: {process_context:?}"
+        )));
+    }
+    for (guest, host, name) in [
+        (
+            identity(&area)?,
+            host_property_identity,
+            "property area",
+        ),
+        (
+            identity(&root.join("dev/socket"))?,
+            host_socket_identity,
+            "socket directory",
+        ),
+        (identity(&root.join("data"))?, host_data_identity, "userdata"),
+        (
+            identity(&property_dir)?,
+            host_persistent_identity,
+            "persistent directory",
+        ),
+    ] {
+        if guest == host {
+            return Err(io::Error::other(format!("Host {name} selected")));
+        }
+    }
+    let guest_socket = identity(&root.join("dev/socket/property_service"))?;
+    if guest_socket == identity(Path::new("/dev/socket/property_service"))? {
+        return Err(io::Error::other("Host property socket selected"));
+    }
+    println!(
+        "PHASE7I_PROPERTY_SERVICE=PASS pid={} sid=u:r:ssal_property:s0 host_area={host_property_identity:?} guest_area={:?} host_data={host_data_identity:?} guest_data={:?}",
+        service.child.id(),
+        identity(&area)?,
+        identity(&root.join("data"))?
+    );
+    Ok(service)
+}
+
 fn isolated(root: &Path, userdata: &Path) -> io::Result<()> {
     let identity = |path: &Path| -> io::Result<_> {
         let m = fs::metadata(path)?;
@@ -712,7 +835,9 @@ pub(crate) fn verify(
     phase6a: bool,
     phase6b: bool,
     phase7a: bool,
+    host_mount_namespace: &Path,
 ) -> io::Result<()> {
+    let phase7i_properties = phase7a && std::env::var_os("SSAL_PHASE7I_PROPERTIES").is_some();
     if fs::read_to_string("/sys/fs/selinux/enforce")?.trim() != "1" {
         return Err(io::Error::other("Host global Enforcing required"));
     }
@@ -739,12 +864,16 @@ pub(crate) fn verify(
     }
     let runtime = crate::guest_mounts::directory(root, "run/ssal", 0o755)?;
     let bin = std::env::current_exe()?.parent().unwrap().to_owned();
-    for name in [
+    let mut runtime_bins = vec![
         "guest_probe",
         "phase3-ipc",
         "ssal-phase2-log.so",
         "ssal-zygote-diag.so",
-    ] {
+    ];
+    if phase7i_properties {
+        runtime_bins.push("ssal-property-service");
+    }
+    for name in runtime_bins {
         if name == "ssal-zygote-diag.so" && !phase7a {
             continue;
         }
@@ -753,6 +882,7 @@ pub(crate) fn verify(
         mounts.bind(&bin.join(name), &target, true, false)?;
     }
     let mut binder = crate::binder_probe::Session::new();
+    let mut property_service = None;
     let result = (|| {
         // Reuse the established servicemanager view: libselinux rejects an RO root.
         // All control endpoints stay RO; only existing AV/context query files are RW.
@@ -776,27 +906,64 @@ pub(crate) fn verify(
                 entry.file_type()?.is_dir(),
             )?;
         }
+        if phase7i_properties {
+            property_service = Some(start_property_service(
+                mounts,
+                root,
+                &bin,
+                host_mount_namespace,
+            )?);
+            let property_script = if std::env::var_os("SSAL_PHASE7I_VERIFY_PERSIST").is_some() {
+                r#"set -eu
+test "$(getprop ro.build.version.sdk)" = 36
+test "$(getprop persist.ssal_probe)" = 7
+test -z "$(getprop sys.ssal_probe)"
+echo SSAL_PROPERTY_RESTORE=PASS
+"#
+            } else {
+                r#"set -eu
+test "$(getprop ro.build.version.sdk)" = 36
+test "$(getprop ro.product.cpu.abilist64)" = arm64-v8a
+setprop sys.ssal_probe phase7i
+test "$(getprop sys.ssal_probe)" = phase7i
+setprop persist.ssal_probe 7
+test "$(getprop persist.ssal_probe)" = 7
+echo SSAL_PROPERTY_BIONIC=PASS
+"#
+            };
+            let property_output = run(
+                root,
+                "/system/bin/sh",
+                &["-c", property_script],
+                1000,
+            )?;
+            if !property_output.contains("SSAL_PROPERTY_") {
+                return Err(io::Error::other("Guest Bionic property evidence missing"));
+            }
+        }
         let (major, minor, _) = binder.provision(root)?;
         let device = binder.private_device()?;
         if unsafe { libc::fchmod(device.as_raw_fd(), 0o666) } != 0 {
             return Err(io::Error::last_os_error());
         }
-        crate::guest_mounts::directory(root, "dev/__properties__", 0o755)?;
-        run(
-            root,
-            "/system/bin/bootstrap/linker64",
-            &[
-                "/run/ssal/guest_probe",
-                "--initialize-private-properties",
-                "/dev/guest-properties",
-            ],
-            0,
-        )?;
-        fs::remove_dir(root.join("dev/__properties__"))?;
-        fs::rename(
-            root.join("dev/guest-properties"),
-            root.join("dev/__properties__"),
-        )?;
+        if !phase7i_properties {
+            crate::guest_mounts::directory(root, "dev/__properties__", 0o755)?;
+            run(
+                root,
+                "/system/bin/bootstrap/linker64",
+                &[
+                    "/run/ssal/guest_probe",
+                    "--initialize-private-properties",
+                    "/dev/guest-properties",
+                ],
+                0,
+            )?;
+            fs::remove_dir(root.join("dev/__properties__"))?;
+            fs::rename(
+                root.join("dev/guest-properties"),
+                root.join("dev/__properties__"),
+            )?;
+        }
         let area = fs::metadata(root.join("dev/__properties__"))?;
         let host = fs::metadata("/dev/__properties__")?;
         if (area.dev(), area.ino()) == (host.dev(), host.ino()) {
@@ -813,6 +980,25 @@ pub(crate) fn verify(
         if unsafe { libc::fcntl(sentinel.as_raw_fd(), libc::F_SETFD, 0) } != 0 {
             return Err(io::Error::last_os_error());
         }
+        let guest_local = crate::guest_mounts::directory(root, "data/local", 0o751)?;
+        fs::set_permissions(&guest_local, fs::Permissions::from_mode(0o751))?;
+        let guest_tmp = crate::guest_mounts::directory(root, "data/local/tmp", 0o1771)?;
+        let guest_tmp_c = std::ffi::CString::new(guest_tmp.as_os_str().as_encoded_bytes())?;
+        if unsafe { libc::chown(guest_tmp_c.as_ptr(), 0, 1000) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        fs::set_permissions(&guest_tmp, fs::Permissions::from_mode(0o1771))?;
+        let local_metadata = fs::metadata(&guest_local)?;
+        let tmp_metadata = fs::metadata(&guest_tmp)?;
+        println!(
+            "Guest tmp DAC local={}:{}:{:04o} tmp={}:{}:{:04o}",
+            local_metadata.uid(),
+            local_metadata.gid(),
+            local_metadata.mode() & 0o7777,
+            tmp_metadata.uid(),
+            tmp_metadata.gid(),
+            tmp_metadata.mode() & 0o7777
+        );
         println!("Guest FD pre-exec: injected Host /data fd={}; root command closes inherited identities and marks later FDs CLOEXEC", sentinel.as_raw_fd());
         let shell = run(
             root,
@@ -824,7 +1010,8 @@ test "$(getprop ro.build.version.sdk)" = 36
 test "$(getprop ro.product.cpu.abilist64)" = arm64-v8a
 test "$(getprop ro.zygote.disable_gl_preload)" = 1
 test -z "$(getprop ro.boot.serialno)"
-for p in /dev/socket/property_service /dev/socket/property_service_for_system /dev/socket/init; do test ! -e "$p"; done
+if test -e /run/ssal/property-service.json; then test -S /dev/socket/property_service; else test ! -e /dev/socket/property_service; fi
+for p in /dev/socket/property_service_for_system /dev/socket/init; do test ! -e "$p"; done
 for fd in /proc/$$/fd/*; do
     target=$(readlink "$fd") || continue
     echo "Guest post-exec fd=$fd target=$target"
@@ -858,15 +1045,17 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
             &[],
             "servicemanager",
             1000,
+            Some(GUEST_PROBE_CONTEXT),
             &[],
         )?;
-        manager.wait_text("servicemanager")?;
+        manager.wait_text("Starting sm instance")?;
         let mut server = Service::start(
             root,
             "/system/bin/bootstrap/linker64",
             &["/run/ssal/phase3-ipc", "server"],
             "aidl-server",
             1000,
+            Some(GUEST_PROBE_CONTEXT),
             &[],
         )?;
         server.wait_text("\"event\":\"registered\"")?;
@@ -881,10 +1070,9 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
         }
         println!("PHASE5B=PASS shell=PASS private_aidl=PASS properties=PASS host_control_socket=ABSENT private_binder={major}:{minor}");
         if phase7a {
-            server.stop()?;
             let controlled_fork = std::env::var_os("SSAL_PHASE7FB_FORK").is_some();
             if controlled_fork {
-                fork_probe::prepare(mounts, root, &bin)?;
+                fork_probe::prepare(mounts, root, &bin, phase7i_properties)?;
             }
             crate::guest_mounts::directory(root, "data/dalvik-cache", 0o771)?;
             let binary = run(
@@ -892,12 +1080,17 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
                 "/system/bin/sh",
                 &[
                     "-c",
-                    "set -eu; test -x /system/bin/app_process64; test -x /apex/com.android.sdkext/bin/derive_classpath; test ! -e /dev/socket/zygote; test ! -e /dev/socket/property_service; stat -c '%n %s %a %u %g' /system/bin/app_process64; sha256sum /system/bin/app_process64; getprop ro.product.cpu.abilist64; getprop ro.zygote.disable_gl_preload",
+                    "set -eu; test -x /system/bin/app_process64; test -x /apex/com.android.sdkext/bin/derive_classpath; test ! -e /dev/socket/zygote; if test -e /run/ssal/property-service.json; then test -S /dev/socket/property_service; else test ! -e /dev/socket/property_service; fi; stat -c '%n %s %a %u %g' /system/bin/app_process64; sha256sum /system/bin/app_process64; getprop ro.product.cpu.abilist64; getprop ro.zygote.disable_gl_preload",
                 ],
                 0,
             )?;
             println!("Guest Zygote binary preflight:\n{binary}");
             let (boot_classpath, dex2oat_classpath) = derive_guest_classpath(root)?;
+            let boot_classpath = if controlled_fork {
+                format!("{boot_classpath}:/system/framework/am.jar")
+            } else {
+                boot_classpath
+            };
             let mut zygote_env = vec![
                 ("ANDROID_BOOTLOGO", "1"),
                 ("ANDROID_ASSETS", "/system/app"),
@@ -912,8 +1105,13 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
             if let Some(classpath) = dex2oat_classpath.as_deref() {
                 zygote_env.push(("DEX2OATBOOTCLASSPATH", classpath));
             }
-            if controlled_fork {
-                zygote_env.push(("CLASSPATH", "/system/framework/am.jar"));
+            if phase7i_properties {
+                zygote_env.push(("SSAL_PHASE7I_PROPERTIES", "1"));
+            }
+            if controlled_fork
+                && std::env::var_os("SSAL_PHASE7FC_BYPASS_SETCONTEXT").is_some()
+            {
+                zygote_env.push(("SSAL_PHASE7FC_BYPASS_SETCONTEXT", "1"));
             }
             println!(
                 "Guest Zygote launch socket=/dev/socket/zygote start_system_server=false private_binder={major}:{minor}"
@@ -939,6 +1137,7 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
                 },
                 "guest-zygote",
                 0,
+                Some(GUEST_PROBE_CONTEXT),
                 &zygote_env,
             )?;
             zygote.wait_for_socket(&root.join("dev/socket/zygote"))?;
@@ -1092,7 +1291,7 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
             )?;
             println!("Guest Zygote residence pid={pid} starttime={starttime} seconds=5 membership=verified");
             if controlled_fork {
-                fork_probe::run(root, &mut zygote)?;
+                fork_probe::run(root, &mut zygote, phase7i_properties)?;
             }
             zygote.stop()?;
             fs::remove_file(root.join("dev/socket/zygote"))?;
@@ -1111,7 +1310,8 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
                 ("/system/bin/installd", "installd"),
                 ("/apex/com.android.art/bin/artd", "artd"),
             ] {
-                let mut service = Service::start(root, exe, &[], name, 0, &[])?;
+                let mut service =
+                    Service::start(root, exe, &[], name, 0, Some(GUEST_PROBE_CONTEXT), &[])?;
                 std::thread::sleep(Duration::from_millis(500));
                 if service.exited()? {
                     return Err(io::Error::other(format!(
@@ -1215,16 +1415,43 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
         }
         server.stop()?;
         manager.stop()?;
+        if let Some(service) = &mut property_service {
+            service.stop()?;
+            fs::remove_file(root.join("dev/socket/property_service"))?;
+        }
         isolated(root, userdata)?;
         Ok(())
     })();
-    let cleanup = binder.cleanup();
-    if fs::read_to_string("/sys/fs/selinux/enforce")?.trim() != "1" {
-        return Err(io::Error::other("Host global Enforcing changed"));
+    let mut cleanup_errors = Vec::new();
+    if let Some(service) = &mut property_service {
+        if let Err(error) = service.stop() {
+            cleanup_errors.push(error.to_string());
+        }
+        match fs::remove_file(root.join("dev/socket/property_service")) {
+            Ok(()) => (),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+            Err(error) => cleanup_errors.push(error.to_string()),
+        }
     }
+    if phase7i_properties && std::env::var_os("SSAL_PHASE7FB_FORK").is_some() {
+        if let Err(error) = fork_probe::cleanup(root) {
+            cleanup_errors.push(error.to_string());
+        }
+    }
+    if let Err(error) = binder.cleanup() {
+        cleanup_errors.push(format!("Private Binder cleanup: {error}"));
+    }
+    if fs::read_to_string("/sys/fs/selinux/enforce")?.trim() != "1" {
+        cleanup_errors.push("Host global Enforcing changed".into());
+    }
+    let cleanup = if cleanup_errors.is_empty() {
+        Ok(())
+    } else {
+        Err(io::Error::other(cleanup_errors.join("; ")))
+    };
     match (result, cleanup) {
-        (Err(e), Err(c)) => Err(io::Error::other(format!("{e}; Binder cleanup: {c}"))),
-        (Err(e), _) | (_, Err(e)) => Err(e),
+        (Err(error), Err(cleanup)) => Err(io::Error::other(format!("{error}; {cleanup}"))),
+        (Err(error), _) | (_, Err(error)) => Err(error),
         _ => Ok(()),
     }
 }

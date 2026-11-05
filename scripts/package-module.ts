@@ -22,10 +22,22 @@ const entries: { name: string; path: string; mode: number }[] = [
     path: `module/${name}`,
     mode: name.endsWith(".sh") ? 0o100755 : 0o100644,
   })),
-  ...["ssal", "ssald", "ssal-selinux-identity", "ssal-enforcing-binder", "ssal-property-service"].map((name) => ({
+  ...[
+    "ssal",
+    "ssald",
+    "ssal-selinux-identity",
+    "ssal-enforcing-binder",
+    "ssal-property-service",
+    "guest_probe",
+    "phase3-ipc",
+    "ssal-phase2-log.so",
+    "ssal-zygote-diag.so",
+    "ssal-zygote-fd-reopen.so",
+    "fork-probe.jar",
+  ].map((name) => ({
     name: `bin/${name}`,
     path: `out/bin/${name}`,
-    mode: 0o100755,
+    mode: name.endsWith(".so") || name.endsWith(".jar") ? 0o100644 : 0o100755,
   })),
 ]
 if (existsSync("out/bin/ssal-binder-probe") || existsSync("out/bin/ssal-binder-probe.json")) {

@@ -625,6 +625,7 @@ pub fn worker(system: &Path, userdata: &Path, base: &Path, mode: &str) -> io::Re
             base,
             &loop_nodes,
             mode,
+            &host_mount_namespace,
         )?;
         Ok(())
     })();

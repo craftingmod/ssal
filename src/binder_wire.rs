@@ -369,11 +369,14 @@ pub fn selftest(identity: [u64; 4]) -> io::Result<()> {
     let parent = unsafe { libc::getpid() };
     let pid = unsafe { libc::fork() };
     if pid < 0 {
+        let err = io::Error::last_os_error();
+
         unsafe {
             libc::close(pipe[0]);
             libc::close(pipe[1]);
         }
-        return Err(io::Error::last_os_error());
+
+        return Err(err);
     }
     if pid == 0 {
         unsafe {

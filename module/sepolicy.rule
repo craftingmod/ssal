@@ -12,3 +12,25 @@ allow aidl_lazy_test_server servicemanager binder { call transfer }
 allow servicemanager aidl_lazy_test_server binder call
 allow shell aidl_lazy_test_server binder transfer
 allow aidl_lazy_test_server shell binder transfer
+# Experimental Guest-only Phase 7I policy. Host domains receive no new permissions.
+type ssal_guest_probe domain
+permissive ssal_guest_probe
+type ssal_property domain
+permissive ssal_property
+type ssal_guest_property_dir file_type
+type ssal_guest_property_area file_type
+typeattribute ssal_guest_property_area property_type
+type ssal_guest_property_info file_type
+type ssal_guest_property_serial file_type
+type ssal_guest_property_socket file_type
+type ssal_guest_property_data_file file_type
+typeattribute ssal_guest_property_data_file data_file_type
+allow ssal_guest_probe ssal_guest_property_area property_service set
+allow ssal_property ssal_guest_property_area property_service set
+allow ssal_guest_property_dir tmpfs filesystem associate
+allow ssal_guest_property_area tmpfs filesystem associate
+allow ssal_guest_property_info tmpfs filesystem associate
+allow ssal_guest_property_serial tmpfs filesystem associate
+allow ssal_guest_property_socket tmpfs filesystem associate
+type_transition ssal_property ssal_guest_property_dir file ssal_guest_property_area
+type_transition ssal_property ssal_guest_property_data_file file ssal_guest_property_data_file

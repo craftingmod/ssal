@@ -3,7 +3,7 @@ $repo = Split-Path $PSScriptRoot -Parent
 $sdk = if ($env:ANDROID_HOME) { $env:ANDROID_HOME } else { "$env:LOCALAPPDATA/Android/Sdk" }
 $tools = Get-ChildItem "$sdk/build-tools" -Directory | Where-Object { Test-Path "$($_.FullName)/lib/d8.jar" } | Sort-Object Name -Descending | Select-Object -First 1
 if (!$tools) { throw 'Android SDK build-tools/d8.jar missing' }
-$classes = "$repo/out/phase7fb/classes"
+$classes = "$repo/out/phase7fc/classes"
 New-Item -ItemType Directory -Force $classes, "$repo/out/bin" | Out-Null
 & javac --release 8 -d $classes "$repo/native/fork-probe/dev/ssal/probe/ForkProbe.java"
 if ($LASTEXITCODE) { throw 'javac failed' }

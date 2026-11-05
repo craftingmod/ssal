@@ -1,6 +1,8 @@
 //! One ordinary, non-USAP fork through the Guest's Java forkAndSpecialize path.
 use super::*;
 use std::os::fd::OwnedFd;
+use std::fs::OpenOptions;
+use std::os::unix::fs::OpenOptionsExt;
 
 const REQUEST: &[&str] = &[
     "--runtime-args",
@@ -37,7 +39,12 @@ pub(crate) fn client() -> io::Result<()> {
     Ok(())
 }
 
-pub(super) fn prepare(mounts: &mut Mounts, root: &Path, bin: &Path) -> io::Result<()> {
+pub(super) fn prepare(
+    mounts: &mut Mounts,
+    root: &Path,
+    bin: &Path,
+    phase7i: bool,
+) -> io::Result<()> {
     fs::create_dir(Path::new(crate::guest_mounts::GUEST_CGROUPS[0].0).join("apps"))?;
     let library = root.join("run/ssal/ssal-zygote-fd-reopen.so");
     File::create(&library)?;
@@ -50,7 +57,10 @@ pub(super) fn prepare(mounts: &mut Mounts, root: &Path, bin: &Path) -> io::Resul
     // shortcut: reuse the unused Guest am.jar slot for this probe; add a dedicated slot before Framework bring-up.
     let jar = root.join("system/framework/am.jar");
     mounts.bind(&bin.join("fork-probe.jar"), &jar, true, false)?;
-    let evidence = root.parent().unwrap().join("phase7fb");
+    let evidence = root
+        .parent()
+        .unwrap()
+        .join(if phase7i { "phase7fc" } else { "phase7fb" });
     fs::create_dir(&evidence)?;
     let contexts = evidence.join("plat_seapp_contexts");
     // Guest-only mapping to the existing experimental domain; no Host app domain reuse.
@@ -110,10 +120,54 @@ fn validate_status(status: &str, parent: u32) -> io::Result<()> {
     Ok(())
 }
 
-pub(super) fn run(root: &Path, zygote: &mut Service) -> io::Result<()> {
+pub(super) fn run(root: &Path, zygote: &mut Service, phase7i: bool) -> io::Result<()> {
     let parent = zygote.child.id();
-    let evidence = root.parent().unwrap().join("phase7fb");
+    let evidence = root
+        .parent()
+        .unwrap()
+        .join(if phase7i { "phase7fc" } else { "phase7fb" });
     let session = root.join("run/ssal/fork-probe");
+    if phase7i {
+        let local_tmp = crate::guest_mounts::directory(root, "data/local/tmp", 0o1771)?;
+        let relative = format!("data/local/tmp/ssal-phase7i-{parent}");
+        let data_dir = root.join(&relative);
+        let ownership_record = session.join("data-probe-dir");
+        fs::write(&ownership_record, &relative)?;
+        if let Err(error) = fs::create_dir(&data_dir) {
+            let _ = fs::remove_file(ownership_record);
+            return Err(error);
+        }
+        fs::set_permissions(&data_dir, fs::Permissions::from_mode(0o700))?;
+        let data_dir_c = std::ffi::CString::new(data_dir.as_os_str().as_encoded_bytes())?;
+        if unsafe { libc::chown(data_dir_c.as_ptr(), 10000, 10000) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        fs::set_permissions(&data_dir, fs::Permissions::from_mode(0o700))?;
+        let data_file = data_dir.join("probe");
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o444)
+            .open(&data_file)?;
+        file.write_all(b"guest-userdata-v1")?;
+        file.sync_all()?;
+        drop(file);
+        fs::set_permissions(&data_file, fs::Permissions::from_mode(0o444))?;
+        let data_path = format!("/data/local/tmp/ssal-phase7i-{parent}/probe\n");
+        let data_path_file = session.join("data-probe-path");
+        fs::write(&data_path_file, data_path)?;
+        fs::set_permissions(&data_path_file, fs::Permissions::from_mode(0o444))?;
+        let data_identity = fs::metadata(&data_dir)?;
+        if data_identity.dev() != fs::metadata(root.join("data"))?.dev() {
+            return Err(io::Error::other("Java data probe is not on Guest userdata"));
+        }
+        println!(
+            "Guest Java data probe prepared path={} dev={} parent={}",
+            local_tmp.join(data_dir.file_name().unwrap()).display(),
+            data_identity.dev(),
+            parent
+        );
+    }
     let mut descriptors = String::new();
     for entry in fs::read_dir(format!("/proc/{parent}/fd"))? {
         let entry = entry?;
@@ -253,6 +307,29 @@ pub(super) fn run(root: &Path, zygote: &mut Service) -> io::Result<()> {
         let entry = entry?;
         fs::copy(entry.path(), evidence.join(entry.file_name()))?;
     }
+    if phase7i {
+        let properties = fs::read_to_string(session.join("properties.txt"))?;
+        let binder = fs::read_to_string(session.join("binder.txt"))?;
+        let integration = fs::read_to_string(session.join("integration"))?;
+        if !properties.contains("sdk=36")
+            || !properties.contains("persist.ssal_probe=7")
+            || !binder.contains("\"event\":\"ipc_passed\"")
+            || integration != "property=PASS private_binder=PASS userdata_read_write=PASS\n"
+        {
+            return Err(io::Error::other(
+                "Java child property or private Binder evidence missing",
+            ));
+        }
+        let relative = fs::read_to_string(session.join("data-probe-dir"))?;
+        let data_dir = crate::guest_mounts::guest_path(root, relative.trim())?;
+        let data_result = fs::read_to_string(data_dir.join("java-child"))?;
+        if data_result != "Java child reached Guest userdata\n" {
+            return Err(io::Error::other("Java Guest userdata write evidence mismatch"));
+        }
+        fs::write(session.join("data-result"), data_result)?;
+        fs::copy(session.join("data-result"), evidence.join("data-result"))?;
+        println!("Guest Java child property=PASS private_binder=PASS userdata_read_write=PASS");
+    }
     let status = fs::read_to_string(proc.join("status"))?;
     validate_status(&status, parent)?;
     if fs::read_to_string(proc.join("attr/current"))?
@@ -328,6 +405,33 @@ pub(super) fn run(root: &Path, zygote: &mut Service) -> io::Result<()> {
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+pub(super) fn cleanup(root: &Path) -> io::Result<()> {
+    let session = root.join("run/ssal/fork-probe");
+    let metadata_path = session.join("data-probe-dir");
+    let relative = match fs::read_to_string(&metadata_path) {
+        Ok(relative) => relative,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let relative = relative.trim();
+    if !relative.starts_with("data/local/tmp/ssal-phase7i-") || relative.contains("..") {
+        return Err(io::Error::other("refusing unowned Guest data cleanup path"));
+    }
+    let data_dir = crate::guest_mounts::guest_path(root, relative)?;
+    let metadata = fs::symlink_metadata(&data_dir)?;
+    if !metadata.is_dir()
+        || !matches!(metadata.uid(), 0 | 10000)
+        || metadata.mode() & 0o077 != 0
+        || metadata.dev() != fs::metadata(root.join("data"))?.dev()
+    {
+        return Err(io::Error::other("Guest data probe ownership changed"));
+    }
+    fs::remove_dir_all(&data_dir)?;
+    fs::remove_file(metadata_path)?;
+    println!("Guest Java userdata probe cleanup=PASS");
+    Ok(())
 }
 
 #[cfg(test)]

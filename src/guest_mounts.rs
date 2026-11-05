@@ -1051,7 +1051,7 @@ fn processgroup_probe(
     mounts.bind(Path::new(&helper), &target, true, false)?;
     println!("Guest libprocessgroup config: original image JSON bound with memory actions disabled; Guest-only v1 groups initialized; vendor/property overrides absent; launcher uid/gid=1000");
     let mut command =
-        crate::guest_launcher::command(root, "/system/bin/bootstrap/linker64", 1000, false)?;
+        crate::guest_launcher::command(root, "/system/bin/bootstrap/linker64", 1000, None)?;
     command
         .arg("/run/ssal/processgroup/probe")
         .env_clear()
@@ -1073,6 +1073,7 @@ pub fn verify(
     base: &Path,
     loop_nodes: &crate::prepare::LoopNodes,
     mode: &str,
+    host_mount_namespace: &Path,
 ) -> io::Result<()> {
     let profile = profile()?;
     let root = base.join("rootfs");
@@ -1293,6 +1294,7 @@ pub fn verify(
                 mode == "--guest-services-6a-worker" || mode == "--guest-services-6b-worker",
                 mode == "--guest-services-6b-worker",
                 mode == "--guest-zygote-7a-worker",
+                host_mount_namespace,
             );
         }
         {
