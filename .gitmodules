@@ -24,3 +24,6 @@
 [submodule "vendor/OneOS"]
 	path = vendor/OneOS
 	url = https://github.com/fahadalijaved/OneOS.git
+[submodule "vendor/KernelSU"]
+	path = vendor/KernelSU
+	url = https://github.com/diabl0w/KernelSU
