@@ -1,4 +1,5 @@
 //! Phase 7C only: disposable allocator, no Android service or task-profile changes.
+#[allow(dead_code)]
 #[path = "../memory_cgroup.rs"]
 mod memory_cgroup;
 #[path = "../zygote_diagnostics.rs"]

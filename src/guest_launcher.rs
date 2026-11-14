@@ -3,7 +3,7 @@ use ssal::namespace_mounts::Mounts;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -18,12 +18,44 @@ pub(crate) use fork_probe::client as fork_client;
 const GUEST_PROBE_CONTEXT: &[u8] = b"u:r:ssal_guest_probe:s0\0";
 const PROPERTY_SERVICE_CONTEXT: &[u8] = b"u:r:ssal_property:s0\0";
 
+fn mapped_exec_domain(executable: &str, exec_context: Option<&[u8]>) -> &'static str {
+    if exec_context == Some(PROPERTY_SERVICE_CONTEXT) {
+        "init"
+    } else {
+        match executable {
+            "/system/bin/app_process64" => "zygote",
+            "/system/bin/servicemanager" => "servicemanager",
+            "/apex/com.android.runtime/bin/linkerconfig" | "/system/bin/linkerconfig" => {
+                "linkerconfig"
+            }
+            _ => "shell",
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct GuestClasspaths {
     boot: String,
     dex2oat: Option<String>,
     system_server: String,
     standalone_system_server: Option<String>,
+}
+
+fn join_cgroups(groups: &[std::path::PathBuf]) -> io::Result<()> {
+    let pid = std::process::id().to_string();
+    for group in groups {
+        fs::write(group.join("cgroup.procs"), &pid)?;
+    }
+    for group in groups {
+        let members = fs::read_to_string(group.join("cgroup.procs"))?;
+        if !members.split_whitespace().any(|member| member == pid) {
+            return Err(io::Error::other(format!(
+                "Guest pre-exec membership missing: pid={pid} group={}",
+                group.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn command(
@@ -38,21 +70,18 @@ pub(crate) fn command(
         && std::env::var_os("SSAL_PHASE7FB_FORK").is_some();
     let mut command = crate::guest_probe::root_command(root, executable, pivot)?;
     let exec_context = if let Some(plan) = ssal::guest_policy::runtime::load(root)? {
-        let original = if exec_context == Some(PROPERTY_SERVICE_CONTEXT) {
-            "init"
-        } else {
-            match executable {
-                "/system/bin/app_process64" => "zygote",
-                "/system/bin/servicemanager" => "servicemanager",
-                _ => "shell",
-            }
-        };
+        let original = mapped_exec_domain(executable, exec_context);
         let mut context = plan.context(original, true)?.into_bytes();
         context.push(0);
         Some(context)
     } else {
         exec_context.map(<[u8]>::to_vec)
     };
+    let pre_exec_cgroups: Vec<_> =
+        crate::guest_mounts::guest_cgroup_mounts(crate::memory_cgroup::backend()?)
+            .into_iter()
+            .map(|(_, target)| Path::new("/").join(target))
+            .collect();
     command.env("LD_LIBRARY_PATH", "/run/ssal");
     if executable == "/system/bin/bootstrap/linker64" {
         command.env("LD_LIBRARY_PATH", "/system/lib64/bootstrap:/system/lib64");
@@ -84,17 +113,7 @@ pub(crate) fn command(
                 return Err(io::Error::other("Guest launcher parent disappeared"));
             }
             // The root transition already ran; only this child joins Guest cgroups.
-            for (_, target) in crate::guest_mounts::GUEST_CGROUPS {
-                fs::write(
-                    format!("/{target}/cgroup.procs"),
-                    std::process::id().to_string(),
-                )?;
-            }
-            crate::memory_cgroup::verify_membership(
-                std::process::id(),
-                Path::new("/sys/fs/cgroup"),
-                Path::new("/sys/fs/cgroup"),
-            )?;
+            join_cgroups(&pre_exec_cgroups)?;
             if let Some(context) = &exec_context {
                 fs::write("/proc/thread-self/attr/exec", context)?;
             }
@@ -104,6 +123,7 @@ pub(crate) fn command(
             {
                 return Err(io::Error::last_os_error());
             }
+            crate::memory_cgroup::verify_guest_mount_membership(std::process::id())?;
             Ok(())
         });
     }
@@ -146,11 +166,32 @@ fn zygote_sockets(command: &mut Command, directory: &Path) -> io::Result<Vec<Uni
 }
 
 fn run(root: &Path, exe: &str, args: &[&str], uid: u32) -> io::Result<String> {
-    let output = crate::guest_probe::run_with_timeout(
-        command(root, exe, uid, Some(GUEST_PROBE_CONTEXT))?.args(args),
-        exe,
-        Duration::from_secs(20),
-    )?;
+    run_as(root, exe, args, uid, GUEST_PROBE_CONTEXT)
+}
+
+fn run_as(root: &Path, exe: &str, args: &[&str], uid: u32, context: &[u8]) -> io::Result<String> {
+    let mut child_command = command(root, exe, uid, Some(context))?;
+    child_command.args(args);
+    if std::env::var_os("SSAL_TRACE_GUEST_SIGABRT").is_some()
+        && (exe == "/apex/com.android.runtime/bin/linkerconfig"
+            || exe == "/system/bin/linkerconfig")
+    {
+        let executable_copy = root
+            .parent()
+            .ok_or_else(|| io::Error::other("Guest worker directory missing"))?
+            .join("linkerconfig.debug.elf");
+        fs::copy(
+            crate::guest_mounts::guest_path(root, exe.trim_start_matches('/'))?,
+            &executable_copy,
+        )?;
+        println!(
+            "linkerconfig trace binary copy: {}",
+            executable_copy.display()
+        );
+        child_command.env("LD_PRELOAD", "/run/ssal/ssal-abort-trace.so");
+    }
+    let output =
+        crate::guest_probe::run_with_timeout(&mut child_command, exe, Duration::from_secs(20))?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     println!(
         "Guest call executable={exe} args={args:?} return={}\n{stdout}{}",
@@ -210,6 +251,52 @@ pub(crate) fn readiness_client() -> io::Result<()> {
     Ok(())
 }
 
+fn guest_servicemanager_property(root: &Path) -> io::Result<String> {
+    let mut command = command(root, "/system/bin/getprop", 1000, Some(GUEST_PROBE_CONTEXT))?;
+    command.arg("servicemanager.ready");
+    let output = crate::guest_probe::run_with_timeout(
+        &mut command,
+        "Guest servicemanager.ready readback",
+        Duration::from_secs(2),
+    )?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "Guest getprop servicemanager.ready: {}",
+            output.status
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+fn probe_guest_context_manager(root: &Path) -> io::Result<String> {
+    let mut command = command(
+        root,
+        "/system/bin/bootstrap/linker64",
+        1000,
+        Some(GUEST_PROBE_CONTEXT),
+    )?;
+    command.args(["/run/ssal/phase3-ipc", "context-manager"]);
+    let output = crate::guest_probe::run_with_timeout(
+        &mut command,
+        "Guest Binder Context Manager probe",
+        Duration::from_secs(2),
+    )?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "Guest Binder Context Manager probe: {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    if !stdout.contains("\"event\":\"context_manager_lookup_passed\"") {
+        return Err(io::Error::other(
+            "Guest Binder Context Manager probe returned no success evidence",
+        ));
+    }
+    Ok(stdout)
+}
+
 fn query_abi(socket: &mut UnixStream) -> io::Result<()> {
     socket
         .write_all(b"1\n--query-abi-list\n")
@@ -242,9 +329,10 @@ struct Service {
     log: std::path::PathBuf,
     stopped: bool,
     diagnostics: Option<crate::zygote_diagnostics::Diagnostics>,
+    output: Vec<crate::zygote_diagnostics::Stream>,
 }
 impl Service {
-    fn exited(&self) -> io::Result<bool> {
+    fn exit_status(&self) -> io::Result<Option<(i32, i32)>> {
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
         if unsafe {
             libc::waitid(
@@ -257,7 +345,10 @@ impl Service {
         {
             return Err(io::Error::last_os_error());
         }
-        Ok(unsafe { info.si_pid() } != 0)
+        Ok((unsafe { info.si_pid() } != 0).then(|| (info.si_code, unsafe { info.si_status() })))
+    }
+    fn exited(&self) -> io::Result<bool> {
+        Ok(self.exit_status()?.is_some())
     }
     fn start(
         root: &Path,
@@ -271,7 +362,9 @@ impl Service {
         let log = root.join(format!("run/ssal/{name}.log"));
         let output = File::create(&log)?;
         let mut command = command(root, exe, uid, exec_context)?;
-        command.env("LD_PRELOAD", "/run/ssal/ssal-phase2-log.so");
+        command
+            .stdin(Stdio::null())
+            .env("LD_PRELOAD", "/run/ssal/ssal-phase2-log.so");
         if name == "memory-probe" {
             command.env_remove("LD_PRELOAD");
         }
@@ -325,7 +418,7 @@ impl Service {
             if std::env::var_os("SSAL_PHASE8B5_ONCE").is_some() {
                 command.env("LD_PRELOAD", "/run/ssal/ssal-system-server-runtime-sid.so:/run/ssal/ssal-phase2-log.so:/run/ssal/ssal-zygote-diag.so:/run/ssal/ssal-zygote-fd-reopen.so");
             }
-        } else if diagnostic {
+        } else if diagnostic || name == "guest-property-service" {
             command.stdout(Stdio::piped()).stderr(Stdio::piped());
         } else {
             command.stdout(output.try_clone()?).stderr(output);
@@ -360,21 +453,57 @@ impl Service {
             log,
             stopped: false,
             diagnostics: None,
+            output: Vec::new(),
         };
-        let membership = crate::memory_cgroup::verify_membership(
-            service.child.id(),
-            Path::new("/sys/fs/cgroup"),
-            Path::new(crate::guest_mounts::GUEST_CGROUPS[0].0),
-        )?;
+        if name == "guest-property-service" {
+            // The parent writes logs; Guest init need not write a system_file.
+            service.output.push(crate::zygote_diagnostics::Stream::new(
+                service.child.stdout.take().unwrap(),
+                File::options().append(true).open(&service.log)?,
+            )?);
+            service.output.push(crate::zygote_diagnostics::Stream::new(
+                service.child.stderr.take().unwrap(),
+                File::options().append(true).open(&service.log)?,
+            )?);
+            service.drain_output()?;
+        }
+        if let Some((code, status)) = service.exit_status()? {
+            service.drain_output()?;
+            let log = fs::read_to_string(&service.log).unwrap_or_default();
+            if !log.is_empty() {
+                println!("Guest service log before cleanup:\n{log}");
+            }
+            return Err(io::Error::other(format!(
+                "Guest service={name} exited after exec: waitid_code={code} status={status}; pre-exec cgroups verified"
+            )));
+        }
+        let membership = match crate::memory_cgroup::verify_guest_membership(service.child.id()) {
+            Ok(membership) => membership,
+            Err(error) => {
+                let cgroup = fs::read_to_string(format!("/proc/{}/cgroup", service.child.id()))
+                    .unwrap_or_else(|e| format!("unavailable: {e}"));
+                let log = fs::read_to_string(&service.log).unwrap_or_default();
+                println!(
+                    "{} Guest service membership failed pid={} cgroup={cgroup} exit_status={:?} error={error}; pre-exec cgroups verified; membership mismatch does not establish exit cause",
+                    crate::zygote_diagnostics::launch_time(),
+                    service.child.id(),
+                    service.exit_status()?
+                );
+                if !log.is_empty() {
+                    println!("Guest service log before cleanup:\n{log}");
+                }
+                return Err(error);
+            }
+        };
         println!(
-            "Guest service membership pid={} v2={membership}",
+            "Guest service memory cgroup membership pid={} path={membership}",
             service.child.id()
         );
         if diagnostic {
             service.diagnostics = Some(crate::zygote_diagnostics::Diagnostics::attach(
                 &mut service.child,
                 &diagnostic_dir,
-                Path::new(crate::guest_mounts::GUEST_CGROUPS[0].0),
+                &crate::memory_cgroup::memory_group(crate::memory_cgroup::backend()?),
                 launch_ms,
                 started,
             )?);
@@ -382,12 +511,20 @@ impl Service {
         }
         Ok(service)
     }
+    fn drain_output(&mut self) -> io::Result<()> {
+        for stream in &mut self.output {
+            stream.drain()?;
+        }
+        Ok(())
+    }
     fn wait_text(&mut self, text: &str) -> io::Result<()> {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             crate::memory_cgroup::check_interrupted()?;
+            let exited = self.exited()?;
+            self.drain_output()?;
             let log = fs::read_to_string(&self.log)?;
-            if self.exited()? {
+            if exited {
                 return Err(io::Error::other(format!(
                     "Guest service exited before readiness: {log}"
                 )));
@@ -401,6 +538,127 @@ impl Service {
                 )));
             }
             std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    fn readiness_diagnostics(&self, root: &Path, reason: &str, service_lookup: &str) {
+        let pid = self.child.id();
+        let wchan = fs::read_to_string(format!("/proc/{pid}/wchan"))
+            .unwrap_or_else(|error| format!("unavailable: {error}"));
+        let mut fds = fs::read_dir(format!("/proc/{pid}/fd"))
+            .map(|entries| {
+                let mut fds: Vec<_> = entries
+                    .flatten()
+                    .map(|entry| {
+                        let number = entry.file_name().to_string_lossy().into_owned();
+                        let target = fs::read_link(entry.path())
+                            .map(|path| path.display().to_string())
+                            .unwrap_or_else(|error| format!("unavailable: {error}"));
+                        let rdev = fs::metadata(entry.path())
+                            .ok()
+                            .filter(|metadata| metadata.file_type().is_char_device())
+                            .map(|metadata| format!(" rdev={}", metadata.rdev()))
+                            .unwrap_or_default();
+                        format!("{number}->{target}{rdev}")
+                    })
+                    .collect();
+                fds.sort();
+                fds.join(",")
+            })
+            .unwrap_or_else(|error| format!("unavailable: {error}"));
+        if fds.len() > 4096 {
+            fds.truncate(4096);
+        }
+        let binder = fs::metadata(root.join("dev/binder"))
+            .map(|metadata| format!("rdev={}", metadata.rdev()))
+            .unwrap_or_else(|error| format!("unavailable: {error}"));
+        let property_area = fs::metadata(root.join("dev/__properties__"))
+            .map(|metadata| format!("dev={} ino={}", metadata.dev(), metadata.ino()))
+            .unwrap_or_else(|error| format!("unavailable: {error}"));
+        let property = guest_servicemanager_property(root)
+            .map(|value| format!("{value:?}"))
+            .unwrap_or_else(|error| format!("unavailable: {error}"));
+        let context_manager = probe_guest_context_manager(root)
+            .map(|value| value.trim().to_owned())
+            .unwrap_or_else(|error| format!("failed: {error}"));
+        let log = fs::read_to_string(&self.log)
+            .map(|value| value.chars().take(4096).collect::<String>())
+            .unwrap_or_else(|error| format!("unavailable: {error}"));
+        println!(
+            "Guest servicemanager readiness diagnostics: reason={reason:?} pid={pid} exit_status={:?} wchan={wchan:?} property={property} guest_property_area={property_area} guest_binder={binder} service_lookup={service_lookup:?}",
+            self.exit_status()
+        );
+        println!("Guest servicemanager FDs: {fds}");
+        println!("Guest Binder Context Manager probe: {context_manager}");
+        println!("Guest servicemanager log: {log}");
+    }
+    fn wait_guest_context_manager(&mut self, root: &Path, expected_binder: u64) -> io::Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut context_manager = Err("not checked".to_owned());
+        let mut next_context_manager_probe = Instant::now();
+        loop {
+            crate::memory_cgroup::check_interrupted()?;
+            if self.exited()? {
+                self.readiness_diagnostics(root, "Guest servicemanager exited", "not run");
+                return Err(io::Error::other(
+                    "Guest servicemanager exited before semantic readiness",
+                ));
+            }
+            if Instant::now() >= next_context_manager_probe {
+                context_manager =
+                    probe_guest_context_manager(root).map_err(|error| error.to_string());
+                next_context_manager_probe = Instant::now() + Duration::from_secs(1);
+            }
+            if let Ok(evidence) = &context_manager {
+                let actual_binder = fs::metadata(root.join("dev/binder"))?.rdev();
+                if actual_binder != expected_binder {
+                    self.readiness_diagnostics(root, "Guest Binder identity changed", "not run");
+                    return Err(io::Error::other(
+                        "Guest Binder device changed during Context Manager readiness",
+                    ));
+                }
+                println!(
+                    "Guest Binder Context Manager=reachable pid={} private_binder_rdev={actual_binder}\n{evidence}",
+                    self.child.id()
+                );
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                self.readiness_diagnostics(root, "semantic readiness timeout", "not run");
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("Guest Binder Context Manager timeout: {context_manager:?}"),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    }
+    fn wait_guest_servicemanager_property(
+        &mut self,
+        root: &Path,
+        service_lookup: &str,
+    ) -> io::Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            crate::memory_cgroup::check_interrupted()?;
+            if self.exited()? {
+                self.readiness_diagnostics(root, "Guest servicemanager exited", service_lookup);
+                return Err(io::Error::other(
+                    "Guest servicemanager exited before servicemanager.ready=true",
+                ));
+            }
+            let property = guest_servicemanager_property(root)
+                .unwrap_or_else(|error| format!("unavailable: {error}"));
+            if property == "true" {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                self.readiness_diagnostics(root, "servicemanager.ready timeout", service_lookup);
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("Guest servicemanager.ready remained {property:?}"),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(250));
         }
     }
     fn wait_for_socket(&mut self, socket_path: &Path) -> io::Result<()> {
@@ -475,6 +733,7 @@ impl Service {
             }
         }
         let status = self.child.wait()?;
+        self.drain_output()?;
         self.stopped = true;
         if let Some(diagnostics) = &mut self.diagnostics {
             diagnostics.finish(status)?;
@@ -490,6 +749,14 @@ impl Service {
 
 pub(crate) fn memory_probe(root: &Path, hierarchy_test: bool) -> io::Result<()> {
     let oom_test = hierarchy_test && std::env::var_os("SSAL_PHASE7D_FIX_OOM").is_some();
+    let backend = crate::memory_cgroup::backend()?;
+    if hierarchy_test && backend == crate::memory_cgroup::Backend::V1 {
+        // shortcut: the Phase 7D OOM proof is v2-only, add a v1 probe before using that phase there.
+        return Err(io::Error::other(
+            "phase 7D OOM hierarchy probe currently requires cgroup v2",
+        ));
+    }
+    let group = crate::memory_cgroup::memory_group(backend);
     let mut service = Service::start(
         root,
         if hierarchy_test {
@@ -525,18 +792,14 @@ pub(crate) fn memory_probe(root: &Path, hierarchy_test: bool) -> io::Result<()> 
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        let subgroup = Path::new(crate::guest_mounts::GUEST_CGROUPS[0].0).join("phase7d_fix");
+        let subgroup = crate::guest_mounts::task_cgroup_path()?.join("phase7d_fix");
         fs::write(subgroup.join("cgroup.procs"), pid.to_string())?;
-        let before: u64 = crate::memory_cgroup::read(
-            Path::new(crate::guest_mounts::GUEST_CGROUPS[0].0).join("memory.current"),
-        )?
-        .parse()
-        .map_err(io::Error::other)?;
+        let before = crate::memory_cgroup::usage(&group, backend)?;
         if unsafe { libc::kill(pid as i32, libc::SIGCONT) } != 0 {
             return Err(io::Error::last_os_error());
         }
         if oom_test {
-            let events = Path::new(crate::guest_mounts::GUEST_CGROUPS[0].0).join("memory.events");
+            let events = group.join("memory.events");
             loop {
                 if let Some(diagnostics) = &mut service.diagnostics {
                     diagnostics.tick()?;
@@ -548,7 +811,6 @@ pub(crate) fn memory_probe(root: &Path, hierarchy_test: bool) -> io::Result<()> 
                     .and_then(|v| v.parse::<u64>().ok())
                     .unwrap_or(0);
                 if count > 0 {
-                    let group = Path::new(crate::guest_mounts::GUEST_CGROUPS[0].0);
                     let limit: u64 = crate::memory_cgroup::read(group.join("memory.max"))?
                         .parse()
                         .map_err(io::Error::other)?;
@@ -607,16 +869,12 @@ pub(crate) fn memory_probe(root: &Path, hierarchy_test: bool) -> io::Result<()> 
             }
             let member = crate::memory_cgroup::verify_membership(
                 child,
-                Path::new("/sys/fs/cgroup"),
+                &crate::memory_cgroup::memory_mount(backend),
                 &subgroup,
             )?;
             println!("GUEST_CHILD pid={child} membership={member}");
         }
-        let after: u64 = crate::memory_cgroup::read(
-            Path::new(crate::guest_mounts::GUEST_CGROUPS[0].0).join("memory.current"),
-        )?
-        .parse()
-        .map_err(io::Error::other)?;
+        let after = crate::memory_cgroup::usage(&group, backend)?;
         if after < before + 8 * 1024 * 1024 {
             return Err(io::Error::other(format!(
                 "hierarchical memory charge too small: {before} -> {after}"
@@ -627,19 +885,12 @@ pub(crate) fn memory_probe(root: &Path, hierarchy_test: bool) -> io::Result<()> 
             after - before
         );
     }
-    let membership = crate::memory_cgroup::verify_membership(
-        pid,
-        Path::new("/sys/fs/cgroup"),
-        Path::new(crate::guest_mounts::GUEST_CGROUPS[0].0),
-    )?;
-    let cgroup = Path::new(crate::guest_mounts::GUEST_CGROUPS[0].0);
-    let current = crate::memory_cgroup::read(cgroup.join("memory.current"))?
-        .parse::<u64>()
-        .map_err(io::Error::other)?;
+    let membership = crate::memory_cgroup::verify_guest_membership(pid)?;
+    let current = crate::memory_cgroup::usage(&group, backend)?;
     if current == 0 {
         return Err(io::Error::other("Guest memory accounting is empty"));
     }
-    println!("GUEST_MEMORY_PROBE pid={pid} membership={membership} memory.current={current}");
+    println!("GUEST_MEMORY_PROBE pid={pid} membership={membership} memory_usage={current}");
     if let Some(diagnostics) = &mut service.diagnostics {
         diagnostics.tick()?;
     }
@@ -822,12 +1073,11 @@ fn start_property_service(
     fs::write(
         &overrides,
         [
-            "servicemanager.ready=true",
+            "servicemanager.ready=false",
             "ro.product.cpu.abilist64=arm64-v8a",
             "ro.build.version.codename=REL",
             "dalvik.vm.dex2oat64.enabled=true",
             "ro.zygote.disable_gl_preload=1",
-            "persist.ssal_probe=1",
         ]
         .join("\n")
             + "\n",
@@ -941,7 +1191,7 @@ fn start_property_service(
         return Err(io::Error::other("Host property socket selected"));
     }
     println!(
-        "PHASE7I_PROPERTY_SERVICE=PASS pid={} sid=u:r:ssal_property:s0 host_area={host_property_identity:?} guest_area={:?} host_data={host_data_identity:?} guest_data={:?}",
+        "PHASE7I_PROPERTY_SERVICE=PASS pid={} sid={expected} host_area={host_property_identity:?} guest_area={:?} host_data={host_data_identity:?} guest_data={:?}",
         service.child.id(),
         identity(&area)?,
         identity(&root.join("data"))?
@@ -990,7 +1240,7 @@ pub(crate) fn verify(
     phase7a: bool,
     host_mount_namespace: &Path,
 ) -> io::Result<()> {
-    let phase7i_properties = phase7a && std::env::var_os("SSAL_PHASE7I_PROPERTIES").is_some();
+    let phase7i_property_tests = std::env::var_os("SSAL_PHASE7I_PROPERTIES").is_some();
     if ssal::guest_policy::runtime::load(root)?.is_some()
         && [
             "SSAL_PHASE7FC_BYPASS_SETCONTEXT",
@@ -1006,9 +1256,9 @@ pub(crate) fn verify(
         ));
     }
     let system_server_preflight = system_server_preflight::enabled()?;
-    let runtime_sid = system_server_runtime_sid::enabled(phase7i_properties)?;
+    let runtime_sid = system_server_runtime_sid::enabled(phase7a)?;
     if system_server_preflight
-        && (!phase7i_properties
+        && (!phase7a
             || [
                 "SSAL_PHASE8B3B_NOOP",
                 "SSAL_PHASE8B3D_TRACE",
@@ -1052,9 +1302,10 @@ pub(crate) fn verify(
         "phase3-ipc",
         "ssal-phase2-log.so",
         "ssal-zygote-diag.so",
+        "ssal-property-service",
     ];
-    if phase7i_properties {
-        runtime_bins.push("ssal-property-service");
+    if std::env::var_os("SSAL_TRACE_GUEST_SIGABRT").is_some() {
+        runtime_bins.push("ssal-abort-trace.so");
     }
     if phase7a && std::env::var_os("SSAL_PHASE8B3B_NOOP").is_some() {
         runtime_bins.extend(["ssal-zygote-selinux-noop.so", "ssal-selinux-startup-probe"]);
@@ -1103,16 +1354,24 @@ pub(crate) fn verify(
                 entry.file_type()?.is_dir(),
             )?;
         }
-        if phase7i_properties {
+        {
             property_service = Some(start_property_service(
                 mounts,
                 root,
                 &bin,
                 host_mount_namespace,
             )?);
-            let property_script = if std::env::var_os("SSAL_PHASE7I_VERIFY_PERSIST").is_some() {
+            let property_script = if !phase7i_property_tests {
                 r#"set -eu
 test "$(getprop ro.build.version.sdk)" = 36
+test "$(getprop ro.product.cpu.abilist64)" = arm64-v8a
+test "$(getprop servicemanager.ready)" = false
+echo SSAL_GUEST_PRIVATE_PROPERTIES=PASS
+"#
+            } else if std::env::var_os("SSAL_PHASE7I_VERIFY_PERSIST").is_some() {
+                r#"set -eu
+test "$(getprop ro.build.version.sdk)" = 36
+test "$(getprop servicemanager.ready)" = false
 test "$(getprop persist.ssal_probe)" = 7
 test -z "$(getprop sys.ssal_probe)"
 echo SSAL_PROPERTY_RESTORE=PASS
@@ -1121,6 +1380,7 @@ echo SSAL_PROPERTY_RESTORE=PASS
                 r#"set -eu
 test "$(getprop ro.build.version.sdk)" = 36
 test "$(getprop ro.product.cpu.abilist64)" = arm64-v8a
+test "$(getprop servicemanager.ready)" = false
 setprop sys.ssal_probe phase7i
 test "$(getprop sys.ssal_probe)" = phase7i
 setprop persist.ssal_probe 7
@@ -1129,7 +1389,12 @@ echo SSAL_PROPERTY_BIONIC=PASS
 "#
             };
             let property_output = run(root, "/system/bin/sh", &["-c", property_script], 1000)?;
-            if !property_output.contains("SSAL_PROPERTY_") {
+            let expected_marker = if phase7i_property_tests {
+                "SSAL_PROPERTY_"
+            } else {
+                "SSAL_GUEST_PRIVATE_PROPERTIES=PASS"
+            };
+            if !property_output.contains(expected_marker) {
                 return Err(io::Error::other("Guest Bionic property evidence missing"));
             }
         }
@@ -1137,24 +1402,6 @@ echo SSAL_PROPERTY_BIONIC=PASS
         let device = binder.private_device()?;
         if unsafe { libc::fchmod(device.as_raw_fd(), 0o666) } != 0 {
             return Err(io::Error::last_os_error());
-        }
-        if !phase7i_properties {
-            crate::guest_mounts::directory(root, "dev/__properties__", 0o755)?;
-            run(
-                root,
-                "/system/bin/bootstrap/linker64",
-                &[
-                    "/run/ssal/guest_probe",
-                    "--initialize-private-properties",
-                    "/dev/guest-properties",
-                ],
-                0,
-            )?;
-            fs::remove_dir(root.join("dev/__properties__"))?;
-            fs::rename(
-                root.join("dev/guest-properties"),
-                root.join("dev/__properties__"),
-            )?;
         }
         let area = fs::metadata(root.join("dev/__properties__"))?;
         let host = fs::metadata("/dev/__properties__")?;
@@ -1180,6 +1427,12 @@ echo SSAL_PROPERTY_BIONIC=PASS
             return Err(io::Error::last_os_error());
         }
         fs::set_permissions(&guest_tmp, fs::Permissions::from_mode(0o1771))?;
+        if let Some(plan) = ssal::guest_policy::runtime::load(root)? {
+            ssal::guest_policy::runtime::set_label(
+                &guest_tmp,
+                &plan.context("shell_data_file", false)?,
+            )?;
+        }
         let local_metadata = fs::metadata(&guest_local)?;
         let tmp_metadata = fs::metadata(&guest_tmp)?;
         println!(
@@ -1192,15 +1445,16 @@ echo SSAL_PROPERTY_BIONIC=PASS
             tmp_metadata.mode() & 0o7777
         );
         println!("Guest FD pre-exec: injected Host /data fd={}; root command closes inherited identities and marks later FDs CLOEXEC", sentinel.as_raw_fd());
-        let shell = run(
-            root,
-            "/system/bin/sh",
-            &[
-                "-c",
-                r#"set -eu
+        let shell_context = ssal::guest_policy::runtime::load(root)?
+            .map(|plan| plan.context("shell", true))
+            .transpose()?
+            .unwrap_or_else(|| "u:r:ssal_guest_probe:s0".into());
+        let shell_script = format!(
+            r#"set -eu
 test "$(getprop ro.build.version.sdk)" = 36
 test "$(getprop ro.product.cpu.abilist64)" = arm64-v8a
 test "$(getprop ro.zygote.disable_gl_preload)" = 1
+test "$(getprop servicemanager.ready)" = false
 test -z "$(getprop ro.boot.serialno)"
 if test -e /run/ssal/property-service.json; then test -S /dev/socket/property_service; else test ! -e /dev/socket/property_service; fi
 for p in /dev/socket/property_service_for_system /dev/socket/init; do test ! -e "$p"; done
@@ -1209,7 +1463,7 @@ for fd in /proc/$$/fd/*; do
     echo "Guest post-exec fd=$fd target=$target"
     case "$target" in /dev/null|pipe:*|/system/bin/sh|/system/bin/mksh) ;; *) exit 31;; esac
 done
-test "$(cat /proc/$$/attr/current)" = u:r:ssal_guest_probe:s0
+test "$(cat /proc/$$/attr/current)" = "{shell_context}"
 umask 077
 marker=/data/local/tmp/ssal-launcher-$$
 set -C
@@ -1223,10 +1477,9 @@ set -e
 echo "Guest ctl.start return=$rc"
 test "$rc" != 0
 echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
-"#,
-            ],
-            1000,
-        )?;
+"#
+        );
+        let shell = run(root, "/system/bin/sh", &["-c", &shell_script], 1000)?;
         if !shell.contains("SSAL_GUEST_SHELL_PROPERTY_FD=PASS") {
             return Err(io::Error::other("shell evidence missing"));
         }
@@ -1240,7 +1493,10 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
             Some(GUEST_PROBE_CONTEXT),
             &[],
         )?;
-        manager.wait_text("Starting sm instance")?;
+        manager.wait_guest_servicemanager_property(root, "not run")?;
+        println!("GUEST_SERVICEMANAGER_PROPERTY=PASS value=true");
+        let guest_binder = fs::metadata(root.join("dev/binder"))?.rdev();
+        manager.wait_guest_context_manager(root, guest_binder)?;
         let mut server = Service::start(
             root,
             "/system/bin/bootstrap/linker64",
@@ -1250,22 +1506,41 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
             Some(GUEST_PROBE_CONTEXT),
             &[],
         )?;
-        server.wait_text("\"event\":\"registered\"")?;
-        let ipc = run(
+        if let Err(error) = server.wait_text("\"event\":\"registered\"") {
+            manager.readiness_diagnostics(
+                root,
+                "Guest AIDL service registration failed",
+                "not run",
+            );
+            return Err(error);
+        }
+        let ipc = match run(
             root,
             "/system/bin/bootstrap/linker64",
             &["/run/ssal/phase3-ipc", "client"],
             1000,
-        )?;
+        ) {
+            Ok(ipc) => ipc,
+            Err(error) => {
+                manager.readiness_diagnostics(root, "Guest AIDL service lookup failed", "failed");
+                return Err(error);
+            }
+        };
         if !ipc.contains("\"event\":\"ipc_passed\"") {
+            manager.readiness_diagnostics(
+                root,
+                "Guest AIDL service lookup returned no success event",
+                "failed",
+            );
             return Err(io::Error::other("AIDL IPC success evidence missing"));
         }
+        println!("GUEST_SERVICEMANAGER_READINESS=PASS property=servicemanager.ready:true context_manager=Guest_handle_0 service_lookup=aidl_lazy_test_1 private_binder={major}:{minor}");
         println!("PHASE5B=PASS shell=PASS private_aidl=PASS properties=PASS host_control_socket=ABSENT private_binder={major}:{minor}");
         if phase7a {
             let controlled_fork = std::env::var_os("SSAL_PHASE7FB_FORK").is_some();
             let app_trace = std::env::var_os("SSAL_PHASE8B3D_TRACE").is_some();
             if controlled_fork && app_trace {
-                fork_probe::prepare(mounts, root, &bin, phase7i_properties)?;
+                fork_probe::prepare(mounts, root, &bin, true)?;
             }
             if std::env::var_os("SSAL_PHASE8B3B_NOOP").is_some() {
                 // App trace uses the same overlay as Zygote; startup diagnostic uses stock rules.
@@ -1300,7 +1575,7 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
                 }
             }
             if controlled_fork && !app_trace {
-                fork_probe::prepare(mounts, root, &bin, phase7i_properties)?;
+                fork_probe::prepare(mounts, root, &bin, true)?;
             }
             if system_server_preflight {
                 system_server_preflight::run(root, &bin)?;
@@ -1343,9 +1618,7 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
             if let Some(jars) = classpaths.standalone_system_server.as_deref() {
                 zygote_env.push(("STANDALONE_SYSTEMSERVER_JARS", jars));
             }
-            if phase7i_properties {
-                zygote_env.push(("SSAL_PHASE7I_PROPERTIES", "1"));
-            }
+            zygote_env.push(("SSAL_PHASE7I_PROPERTIES", "1"));
             if controlled_fork && std::env::var_os("SSAL_PHASE7FC_BYPASS_SETCONTEXT").is_some() {
                 zygote_env.push(("SSAL_PHASE7FC_BYPASS_SETCONTEXT", "1"));
             }
@@ -1550,14 +1823,10 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
                     ));
                 }
             }
-            crate::memory_cgroup::verify_membership(
-                pid,
-                Path::new("/sys/fs/cgroup"),
-                Path::new(crate::guest_mounts::GUEST_CGROUPS[0].0),
-            )?;
+            crate::memory_cgroup::verify_guest_membership(pid)?;
             println!("Guest Zygote residence pid={pid} starttime={starttime} seconds=5 membership=verified");
             if controlled_fork {
-                fork_probe::run(root, &mut zygote, phase7i_properties)?;
+                fork_probe::run(root, &mut zygote, true)?;
             }
             zygote.stop()?;
             fs::remove_file(root.join("dev/socket/zygote"))?;
@@ -1699,7 +1968,7 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
             Err(error) => cleanup_errors.push(error.to_string()),
         }
     }
-    if phase7i_properties && std::env::var_os("SSAL_PHASE7FB_FORK").is_some() {
+    if phase7a && std::env::var_os("SSAL_PHASE7FB_FORK").is_some() {
         if let Err(error) = fork_probe::cleanup(root) {
             cleanup_errors.push(error.to_string());
         }
@@ -1725,6 +1994,130 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn common_workers_share_live_property_readiness() {
+        // Wiring regression: every caller enters this setup before any phase-specific work.
+        let source = include_str!("guest_launcher.rs");
+        let verify = source.split("pub(crate) fn verify(").nth(1).unwrap();
+        let setup = verify
+            .split("let mut manager = Service::start(")
+            .next()
+            .unwrap();
+        assert!(setup.contains("\"ssal-property-service\","));
+        assert!(setup.contains("property_service = Some(start_property_service("));
+        assert!(!setup.contains("if phase7i_properties"));
+        assert!(!setup.contains("--initialize-private-properties"));
+        assert!(source.contains("\"servicemanager.ready=false\""));
+        assert!(!source.contains(concat!("\"servicemanager.ready", "=true\"")));
+        let property = verify
+            .find("manager.wait_guest_servicemanager_property(")
+            .unwrap();
+        let context = verify.find("manager.wait_guest_context_manager(").unwrap();
+        let aidl = verify.find("\"aidl-server\"").unwrap();
+        assert!(property < context && context < aidl);
+    }
+
+    #[test]
+    fn property_failure_stderr_survives_child_exit() -> io::Result<()> {
+        let log = std::env::temp_dir().join(format!("ssal-property-stderr-{}", std::process::id()));
+        let output = File::create(&log)?;
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "echo 'property startup failure fixture' >&2; exit 1"])
+            .stderr(Stdio::piped());
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn()?;
+        let stream = crate::zygote_diagnostics::Stream::new(child.stderr.take().unwrap(), output)?;
+        let mut service = Service {
+            child,
+            log: log.clone(),
+            stopped: false,
+            diagnostics: None,
+            output: vec![stream],
+        };
+        let error = service
+            .wait_text("guest_property_service_ready")
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("property startup failure fixture"));
+        service.stop()?;
+        assert_eq!(service.child.wait()?.code(), Some(1));
+        fs::remove_file(log)?;
+        Ok(())
+    }
+
+    #[test]
+    fn child_joins_every_hierarchy_before_exec() -> io::Result<()> {
+        let directory = std::env::temp_dir().join(format!("ssal-pre-exec-{}", std::process::id()));
+        fs::create_dir_all(&directory)?;
+        let groups: Vec<_> = ["unified", "memory"]
+            .into_iter()
+            .map(|name| directory.join(name))
+            .collect();
+        for group in &groups {
+            fs::create_dir(group)?;
+            fs::write(group.join("cgroup.procs"), "parent")?;
+        }
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "printf %s $$"]);
+        let child_groups = groups.clone();
+        unsafe {
+            command.pre_exec(move || join_cgroups(&child_groups));
+        }
+        let output = command.output()?;
+        assert!(output.status.success());
+        for group in &groups {
+            assert_eq!(fs::read(group.join("cgroup.procs"))?, output.stdout);
+        }
+        fs::remove_file(groups[1].join("cgroup.procs"))?;
+        std::os::unix::fs::symlink("/dev/null", groups[1].join("cgroup.procs"))?;
+        assert!(command.spawn().is_err());
+        // A failed join must prevent exec, including when an earlier hierarchy succeeded.
+        fs::remove_file(groups[1].join("cgroup.procs"))?;
+        fs::remove_dir(&groups[1])?;
+        assert!(command.spawn().is_err());
+        fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[test]
+    fn mapped_helpers_use_their_guest_domains() {
+        for executable in [
+            "/apex/com.android.runtime/bin/linkerconfig",
+            "/system/bin/linkerconfig",
+        ] {
+            assert_eq!(
+                mapped_exec_domain(executable, Some(GUEST_PROBE_CONTEXT)),
+                "linkerconfig"
+            );
+        }
+        assert_eq!(
+            mapped_exec_domain(
+                "/system/bin/bootstrap/linker64",
+                Some(PROPERTY_SERVICE_CONTEXT)
+            ),
+            "init"
+        );
+        for (executable, domain) in [
+            ("/system/bin/app_process64", "zygote"),
+            ("/system/bin/servicemanager", "servicemanager"),
+            ("/system/bin/sh", "shell"),
+        ] {
+            assert_eq!(
+                mapped_exec_domain(executable, Some(GUEST_PROBE_CONTEXT)),
+                domain
+            );
+        }
+    }
 
     #[test]
     fn abi_query_requires_valid_response() -> io::Result<()> {
@@ -1841,6 +2234,7 @@ mod tests {
             log,
             stopped: false,
             diagnostics: None,
+            output: Vec::new(),
         };
         service.diagnostics = Some(crate::zygote_diagnostics::Diagnostics::attach(
             &mut service.child,
@@ -1852,6 +2246,10 @@ mod tests {
         assert!(service
             .wait_for_socket(Path::new("ssal_7b_fixture_absent"))
             .is_err());
+        let status = service.exit_status()?.expect("fixture exited");
+        assert!(matches!(status.0, libc::CLD_KILLED | libc::CLD_DUMPED));
+        assert_eq!(status.1, libc::SIGABRT);
+        assert_eq!(service.exit_status()?, Some(status));
         drop(service);
         let metadata = fs::read_to_string(directory.join("metadata.jsonl"))?;
         let exit: serde_json::Value = serde_json::from_str(metadata.lines().last().unwrap())?;
@@ -1884,6 +2282,7 @@ mod tests {
             log: log.clone(),
             stopped: false,
             diagnostics: None,
+            output: Vec::new(),
         };
         service.stop()?;
         service.stop()?;
@@ -1914,6 +2313,7 @@ mod tests {
             log: log.clone(),
             stopped: false,
             diagnostics: None,
+            output: Vec::new(),
         };
         let deadline = Instant::now() + Duration::from_secs(3);
         while !service.exited()? {

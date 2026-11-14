@@ -10,14 +10,17 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const LIMIT: usize = 1024 * 1024;
 
-struct Stream {
+pub(crate) struct Stream {
     input: Box<dyn Read + Send>,
     output: File,
     seen: u64,
     saved: usize,
 }
 impl Stream {
-    fn new(input: impl Read + AsRawFd + Send + 'static, output: File) -> io::Result<Self> {
+    pub(crate) fn new(
+        input: impl Read + AsRawFd + Send + 'static,
+        output: File,
+    ) -> io::Result<Self> {
         let fd = input.as_raw_fd();
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
         if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
@@ -30,7 +33,7 @@ impl Stream {
             saved: 0,
         })
     }
-    fn drain(&mut self) -> io::Result<()> {
+    pub(crate) fn drain(&mut self) -> io::Result<()> {
         let mut buffer = [0; 8192];
         // A writer or descendant holding the pipe cannot stall cleanup indefinitely.
         for _ in 0..32 {
@@ -162,6 +165,11 @@ impl Diagnostics {
             "memory.peak",
             "memory.max",
             "memory.high",
+            "memory.usage_in_bytes",
+            "memory.limit_in_bytes",
+            "memory.soft_limit_in_bytes",
+            "memory.failcnt",
+            "memory.oom_control",
             "memory.events",
             "memory.events.local",
             "memory.stat",

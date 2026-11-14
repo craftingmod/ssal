@@ -45,7 +45,7 @@ pub(super) fn prepare(
     bin: &Path,
     phase7i: bool,
 ) -> io::Result<()> {
-    fs::create_dir(Path::new(crate::guest_mounts::GUEST_CGROUPS[0].0).join("apps"))?;
+    fs::create_dir(crate::guest_mounts::task_cgroup_path()?.join("apps"))?;
     let library = root.join("run/ssal/ssal-zygote-fd-reopen.so");
     File::create(&library)?;
     mounts.bind(&bin.join("ssal-zygote-fd-reopen.so"), &library, true, false)?;
@@ -341,13 +341,12 @@ pub(super) fn run(root: &Path, zygote: &mut Service, phase7i: bool) -> io::Resul
     {
         return Err(io::Error::other("child escaped Guest SELinux domain"));
     }
-    crate::memory_cgroup::verify_membership(
-        pid as u32,
-        Path::new("/sys/fs/cgroup"),
-        Path::new(crate::guest_mounts::GUEST_CGROUPS[0].0),
-    )?;
+    crate::memory_cgroup::verify_guest_membership(pid as u32)?;
     let cgroups = fs::read_to_string(proc.join("cgroup"))?;
-    for (_, target) in crate::guest_mounts::GUEST_CGROUPS.iter().skip(1) {
+    for (_, target) in crate::guest_mounts::guest_cgroup_mounts(crate::memory_cgroup::backend()?)
+        .iter()
+        .filter(|(_, target)| matches!(*target, "dev/cpuset" | "dev/cpuctl" | "dev/blkio"))
+    {
         let controller = match *target {
             "dev/cpuset" => "cpuset",
             "dev/cpuctl" => "cpu",

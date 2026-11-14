@@ -119,6 +119,7 @@ pub(super) fn run(root: &Path, bin: &Path, env: &[(&str, &str)]) -> io::Result<(
         log,
         stopped: false,
         diagnostics: None,
+        output: Vec::new(),
     };
     let deadline = Instant::now() + Duration::from_secs(5);
     while !fs::read(&canary_report)?

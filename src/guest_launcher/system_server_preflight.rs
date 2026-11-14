@@ -181,7 +181,7 @@ pub(super) fn run(root: &Path, bin: &Path) -> io::Result<()> {
             "preflight requires a finite Guest memory.max",
         ));
     }
-    let apps = Path::new(crate::guest_mounts::GUEST_CGROUPS[0].0).join("apps");
+    let apps = crate::guest_mounts::task_cgroup_path()?.join("apps");
     if !apps.exists() {
         fs::create_dir(&apps)?;
     }

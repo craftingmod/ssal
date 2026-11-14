@@ -32,6 +32,41 @@ fn guest_all_codenames(build: &str) -> std::io::Result<&str> {
         })
 }
 
+#[cfg(any(target_os = "android", test))]
+fn guest_property_contexts(mapping: Option<&str>) -> std::io::Result<[String; 5]> {
+    let mut contexts = [
+        "properties_device",
+        "property_info",
+        "properties_serial",
+        "build_prop",
+        "default_prop",
+    ]
+    .map(str::to_owned);
+    for name in &mut contexts {
+        if let Some(mapping) = mapping {
+            let mapped = mapping
+                .lines()
+                .find_map(|line| {
+                    let (original, mapped) = line.split_once(' ')?;
+                    (original == name).then_some(mapped)
+                })
+                .filter(|value| {
+                    value.starts_with("ssal_p")
+                        && value.len() <= 255
+                        && value
+                            .bytes()
+                            .all(|c| c.is_ascii_alphanumeric() || c == b'_')
+                })
+                .ok_or_else(|| {
+                    std::io::Error::other(format!("missing or invalid mapped property type {name}"))
+                })?;
+            *name = mapped.to_owned();
+        }
+        *name = format!("u:object_r:{name}:s0");
+    }
+    Ok(contexts)
+}
+
 fn parse_args(args: &[String]) -> Result<Args, &'static str> {
     if args.len() != 6
         || args[0] != "--device"
@@ -109,6 +144,33 @@ mod android_probe;
 #[cfg(test)]
 mod tests {
     use super::{guest_all_codenames, parse_args, validate_kind_path, ProbeKind};
+
+    #[test]
+    fn private_property_labels_follow_the_guest_mapping() {
+        let names = [
+            "properties_device",
+            "property_info",
+            "properties_serial",
+            "build_prop",
+            "default_prop",
+        ];
+        let mapping = names
+            .map(|name| format!("{name} ssal_p0001_{name}\n"))
+            .concat();
+        let contexts = super::guest_property_contexts(Some(&mapping)).unwrap();
+        for (name, context) in names.iter().zip(contexts) {
+            assert_eq!(context, format!("u:object_r:ssal_p0001_{name}:s0"));
+        }
+        assert_eq!(
+            super::guest_property_contexts(None).unwrap()[0],
+            "u:object_r:properties_device:s0"
+        );
+        assert!(super::guest_property_contexts(Some("")).is_err());
+        assert!(super::guest_property_contexts(Some(
+            &mapping.replace("ssal_p0001_build_prop", "build_prop")
+        ))
+        .is_err());
+    }
 
     #[test]
     fn all_codenames_comes_from_guest_build_without_a_fallback() {

@@ -1,6 +1,5 @@
 use rsbinder::{
-    hub, DeathRecipient, Interface, Parcel, ProcessState, StatusCode, Strong, WIBinder,
-    INTERFACE_TRANSACTION,
+    hub, DeathRecipient, Interface, Parcel, ProcessState, Strong, WIBinder, INTERFACE_TRANSACTION,
 };
 use serde_json::json;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
@@ -60,8 +59,11 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         Some("client") => client(),
         Some("death-client") => death_client(),
         Some("check-absent") => check_absent(),
+        Some("context-manager") => context_manager(),
         Some("inspect-data-service") => inspect_data_service(args.next().as_deref()),
-        _ => Err("usage: phase3-ipc server|client|death-client|check-absent".into()),
+        _ => {
+            Err("usage: phase3-ipc server|client|death-client|check-absent|context-manager".into())
+        }
     }
 }
 
@@ -93,6 +95,15 @@ fn inspect_data_service(name: Option<&str>) -> Result<(), Box<dyn std::error::Er
 fn init() -> Result<(), Box<dyn std::error::Error>> {
     ProcessState::init_default()?;
     ProcessState::start_thread_pool();
+    let binder = std::fs::metadata("/dev/binder")?;
+    if !binder.file_type().is_char_device()
+        || !std::fs::read_dir("/proc/self/fd")?.flatten().any(|entry| {
+            std::fs::metadata(entry.path())
+                .is_ok_and(|fd| fd.file_type().is_char_device() && fd.rdev() == binder.rdev())
+        })
+    {
+        return Err("Guest Binder process fd does not match /dev/binder".into());
+    }
     Ok(())
 }
 
@@ -177,14 +188,7 @@ fn client() -> Result<(), Box<dyn std::error::Error>> {
         std::process::id(),
         SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
     );
-    if manager.check_service(&missing).is_some() {
-        return Err("unique unavailable service unexpectedly exists".into());
-    }
-    match manager.check_interface::<dyn IPhase3Service>(&missing) {
-        Err(StatusCode::NameNotFound) => {}
-        Err(error) => return Err(format!("unexpected unavailable-service error: {error}").into()),
-        Ok(_) => return Err("lookup of unavailable service unexpectedly succeeded".into()),
-    }
+    crate::lookup::require_absent(manager.try_get_service(&missing))?;
     let service = service()?;
     let add = service
         .r#add(17, 25)
@@ -218,9 +222,24 @@ fn client() -> Result<(), Box<dyn std::error::Error>> {
             "echo":echo,
             "callback":{"binder_object_transferred":true,"invocations":callback_results},
             "callback_lifetime":"same Strong reference retained across two synchronous transactions",
-            "unavailable_service":{"check_service_absent":true,"get_interface_failed":true},
+            "unavailable_service":{"transaction_succeeded":true,"service_absent":true},
             "identity":identity(),
         })
+    );
+    Ok(())
+}
+
+fn context_manager() -> Result<(), Box<dyn std::error::Error>> {
+    init()?;
+    let name = format!(
+        "ssal.phase3.context_manager.{}.{}",
+        std::process::id(),
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+    );
+    crate::lookup::require_absent(hub::default()?.try_get_service(&name))?;
+    println!(
+        "{}",
+        json!({"event":"context_manager_lookup_passed","missing_service":name,"transaction_succeeded":true,"identity":identity()})
     );
     Ok(())
 }
@@ -249,7 +268,7 @@ fn death_client() -> Result<(), Box<dyn std::error::Error>> {
     };
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     let absent_after_death = loop {
-        if manager.check_service(SERVICE).is_none() {
+        if manager.try_get_service(SERVICE)?.is_none() {
             break true;
         }
         if std::time::Instant::now() >= deadline {
@@ -271,7 +290,7 @@ fn check_absent() -> Result<(), Box<dyn std::error::Error>> {
     init()?;
     let manager = hub::default()?;
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
-    while manager.check_service(SERVICE).is_some() {
+    while manager.try_get_service(SERVICE)?.is_some() {
         if std::time::Instant::now() >= deadline {
             return Err("Guest service remained registered after server death".into());
         }

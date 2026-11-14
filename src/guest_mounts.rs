@@ -741,12 +741,32 @@ fn code_bridges(mounts: &mut Mounts, root: &Path, patch_dir: &Path) -> io::Resul
     Ok(())
 }
 
-pub(crate) const GUEST_CGROUPS: [(&str, &str); 4] = [
-    ("/sys/fs/cgroup/apps/ssal_guest", "sys/fs/cgroup"),
+pub(crate) const GUEST_RESOURCE_CGROUPS: [(&str, &str); 3] = [
     ("/dev/cpuctl/ssal_guest", "dev/cpuctl"),
     ("/dev/cpuset/ssal_guest", "dev/cpuset"),
     ("/dev/blkio/ssal_guest", "dev/blkio"),
 ];
+
+pub(crate) fn guest_cgroup_mounts(
+    backend: crate::memory_cgroup::Backend,
+) -> Vec<(PathBuf, &'static str)> {
+    let mut groups = vec![(crate::memory_cgroup::task_group(backend), "sys/fs/cgroup")];
+    if backend == crate::memory_cgroup::Backend::V1 {
+        groups.push((crate::memory_cgroup::memory_group(backend), "dev/memcg"));
+    }
+    groups.extend(
+        GUEST_RESOURCE_CGROUPS
+            .iter()
+            .map(|(source, target)| (PathBuf::from(source), *target)),
+    );
+    groups
+}
+
+pub(crate) fn task_cgroup_path() -> io::Result<PathBuf> {
+    Ok(crate::memory_cgroup::task_group(
+        crate::memory_cgroup::backend()?,
+    ))
+}
 
 #[derive(Default)]
 struct GuestCgroups {
@@ -767,26 +787,23 @@ impl GuestCgroups {
         ssal::namespace_mounts::require_private_mounts(&fs::read_to_string(
             "/proc/self/mountinfo",
         )?)?;
-        for (source, target) in GUEST_CGROUPS {
-            let source = Path::new(source);
+        let backend = self
+            .memory
+            .as_ref()
+            .ok_or_else(|| io::Error::other("Guest memory cgroup was not prepared"))?
+            .backend();
+        for (source, target) in guest_cgroup_mounts(backend) {
             let parent = source.parent().unwrap();
             if fs::canonicalize(parent)? != parent {
                 return Err(io::Error::other("cgroup parent contains a symlink"));
             }
-            self.create(source)?;
-            if target == "sys/fs/cgroup" && self.memory.is_some() {
-                for (name, key) in [
-                    ("memory.high", "SSAL_MEMORY_HIGH"),
-                    ("memory.max", "SSAL_MEMORY_MAX"),
-                ] {
-                    if let Some(value) = memory_limit(std::env::var(key).ok().as_deref())? {
-                        fs::write(source.join(name), value.to_string())?;
-                        crate::memory_cgroup::require(
-                            crate::memory_cgroup::read(source.join(name))? == value.to_string(),
-                            "Guest memory limit readback",
-                        )?;
-                    }
-                }
+            self.create(&source)?;
+            let memory_group = match backend {
+                crate::memory_cgroup::Backend::V2 => target == "sys/fs/cgroup",
+                crate::memory_cgroup::Backend::V1 => target == "dev/memcg",
+            };
+            if memory_group {
+                self.memory.as_ref().unwrap().configure_group(&source)?;
             }
             if target == "dev/cpuset" {
                 for name in ["cpus", "mems"] {
@@ -803,8 +820,8 @@ impl GuestCgroups {
             } else {
                 directory(root, target, 0o755)?
             };
-            mounts.bind(source, &target, false, false)?;
-            same_directory(source, &target)?;
+            mounts.bind(&source, &target, false, false)?;
+            same_directory(&source, &target)?;
             println!(
                 "Guest cgroup bind: {} -> {}",
                 source.display(),
@@ -867,14 +884,7 @@ fn remove_empty_cgroup_children(path: &Path) -> io::Result<()> {
 }
 
 fn memory_limit(value: Option<&str>) -> io::Result<Option<u64>> {
-    value
-        .map(|v| {
-            v.parse::<u64>()
-                .ok()
-                .filter(|n| *n > 0)
-                .ok_or_else(|| io::Error::other("memory limit must be a positive byte count"))
-        })
-        .transpose()
+    crate::memory_cgroup::parse_limit(value)
 }
 
 fn guest_cgroup_probe(root: &Path) -> io::Result<()> {
@@ -1005,7 +1015,7 @@ fn processgroup_probe(
             if action["Name"] == "JoinCgroup" {
                 let controller = action["Params"]["Controller"].as_str().unwrap();
                 let path = action["Params"]["Path"].as_str().unwrap();
-                let source = GUEST_CGROUPS
+                let source = GUEST_RESOURCE_CGROUPS
                     .iter()
                     .find(|(_, target)| {
                         *target
@@ -1037,7 +1047,7 @@ fn processgroup_probe(
         }
     }
     for name in ["apps", "system"] {
-        cgroups.create(&Path::new(GUEST_CGROUPS[0].0).join(name))?;
+        cgroups.create(&task_cgroup_path()?.join(name))?;
     }
     for path in &cgroups.created {
         for entry in [
@@ -1221,6 +1231,7 @@ pub fn verify(
             if matches!(
                 mode,
                 "--guest-processgroup-worker"
+                    | "--guest-cgroup-worker"
                     | "--guest-memory-worker"
                     | "--guest-child-worker"
                     | "--guest-service-worker"
@@ -1339,18 +1350,27 @@ pub fn verify(
             let shell = guest_path(&root, "system/bin/sh")?;
             let shell_label = ssal::unix::image_context(&File::open(&shell)?)?;
             let expected = plan.context("system_data_file", false)?;
-            let probe = root.join(format!("data/.ssal-restorecon-probe-{}", std::process::id()));
-            let file = OpenOptions::new().write(true).create_new(true).open(&probe)?;
+            let probe = root.join(format!(
+                "data/.ssal-restorecon-probe-{}",
+                std::process::id()
+            ));
+            let file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&probe)?;
             let result = (|| {
                 let before = ssal::unix::image_context(&file)?;
                 if before == expected {
-                    return Err(io::Error::other("restorecon probe already has target label"));
+                    return Err(io::Error::other(
+                        "restorecon probe already has target label",
+                    ));
                 }
-                let status = crate::guest_probe::root_command(&root, "/system/bin/restorecon", false)?
-                    .env("LD_PRELOAD", "/run/ssal/ssal-context-map.so")
-                    .args(["-RF", "/data"])
-                    .status()
-                    .map_err(|e| io::Error::other(format!("execute Guest restorecon: {e}")))?;
+                let status =
+                    crate::guest_probe::root_command(&root, "/system/bin/restorecon", false)?
+                        .env("LD_PRELOAD", "/run/ssal/ssal-context-map.so")
+                        .args(["-RF", "/data"])
+                        .status()
+                        .map_err(|e| io::Error::other(format!("execute Guest restorecon: {e}")))?;
                 if !status.success() {
                     return Err(io::Error::other(
                         "restorecon Guest userdata using mapped file_contexts failed",
@@ -1377,7 +1397,7 @@ pub fn verify(
         if mode == "--guest-memory-worker" {
             let helper = std::env::var_os("SSAL_PHASE7D_FIX_HELPER");
             if let Some(path) = &helper {
-                cgroups.create(&Path::new(GUEST_CGROUPS[0].0).join("phase7d_fix"))?;
+                cgroups.create(&task_cgroup_path()?.join("phase7d_fix"))?;
                 let target = directory(&root, "run/ssal", 0o755)?.join("phase7d-fix-probe");
                 File::create(&target)?;
                 mounts.bind(Path::new(path), &target, true, false)?;

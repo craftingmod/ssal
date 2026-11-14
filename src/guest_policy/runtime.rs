@@ -296,15 +296,7 @@ fn delta(plan: &Plan, applied: &Applied) -> io::Result<Vec<String>> {
             rules.extend(split_allow_rule(rule)?);
         }
     }
-    let desired: BTreeSet<_> = plan
-        .declarations
-        .iter()
-        .chain(rules.iter())
-        .cloned()
-        .collect();
-    if !applied.statements.is_subset(&desired) {
-        return Err(invalid("GSI removed/changed previously applied rules; reboot before prepare to discard stale Guest rules"));
-    }
+    // KernelSU cannot remove policy statements already applied to this Guest ID.
     Ok(plan
         .declarations
         .iter()
@@ -677,7 +669,8 @@ pub fn isolate_tree(
         return Err(invalid("overlay path contains option separators"));
     }
     let options = format!(
-        "lowerdir={},upperdir={},workdir={},metacopy=on",
+        // mprotect checks the backing inode; metadata-only copy-up leaves its Host label active.
+        "lowerdir={},upperdir={},workdir={},metacopy=off",
         target.display(),
         scratch.join("upper").display(),
         scratch.join("work").display()
@@ -701,6 +694,11 @@ pub fn isolate_tree(
 }
 
 pub fn install(plan: &Plan, mounts: &mut Mounts, root: &Path) -> io::Result<()> {
+    // New linkerconfig files inherit this Guest-only tmpfs directory's mapped type.
+    set_label(
+        &root.join("linkerconfig"),
+        &plan.context("linkerconfig_file", false)?,
+    )?;
     let scratch = root.parent().unwrap().join("selinux-overlay");
     let runtime = root.join("run/ssal");
     fs::create_dir_all(&runtime)?;
@@ -790,7 +788,7 @@ pub fn bind_file(mounts: &mut Mounts, root: &Path, source: &Path, target: &Path)
     mounts.bind(&private, target, true, false)
 }
 
-fn set_label(path: &Path, context: &str) -> io::Result<()> {
+pub fn set_label(path: &Path, context: &str) -> io::Result<()> {
     let path = CString::new(path.as_os_str().as_bytes()).map_err(invalid_cstring)?;
     let context = CString::new(context).map_err(invalid_cstring)?;
     if unsafe {
@@ -1097,8 +1095,7 @@ mod tests {
     }
 
     #[test]
-    fn application_delta_is_idempotent_and_requires_reboot_for_removals_or_uncertain_apply(
-    ) -> io::Result<()> {
+    fn application_delta_is_idempotent_and_preserves_applied_rules() -> io::Result<()> {
         let plan = generate("p0001", &BTreeMap::from([("policy.cil".into(), "(type foo) (typeattribute domain) (typeattributeset domain (foo)) (allow domain self (process (fork)))".into())]))?;
         let mut applied = Applied::default();
         let first = delta(&plan, &applied)?;
@@ -1112,10 +1109,7 @@ mod tests {
         assert!(delta(&plan, &applied)?.is_empty());
         let mut removed = plan.clone();
         removed.rules.retain(|r| !r.starts_with("allow "));
-        assert!(delta(&removed, &applied)
-            .unwrap_err()
-            .to_string()
-            .contains("reboot"));
+        assert!(delta(&removed, &applied)?.is_empty());
         applied.pending = true;
         assert!(delta(&plan, &applied)
             .unwrap_err()

@@ -368,7 +368,7 @@ int main(int argc, char** argv) {
         const char* abi = "ro.product.cpu.abilist64";
         const char* sdk = "ro.build.version.sdk";
         const char* codename = "ro.build.version.codename";
-        const bool ok = area->add("servicemanager.ready", 20, "true", 4) && area->add(compiler, strlen(compiler), "true", 4) && area->add(abi, strlen(abi), "arm64-v8a", 9) && area->add(sdk,strlen(sdk),"36",2) && area->add(codename,strlen(codename),"REL",3);
+        const bool ok = area->add("servicemanager.ready", 20, "false", 5) && area->add(compiler, strlen(compiler), "true", 4) && area->add(abi, strlen(abi), "arm64-v8a", 9) && area->add(sdk,strlen(sdk),"36",2) && area->add(codename,strlen(codename),"REL",3);
         prop_area::unmap_prop_area(&area);
         return ok ? 0 : 1;
     }

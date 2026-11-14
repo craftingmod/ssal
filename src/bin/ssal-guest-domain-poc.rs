@@ -934,6 +934,19 @@ fn cgroup_mount_check(args: &[String]) -> std::io::Result<()> {
     std::env::set_current_dir("/")?;
     let info = fs::read_to_string("/proc/self/mountinfo")?;
     ssal::namespace_mounts::require_private_mounts(&info)?;
+    let v1_memory = info.lines().any(|line| {
+        line.split_once(" - ").is_some_and(|(_, tail)| {
+            let fields: Vec<_> = tail.split_whitespace().collect();
+            fields.first() == Some(&"cgroup")
+                && line.split_whitespace().nth(4) == Some("/dev/memcg")
+                && fields
+                    .get(2..)
+                    .unwrap_or_default()
+                    .iter()
+                    .flat_map(|value| value.split(','))
+                    .any(|value| value == "memory")
+        })
+    });
     if info
         .lines()
         .filter(|line| {
@@ -942,18 +955,30 @@ fn cgroup_mount_check(args: &[String]) -> std::io::Result<()> {
             })
         })
         .count()
-        != 4
+        != if v1_memory { 5 } else { 4 }
     {
         return Err(io::Error::other(
             "unexpected extra/missing Guest cgroup mount",
         ));
     }
-    for (target, expected_root, kind) in [
-        ("/sys/fs/cgroup", "/apps/ssal_guest", "cgroup2"),
+    let mut expected = vec![
+        (
+            "/sys/fs/cgroup",
+            if v1_memory {
+                "/ssal_guest"
+            } else {
+                "/apps/ssal_guest"
+            },
+            "cgroup2",
+        ),
         ("/dev/cpuctl", "/ssal_guest", "cgroup"),
         ("/dev/cpuset", "/ssal_guest", "cgroup"),
         ("/dev/blkio", "/ssal_guest", "cgroup"),
-    ] {
+    ];
+    if v1_memory {
+        expected.push(("/dev/memcg", "/ssal_guest", "cgroup"));
+    }
+    for (target, expected_root, kind) in expected {
         let entries: Vec<_> = info
             .lines()
             .filter(|line| line.split_whitespace().nth(4) == Some(target))

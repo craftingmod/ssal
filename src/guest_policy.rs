@@ -11,7 +11,7 @@ pub mod native;
 pub mod runtime;
 mod symbols;
 
-const VERSION: u32 = 5;
+const VERSION: u32 = 10;
 
 type Names = BTreeMap<String, String>;
 
@@ -1042,6 +1042,49 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
             }
         }
     }
+    // exec opens the ELF as ksu; only these launcher clients receive its isolated stdio.
+    for original in ["init", "shell", "linkerconfig", "servicemanager"] {
+        if let Some(domain) = plan.types.get(original) {
+            for (class, permission) in [("fd", "use"), ("fifo_file", "write")] {
+                let rule = format!("allow {domain} ksu {class} {{ {permission} }}");
+                native::record(
+                    &mut native_rules,
+                    rule.clone(),
+                    1,
+                    1,
+                    &[domain, "ksu", class, permission],
+                );
+                plan.rules.insert(rule);
+            }
+        }
+    }
+    // Property files are created under the directory type, then receive their final Guest label.
+    if let (Some(init), Some(directory)) =
+        (plan.types.get("init"), plan.types.get("properties_device"))
+    {
+        let rule = format!("allow {init} {directory} file {{ relabelfrom }}");
+        native::record(
+            &mut native_rules,
+            rule.clone(),
+            1,
+            1,
+            &[init, directory, "file", "relabelfrom"],
+        );
+        plan.rules.insert(rule);
+    }
+    // binderfs context= mounts require the Guest binder label to associate with its filesystem.
+    if let Some(device) = plan.types.get("binder_device") {
+        let rule = format!("allow {device} {device} filesystem {{ associate }}");
+        if plan.rules.insert(rule.clone()) {
+            native::record(
+                &mut native_rules,
+                rule,
+                1,
+                1,
+                &[device, device, "filesystem", "associate"],
+            );
+        }
+    }
     plan.native_rules = native_rules;
     Ok(plan)
 }
@@ -1150,6 +1193,39 @@ mod tests {
         ])
     }
     #[test]
+    fn launcher_fd_permissions_only_extend_guest_helper_clients() -> io::Result<()> {
+        let mut inputs = fixture();
+        inputs
+            .get_mut("system/etc/selinux/plat_sepolicy.cil")
+            .unwrap()
+            .push_str(" (type init) (type shell) (type linkerconfig) (type servicemanager) (type properties_device)");
+        let plan = generate("p0001", &inputs)?;
+        let rules: Vec<_> = plan
+            .rules
+            .iter()
+            .filter(|r| r.contains(" ksu "))
+            .cloned()
+            .collect();
+        assert_eq!(rules.len(), 8);
+        let relabel = "allow ssal_p0001_init ssal_p0001_properties_device file { relabelfrom }";
+        assert!(plan.rules.contains(relabel));
+        assert!(plan.native_rules.contains_key(relabel));
+        for source in ["init", "shell", "linkerconfig", "servicemanager"] {
+            for (class, permission) in [("fd", "use"), ("fifo_file", "write")] {
+                let rule = format!("allow ssal_p0001_{source} ksu {class} {{ {permission} }}");
+                assert!(rules.contains(&rule));
+                assert_eq!(
+                    native::encode(&plan, &[rule])?
+                        .iter()
+                        .map(|b| b.commands)
+                        .sum::<usize>(),
+                    1
+                );
+            }
+        }
+        Ok(())
+    }
+    #[test]
     fn converts_private_types_shared_labels_and_transitions() -> io::Result<()> {
         let plan = generate("p0001", &fixture())?;
         plan.usable()?;
@@ -1161,6 +1237,18 @@ mod tests {
             .contains("/vendor(/.*)? u:object_r:vendor_file:s0"));
         assert!(plan.contexts["system/etc/selinux/plat_file_contexts"]
             .contains("/dev/binder u:object_r:ssal_p0001_binder_device:s0"));
+        let binder_device = &plan.types["binder_device"];
+        let binderfs_rule =
+            format!("allow {binder_device} {binder_device} filesystem {{ associate }}");
+        assert!(plan.rules.contains(&binderfs_rule));
+        assert!(plan.native_rules.contains_key(&binderfs_rule));
+        assert_eq!(
+            native::encode(&plan, &[binderfs_rule])?
+                .iter()
+                .map(|batch| batch.commands)
+                .sum::<usize>(),
+            1
+        );
         assert!(plan.contexts["system/etc/selinux/plat_seapp_contexts"]
             .contains("domain=ssal_p0001_system_server"));
         assert!(plan.declarations.iter().all(|s| !s.ends_with(" domain")));

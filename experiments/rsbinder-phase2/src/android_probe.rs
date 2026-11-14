@@ -33,8 +33,10 @@ struct Failure {
 }
 
 pub(super) fn initialize_private_properties(path: &Path) -> std::io::Result<String> {
+    eprintln!("Guest private properties: start");
     // Test B sets umask 0000; rsproperties rejects group- or world-writable area files.
     unsafe { libc::umask(0o022) };
+    eprintln!("Guest private properties: read Guest build.prop");
     let build = fs::read_to_string("/system/build.prop")?;
     let sdk = build
         .lines()
@@ -63,13 +65,21 @@ pub(super) fn initialize_private_properties(path: &Path) -> std::io::Result<Stri
     }
 
     let all_codenames = crate::guest_all_codenames(&build)?;
+    let mapping = match fs::read_to_string("/run/ssal/selinux-types") {
+        Ok(mapping) => Some(mapping),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    let [directory_context, info_context, serial_context, value_context, default_context] =
+        crate::guest_property_contexts(mapping.as_deref())?;
+    eprintln!("Guest private properties: create and label area");
     fs::create_dir(path)?;
-    set_label(path, "u:object_r:properties_device:s0")?;
+    set_label(path, &directory_context)?;
     let seeds = [
         ("ro.build.version.sdk", sdk),
         ("ro.build.version.sdk_full", sdk_full),
         ("ro.build.version.all_codenames", all_codenames),
-        ("servicemanager.ready", "true"),
+        ("servicemanager.ready", "false"),
         ("ro.product.cpu.abilist64", "arm64-v8a"),
         ("ro.build.version.codename", "REL"),
         ("dalvik.vm.dex2oat64.enabled", "true"),
@@ -80,7 +90,7 @@ pub(super) fn initialize_private_properties(path: &Path) -> std::io::Result<Stri
         .map(|(name, _)| {
             rsproperties::PropertyInfoEntry::new(
                 (*name).to_owned(),
-                "u:object_r:build_prop:s0".to_owned(),
+                value_context.clone(),
                 "string",
                 true,
             )
@@ -88,23 +98,37 @@ pub(super) fn initialize_private_properties(path: &Path) -> std::io::Result<Stri
         })
         .collect::<std::io::Result<Vec<_>>>()?;
     let property_info = path.join("property_info");
-    fs::write(
-        &property_info,
-        rsproperties::build_trie(&entries, "u:object_r:default_prop:s0", "string")
-            .map_err(std::io::Error::other)?,
-    )?;
-    set_label(&property_info, "u:object_r:property_info:s0")?;
+    let property_info_bytes = rsproperties::build_trie(&entries, &default_context, "string")
+        .map_err(std::io::Error::other)?;
+    eprintln!("Guest private properties: write property_info");
+    let fscreate = "/proc/thread-self/attr/fscreate";
+    fs::write(fscreate, &directory_context)?;
+    let write = fs::write(&property_info, property_info_bytes);
+    fs::write(fscreate, b"\0")?;
+    write.map_err(|e| std::io::Error::other(format!("write property_info: {e}")))?;
+    set_label(&property_info, &info_context)?;
 
-    let mut properties =
-        rsproperties::SystemProperties::new_area(path).map_err(std::io::Error::other)?;
+    eprintln!("Guest private properties: create property area");
+    fs::write(fscreate, &directory_context)?;
+    let properties = rsproperties::SystemProperties::new_area(path);
+    fs::write(fscreate, b"\0")?;
+    let mut properties = properties.map_err(std::io::Error::other)?;
+    set_label(&path.join("properties_serial"), &serial_context)?;
+    set_label(&path.join(".writer_lock"), &serial_context)?;
+    for context in [&value_context, &default_context] {
+        set_label(&path.join(context), context)?;
+    }
     for (name, value) in seeds {
+        eprintln!("Guest private properties: add {name}");
         properties.add(name, value).map_err(std::io::Error::other)?;
     }
     drop(properties);
+    eprintln!("Guest private properties: select private area");
     rsproperties::try_init(rsproperties::PropertyConfig::with_properties_dir(
         path.to_path_buf(),
     ))
     .map_err(std::io::Error::other)?;
+    eprintln!("Guest private properties: readback");
     let observed =
         rsproperties::get::<String>("ro.build.version.sdk").map_err(std::io::Error::other)?;
     if observed != sdk {
@@ -128,8 +152,8 @@ pub(super) fn initialize_private_properties(path: &Path) -> std::io::Result<Stri
         "rsproperties_all_codenames":observed_codenames,
         "rsproperties_sdk":observed,
         "property_area":path.display().to_string(),
-        "property_info_context":"u:object_r:property_info:s0",
-        "property_value_context":"u:object_r:build_prop:s0",
+        "property_info_context":info_context,
+        "property_value_context":value_context,
     })
     .to_string())
 }
@@ -138,6 +162,22 @@ fn set_label(path: &Path, label: &str) -> std::io::Result<()> {
     let path =
         std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(std::io::Error::other)?;
     let label = std::ffi::CString::new(label).map_err(std::io::Error::other)?;
+    let mut current = [0u8; 256];
+    let size = unsafe {
+        libc::getxattr(
+            path.as_ptr(),
+            c"security.selinux".as_ptr(),
+            current.as_mut_ptr().cast(),
+            current.len(),
+        )
+    };
+    if size < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let current = &current[..size as usize];
+    if current.strip_suffix(&[0]).unwrap_or(current) == label.as_bytes() {
+        return Ok(());
+    }
     if unsafe {
         libc::setxattr(
             path.as_ptr(),

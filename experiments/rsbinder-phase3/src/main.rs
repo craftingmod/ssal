@@ -1,5 +1,6 @@
 #[cfg(target_os = "android")]
 mod android;
+mod lookup;
 
 #[cfg(target_os = "android")]
 fn main() {

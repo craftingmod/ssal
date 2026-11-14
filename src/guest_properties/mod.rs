@@ -278,23 +278,34 @@ fn load_seeds(paths: &[PathBuf], policy: &policy::Policy) -> io::Result<BTreeMap
 }
 
 pub fn serve(config: Config) -> io::Result<()> {
-    check_isolation(&config)?;
-    let mut policy = load_policy(&config.property_contexts)?;
+    check_isolation(&config)
+        .map_err(|e| io::Error::new(e.kind(), format!("property isolation: {e}")))?;
+    let mut policy = load_policy(&config.property_contexts)
+        .map_err(|e| io::Error::new(e.kind(), format!("property contexts: {e}")))?;
     policy.default_context = config.context("default_prop", &policy.default_context, false)?;
-    let seeds = load_seeds(&config.build_props, &policy)?;
-    let store = persistent::Store::open(Path::new(PERSIST_DIRECTORY))?;
+    let seeds = load_seeds(&config.build_props, &policy)
+        .map_err(|e| io::Error::new(e.kind(), format!("property seeds: {e}")))?;
+    let store = persistent::Store::open(Path::new(PERSIST_DIRECTORY))
+        .map_err(|e| io::Error::new(e.kind(), format!("property persistent store: {e}")))?;
     let mapped_label = |path: &Path, original: &str| {
-        let name = match original {
-            DIRECTORY_CONTEXT => "properties_device",
-            INFO_CONTEXT => "property_info",
-            SERIAL_CONTEXT => "properties_serial",
-            _ => return label(path, original),
+        let context = match original {
+            DIRECTORY_CONTEXT => config.context("properties_device", original, false)?,
+            INFO_CONTEXT => config.context("property_info", original, false)?,
+            SERIAL_CONTEXT => config.context("properties_serial", original, false)?,
+            _ => original.into(),
         };
-        label(path, &config.context(name, original, false)?)
+        label(path, &context).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("label {} as {context}: {e}", path.display()),
+            )
+        })
     };
-    let mut properties = initialize(policy, seeds, store, Path::new(AREA), mapped_label)?;
+    let mut properties = initialize(policy, seeds, store, Path::new(AREA), mapped_label)
+        .map_err(|e| io::Error::new(e.kind(), format!("property area initialization: {e}")))?;
     properties.socket_context = config.context("property_socket", SOCKET_CONTEXT, false)?;
     server::serve(&mut properties)
+        .map_err(|e| io::Error::new(e.kind(), format!("property socket server: {e}")))
 }
 
 fn initialize(
@@ -330,11 +341,15 @@ fn initialize(
         .write(true)
         .create_new(true)
         .mode(0o444)
-        .open(&info_path)?;
-    file.write_all(&info)?;
+        .open(&info_path)
+        .map_err(|e| io::Error::new(e.kind(), format!("create {}: {e}", info_path.display())))?;
+    file.write_all(&info)
+        .map_err(|e| io::Error::new(e.kind(), format!("write {}: {e}", info_path.display())))?;
     drop(file);
     label(&info_path, INFO_CONTEXT)?;
-    let mut area = SystemProperties::new_area(directory).map_err(io::Error::other)?;
+    let mut area = SystemProperties::new_area(directory).map_err(|e| {
+        io::Error::other(format!("create property area {}: {e}", directory.display()))
+    })?;
     label(&directory.join("properties_serial"), SERIAL_CONTEXT)?;
     for context in policy
         .entries
@@ -347,7 +362,8 @@ fn initialize(
         }
     }
     for (name, value) in seeds {
-        area.add(&name, &value).map_err(io::Error::other)?;
+        area.add(&name, &value)
+            .map_err(|e| io::Error::other(format!("seed property {name}: {e}")))?;
     }
     if !staged.is_empty() {
         store.apply_staged()?;
@@ -369,9 +385,19 @@ pub fn main() -> io::Result<()> {
     }
     // This is a dedicated exec worker; inherited Host roots/property/socket FDs must not survive.
     if unsafe { libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32) } != 0 {
-        return Err(io::Error::last_os_error());
+        let e = io::Error::last_os_error();
+        return Err(io::Error::new(
+            e.kind(),
+            format!("property inherited FD cleanup: {e}"),
+        ));
     }
-    let config = serde_json::from_reader(File::open(&args[1])?).map_err(io::Error::other)?;
+    let file = File::open(&args[1]).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("property config {}: {e}", Path::new(&args[1]).display()),
+        )
+    })?;
+    let config = serde_json::from_reader(file).map_err(io::Error::other)?;
     serve(config)
 }
 
