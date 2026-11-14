@@ -120,7 +120,7 @@ fn profile() -> io::Result<Profile> {
 pub fn description() -> io::Result<String> {
     let p = profile()?;
     let services = crate::service_contract::blocked_summary()?;
-    Ok(format!("mount profile: {} (built-in v{})\nrootfs: composed system RO, profile userdata RW, private mnt/storage/data_mirror\nruntime: tmp/cache RW tmpfs; metadata/config empty RO tmpfs; no host metadata/configfs\ndevices: fresh Guest /dev with null/zero/random/urandom; Guest child/cgroup workers additionally bind Guest-only cgroup subtrees; no Host Binder, properties, sockets, cgroup roots or BPF bind\nGuest executable admission: BLOCKED until Host proc/root, exec-FD and signal/ptrace boundaries pass\nAPEX: guest/vendor payload ext4 RO; Guest linkerconfig not executed\nGuest property service, Android services, FUSE access control, VINTF and SELinux compatibility: not certified\n{services}", p.name, p.version))
+    Ok(format!("mount profile: {} (built-in v{})\nrootfs: composed system RO, profile userdata RW, private mnt/storage/data_mirror\nruntime: tmp/cache RW tmpfs; metadata/config empty RO tmpfs; no host metadata/configfs\ndevices: fresh Guest /dev with null/zero/random/urandom; Guest child/cgroup workers additionally bind Guest-only cgroup subtrees; no Host Binder, properties, sockets, cgroup roots or BPF bind\nAutomatic Guest launch: BLOCKED; preparation restorecon/linkerconfig helpers permitted\nAPEX: guest/vendor payload ext4 RO; Guest linkerconfig generation required\nGuest property service, Android services, FUSE access control, VINTF and SELinux compatibility: not certified\n{services}", p.name, p.version))
 }
 
 // Reject symlinks at every directory component, including persistent userdata.
@@ -471,6 +471,7 @@ fn apex(
     root: &Path,
     cache: &Path,
     loop_nodes: &crate::prepare::LoopNodes,
+    policy: Option<&ssal::guest_policy::Plan>,
 ) -> io::Result<()> {
     fs::create_dir(cache)?;
     let mut packages = Vec::new();
@@ -547,6 +548,10 @@ fn apex(
         if payload_identity != (name.clone(), version) {
             return Err(io::Error::other("APEX outer/payload manifest mismatch"));
         }
+        if let Some(plan) = policy {
+            ssal::guest_policy::runtime::isolate_tree(plan, mounts, &versioned,
+                &root.parent().unwrap().join("selinux-overlay").join(format!("apex-{index}")))?;
+        }
         fs::create_dir(&destination)?;
         mounts.bind(&versioned, &destination, true, false)?;
         let package_target = package_dir.join(format!("{index}.apex"));
@@ -598,7 +603,8 @@ pub(crate) fn linkerconfig_binary(root: &Path) -> io::Result<&'static str> {
 fn linkerconfig(root: &Path) -> io::Result<()> {
     let binary = linkerconfig_binary(root)?;
     println!("guest linkerconfig executable: {binary}");
-    let mut command = crate::guest_probe::command(root, binary, false)?;
+    // This fixed preparation helper does not admit automatic Android service launch.
+    let mut command = crate::guest_probe::root_command(root, binary, false)?;
     command.args(["--target", "/linkerconfig"]);
     let output = command.output()
         .map_err(|e| io::Error::new(e.kind(), format!("execute {binary} inside {}: {e}; guest executable was found; check its ELF interpreter path and chroot setup", root.display())))?;
@@ -634,7 +640,7 @@ fn patches(
                     target.display()
                 )));
             }
-            mounts.bind(&source, &target, true, false)?;
+            ssal::guest_policy::runtime::bind_file(mounts, root, &source, &target)?;
             // Keep the versioned APEX view consistent with the active alias.
             if apex_phase {
                 let parts: Vec<_> = patch.target.splitn(3, '/').collect();
@@ -647,7 +653,12 @@ fn patches(
                     {
                         let relative =
                             format!("apex/{}/{}", entry.file_name().to_string_lossy(), parts[2]);
-                        mounts.bind(&source, &guest_path(root, &relative)?, true, false)?;
+                        ssal::guest_policy::runtime::bind_file(
+                            mounts,
+                            root,
+                            &source,
+                            &guest_path(root, &relative)?,
+                        )?;
                     }
                 }
             }
@@ -689,7 +700,7 @@ fn permission_controller(mounts: &mut Mounts, patch_dir: &Path, root: &Path) -> 
         ));
     }
     for target in targets {
-        mounts.bind(&source, &target, true, false)?;
+        ssal::guest_policy::runtime::bind_file(mounts, root, &source, &target)?;
     }
     Ok(())
 }
@@ -709,7 +720,7 @@ fn code_bridges(mounts: &mut Mounts, root: &Path, patch_dir: &Path) -> io::Resul
             if source.is_file() {
                 let target = code.join(name);
                 File::create(&target)?;
-                mounts.bind(&source, &target, true, false)?;
+                ssal::guest_policy::runtime::bind_file(mounts, root, &source, &target)?;
             }
         }
     }
@@ -1074,6 +1085,7 @@ pub fn verify(
     loop_nodes: &crate::prepare::LoopNodes,
     mode: &str,
     host_mount_namespace: &Path,
+    force_regen: bool,
 ) -> io::Result<()> {
     let profile = profile()?;
     let root = base.join("rootfs");
@@ -1081,6 +1093,27 @@ pub fn verify(
     fs::create_dir(&root)?;
     let mut mounts = Mounts::new();
     let mut cgroups = GuestCgroups::default();
+    let overlay_backing = userdata.join(format!(".ssal-overlay-{}", std::process::id()));
+    let mut overlay_created = false;
+    let mapped_launch = matches!(
+        mode,
+        "--guest-child-worker"
+            | "--guest-service-worker"
+            | "--guest-services-6a-worker"
+            | "--guest-services-6b-worker"
+            | "--guest-zygote-7a-worker"
+    );
+    let policy = if mode == "--prepare-worker"
+        || (mapped_launch && profile_dir.join("selinux/plan.json").is_file())
+    {
+        Some(ssal::guest_policy::runtime::prepare_mounted(
+            system,
+            profile_dir,
+            force_regen,
+        )?)
+    } else {
+        None
+    };
     if matches!(
         mode,
         "--guest-processgroup-worker"
@@ -1100,6 +1133,17 @@ pub fn verify(
         }
         mounts.tmpfs(&root, 0o755)?;
         compose_system(&mut mounts, system, &root)?;
+        if let Some(plan) = &policy {
+            fs::create_dir(&overlay_backing)?;
+            overlay_created = true;
+            fs::set_permissions(&overlay_backing, fs::Permissions::from_mode(0o700))?;
+            ssal::guest_policy::runtime::isolate_system(
+                plan,
+                &mut mounts,
+                &root,
+                &overlay_backing,
+            )?;
+        }
         prepare_lock_compat(&mut mounts, &root, userdata, profile_dir)?;
         for name in ["product", "system_ext"] {
             if root.join(name).symlink_metadata().is_err()
@@ -1119,6 +1163,16 @@ pub fn verify(
             libc::MS_BIND | libc::MS_REMOUNT | libc::MS_NOSUID | libc::MS_NODEV,
             "",
         )?;
+        if overlay_created {
+            // restorecon /data must not relabel the metadata backing the Guest system/APEX views.
+            let hidden = root.join("data").join(overlay_backing.file_name().unwrap());
+            mounts.tmpfs(&hidden, 0o000)?;
+            if fs::read_dir(&hidden)?.next().is_some() {
+                return Err(io::Error::other(
+                    "Guest overlay backing is visible through /data",
+                ));
+            }
+        }
         prepare_guest_dev(&mut mounts, &root)?;
         for path in &profile.tmpfs {
             directory(&root, path, 0o755)?;
@@ -1202,6 +1256,15 @@ pub fn verify(
                 mounts.bind(&source, &target, entry.readonly, false)?;
             }
         }
+        if policy.is_some() {
+            // Context validation is a kernel query; policy controls remain read-only.
+            mounts.bind(
+                Path::new("/sys/fs/selinux/context"),
+                &guest_path(&root, "sys/fs/selinux/context")?,
+                false,
+                false,
+            )?;
+        }
         for (path, mode, uid, gid) in [
             ("mnt/user", 0o755, 0, 0),
             ("mnt/user/0", 0o755, 0, 0),
@@ -1262,13 +1325,55 @@ pub fn verify(
             symlink("/storage/self/primary", root.join("sdcard"))?;
         }
         let patch_dir = profile_dir.join("patches");
+        if let Some(plan) = &policy {
+            ssal::guest_policy::runtime::install(plan, &mut mounts, &root)?;
+        }
         patches(&mut mounts, &profile, &patch_dir, &root, false)?;
         code_bridges(&mut mounts, &root, &patch_dir)?;
         println!("guest stage: APEX preparation");
-        apex(&mut mounts, &root, &cache, loop_nodes)?;
+        apex(&mut mounts, &root, &cache, loop_nodes, policy.as_ref())?;
         println!("guest stage: APEX patches");
         patches(&mut mounts, &profile, &patch_dir, &root, true)?;
         permission_controller(&mut mounts, &patch_dir, &root)?;
+        if let Some(plan) = &policy {
+            let shell = guest_path(&root, "system/bin/sh")?;
+            let shell_label = ssal::unix::image_context(&File::open(&shell)?)?;
+            let expected = plan.context("system_data_file", false)?;
+            let probe = root.join(format!("data/.ssal-restorecon-probe-{}", std::process::id()));
+            let file = OpenOptions::new().write(true).create_new(true).open(&probe)?;
+            let result = (|| {
+                let before = ssal::unix::image_context(&file)?;
+                if before == expected {
+                    return Err(io::Error::other("restorecon probe already has target label"));
+                }
+                let status = crate::guest_probe::root_command(&root, "/system/bin/restorecon", false)?
+                    .env("LD_PRELOAD", "/run/ssal/ssal-context-map.so")
+                    .args(["-RF", "/data"])
+                    .status()
+                    .map_err(|e| io::Error::other(format!("execute Guest restorecon: {e}")))?;
+                if !status.success() {
+                    return Err(io::Error::other(
+                        "restorecon Guest userdata using mapped file_contexts failed",
+                    ));
+                }
+                let actual = ssal::unix::image_context(&file)?;
+                if actual != expected {
+                    return Err(io::Error::other(format!(
+                        "Guest restorecon did not relabel userdata probe: expected {expected}, got {actual}"
+                    )));
+                }
+                println!("Guest restorecon: actual userdata probe label changed from {before} to {actual}");
+                Ok(())
+            })();
+            let cleanup = fs::remove_file(&probe);
+            result?;
+            cleanup?;
+            if ssal::unix::image_context(&File::open(&shell)?)? != shell_label {
+                return Err(io::Error::other(
+                    "Guest restorecon changed the system overlay label",
+                ));
+            }
+        }
         if mode == "--guest-memory-worker" {
             let helper = std::env::var_os("SSAL_PHASE7D_FIX_HELPER");
             if let Some(path) = &helper {
@@ -1377,11 +1482,22 @@ pub fn verify(
             Ok(())
         }
     });
-    let cleanup = [descendants, cleanup, cgroup_cleanup, residual]
-        .into_iter()
-        .filter_map(Result::err)
-        .map(|error| error.to_string())
-        .collect::<Vec<_>>();
+    let overlay_cleanup = if overlay_created && cleanup.is_ok() && residual.is_ok() {
+        fs::remove_dir_all(&overlay_backing)
+    } else {
+        Ok(())
+    };
+    let cleanup = [
+        descendants,
+        cleanup,
+        cgroup_cleanup,
+        residual,
+        overlay_cleanup,
+    ]
+    .into_iter()
+    .filter_map(Result::err)
+    .map(|error| error.to_string())
+    .collect::<Vec<_>>();
     let cleanup = if cleanup.is_empty() {
         Ok(())
     } else {

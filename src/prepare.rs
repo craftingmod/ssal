@@ -484,7 +484,16 @@ pub(crate) fn mount_image(source: &Path, target: &Path, readonly: bool) -> io::R
     Ok(())
 }
 
-pub fn worker(system: &Path, userdata: &Path, base: &Path, mode: &str) -> io::Result<()> {
+pub fn worker(
+    system: &Path,
+    userdata: &Path,
+    base: &Path,
+    mode: &str,
+    force_regen: bool,
+) -> io::Result<()> {
+    if force_regen && mode != "--prepare-worker" {
+        return Err(io::Error::other("--regen is only supported by prepare"));
+    }
     crate::selinux_probe::servicemanager::check_recovery()?;
     let host_mount_namespace = fs::read_link("/proc/self/ns/mnt")?;
     if unsafe { libc::unshare(libc::CLONE_NEWNS) } != 0 {
@@ -626,6 +635,7 @@ pub fn worker(system: &Path, userdata: &Path, base: &Path, mode: &str) -> io::Re
             &loop_nodes,
             mode,
             &host_mount_namespace,
+            force_regen,
         )?;
         Ok(())
     })();

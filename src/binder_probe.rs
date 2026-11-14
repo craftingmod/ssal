@@ -86,9 +86,18 @@ impl Session {
         if !target.is_dir() {
             return Err(io::Error::other("binderfs mountpoint missing"));
         }
+        let mapped = ssal::guest_policy::runtime::load(root)?
+            .map(|p| p.context("binder_device", false))
+            .transpose()?;
+        let label = mapped.as_deref().or(label);
         let options = CString::new(match label {
-            Some("u:object_r:binder_device:s0") => "max=4,context=u:object_r:binder_device:s0",
-            None => "max=4",
+            Some(context)
+                if context == "u:object_r:binder_device:s0"
+                    || mapped.as_deref() == Some(context) =>
+            {
+                format!("max=4,context={context}")
+            }
+            None => "max=4".into(),
             _ => return Err(io::Error::other("unsupported private Binder context")),
         })
         .map_err(io::Error::other)?;

@@ -1,7 +1,7 @@
 //! One ordinary, non-USAP fork through the Guest's Java forkAndSpecialize path.
 use super::*;
-use std::os::fd::OwnedFd;
 use std::fs::OpenOptions;
+use std::os::fd::OwnedFd;
 use std::os::unix::fs::OpenOptionsExt;
 
 const REQUEST: &[&str] = &[
@@ -324,7 +324,9 @@ pub(super) fn run(root: &Path, zygote: &mut Service, phase7i: bool) -> io::Resul
         let data_dir = crate::guest_mounts::guest_path(root, relative.trim())?;
         let data_result = fs::read_to_string(data_dir.join("java-child"))?;
         if data_result != "Java child reached Guest userdata\n" {
-            return Err(io::Error::other("Java Guest userdata write evidence mismatch"));
+            return Err(io::Error::other(
+                "Java Guest userdata write evidence mismatch",
+            ));
         }
         fs::write(session.join("data-result"), data_result)?;
         fs::copy(session.join("data-result"), evidence.join("data-result"))?;

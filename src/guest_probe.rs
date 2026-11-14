@@ -16,6 +16,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn preparation_probe_keeps_automatic_execution_blocked() -> io::Result<()> {
+        let root = std::env::temp_dir();
+        assert!(command(&root, "/system/bin/sh", false)
+            .unwrap_err()
+            .to_string()
+            .contains("--guest-service-worker"));
+        assert_eq!(
+            root_command(&root, "/system/bin/sh", false)?.get_program(),
+            "/system/bin/sh"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn zygote_group_allows_zygote_init_to_setpgid_again() -> io::Result<()> {
         let mut command = std::process::Command::new("/bin/true");
         unsafe {
@@ -242,7 +256,7 @@ mod tests {
                 }
             }
             fs::write(root.join("guest-only-marker"), b"guest")?;
-            let mut cmd = command(&root, "/bin/sh", true)?;
+            let mut cmd = root_command(&root, "/bin/sh", true)?;
             cmd.args(["-c", "set -eu; test ! -e /.ssal-old-root; test -f /guest-only-marker; test \"$(pwd)\" = /; printf 'pivot root and old-root detach OK'"]);
             let output = run(&mut cmd, "pivot fixture")?;
             assert!(
@@ -891,7 +905,7 @@ fn vintf_status(code: Option<i32>) -> CheckStatus {
 }
 
 fn vintf_diagnostic(root: &Path) -> io::Result<CheckStatus> {
-    let mut inventory = command(root, "/system/bin/sh", false)?;
+    let mut inventory = root_command(root, "/system/bin/sh", false)?;
     inventory.args(["-c", "set -eu; for p in /system/etc/vintf /vendor/etc/vintf /product/etc/vintf /system_ext/etc/vintf; do if test -d \"$p\"; then /system/bin/toybox ls -l \"$p\"; else echo \"VINTF path absent: $p\"; fi; done"]);
     let output = run(&mut inventory, "VINTF inventory")?;
     println!(
@@ -921,7 +935,7 @@ fn vintf_diagnostic(root: &Path) -> io::Result<CheckStatus> {
         println!("VINTF result: error; checkvintf is not executable");
         return Ok(CheckStatus::Error);
     }
-    let mut checker = command(root, "/system/bin/checkvintf", false)?;
+    let mut checker = root_command(root, "/system/bin/checkvintf", false)?;
     checker.args(["--check-compat", "--rootdir", "/"]);
     match run(&mut checker, "VINTF compatibility checker") {
         Ok(output) => {
@@ -987,7 +1001,8 @@ echo 'guest runtime paths and write/read checks: OK'
         }
         println!("guest stage: {stage} dynamic shell probe");
         let result = (|| {
-            let mut cmd = command(root, "/system/bin/sh", pivot)?;
+            // Fixed, time-bounded preparation checks do not admit Android services.
+            let mut cmd = root_command(root, "/system/bin/sh", pivot)?;
             cmd.args(["-c", script, "ssal-probe", stage, &probe]);
             let output = run(&mut cmd, stage)?;
             println!("{}", String::from_utf8_lossy(&output.stdout));

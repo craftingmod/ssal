@@ -25,9 +25,11 @@ const entries: { name: string; path: string; mode: number }[] = [
   ...[
     "ssal",
     "ssald",
+    "ssal-sepolicy",
     "ssal-selinux-identity",
     "ssal-enforcing-binder",
     "ssal-property-service",
+    "ssal-context-map.so",
     "guest_probe",
     "phase3-ipc",
     "ssal-phase2-log.so",

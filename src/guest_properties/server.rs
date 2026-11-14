@@ -1,4 +1,4 @@
-use super::{policy, Properties, SOCKET, SOCKET_CONTEXT};
+use super::{policy, Properties, SOCKET};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
@@ -172,7 +172,8 @@ pub(super) fn serve(properties: &mut Properties) -> io::Result<()> {
     let listener = UnixListener::bind(path)?;
     let result: io::Result<()> = (|| {
         let name = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(io::Error::other)?;
-        let context = std::ffi::CString::new(SOCKET_CONTEXT).unwrap();
+        let context =
+            std::ffi::CString::new(properties.socket_context.as_str()).map_err(io::Error::other)?;
         if unsafe {
             libc::lsetxattr(
                 name.as_ptr(),

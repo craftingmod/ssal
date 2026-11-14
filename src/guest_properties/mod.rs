@@ -31,12 +31,37 @@ pub struct Config {
     pub host_socket_identity: [u64; 2],
     pub property_contexts: Vec<PathBuf>,
     pub build_props: Vec<PathBuf>,
+    #[serde(default)]
+    pub selinux_types: BTreeMap<String, String>,
+}
+
+impl Config {
+    fn context(&self, original: &str, fallback: &str, process: bool) -> io::Result<String> {
+        if self.selinux_types.is_empty() {
+            return Ok(fallback.into());
+        }
+        let name = self
+            .selinux_types
+            .get(original)
+            .ok_or_else(|| io::Error::other(format!("missing property service type {original}")))?;
+        if !name.starts_with("ssal_p")
+            || name.len() > 255
+            || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        {
+            return Err(io::Error::other("invalid mapped property service type"));
+        }
+        Ok(format!(
+            "u:{}:{name}:s0",
+            if process { "r" } else { "object_r" }
+        ))
+    }
 }
 
 struct Properties {
     area: SystemProperties,
     store: persistent::Store,
     policy: policy::Policy,
+    socket_context: String,
 }
 
 impl Properties {
@@ -86,7 +111,7 @@ fn check_isolation(config: &Config) -> io::Result<()> {
         || identity(Path::new("/dev/socket"))? == config.host_socket_identity
         || fs::read_to_string("/sys/fs/selinux/enforce")?.trim() != "1"
         || fs::read_to_string("/proc/self/attr/current")?.trim_matches(['\0', '\n'])
-            != "u:r:ssal_property:s0"
+            != config.context("init", "u:r:ssal_property:s0", true)?
     {
         return Err(io::Error::other(
             "Guest property server identity/isolation gate failed",
@@ -254,10 +279,21 @@ fn load_seeds(paths: &[PathBuf], policy: &policy::Policy) -> io::Result<BTreeMap
 
 pub fn serve(config: Config) -> io::Result<()> {
     check_isolation(&config)?;
-    let policy = load_policy(&config.property_contexts)?;
+    let mut policy = load_policy(&config.property_contexts)?;
+    policy.default_context = config.context("default_prop", &policy.default_context, false)?;
     let seeds = load_seeds(&config.build_props, &policy)?;
     let store = persistent::Store::open(Path::new(PERSIST_DIRECTORY))?;
-    let mut properties = initialize(policy, seeds, store, Path::new(AREA), label)?;
+    let mapped_label = |path: &Path, original: &str| {
+        let name = match original {
+            DIRECTORY_CONTEXT => "properties_device",
+            INFO_CONTEXT => "property_info",
+            SERIAL_CONTEXT => "properties_serial",
+            _ => return label(path, original),
+        };
+        label(path, &config.context(name, original, false)?)
+    };
+    let mut properties = initialize(policy, seeds, store, Path::new(AREA), mapped_label)?;
+    properties.socket_context = config.context("property_socket", SOCKET_CONTEXT, false)?;
     server::serve(&mut properties)
 }
 
@@ -320,6 +356,7 @@ fn initialize(
         area,
         store,
         policy,
+        socket_context: SOCKET_CONTEXT.into(),
     })
 }
 
@@ -387,6 +424,30 @@ mod tests {
     }
 
     #[test]
+    fn profile_contexts_do_not_fall_back_to_fixed_guest_types() {
+        let mut config: Config = serde_json::from_value(serde_json::json!({
+            "host_mount_namespace":"mnt:[1]", "host_property_identity":[1,1],
+            "host_data_identity":[1,2], "host_persistent_identity":[1,3],
+            "host_socket_identity":[1,4], "property_contexts":[], "build_props":[],
+            "selinux_types":{"init":"ssal_p0001_init", "default_prop":"ssal_p0001_default_prop"}
+        }))
+        .unwrap();
+        assert_eq!(
+            config.context("init", "old", true).unwrap(),
+            "u:r:ssal_p0001_init:s0"
+        );
+        assert_eq!(
+            config.context("default_prop", "old", false).unwrap(),
+            "u:object_r:ssal_p0001_default_prop:s0"
+        );
+        assert!(config.context("missing", "old", false).is_err());
+        config.selinux_types.insert("init".into(), "init".into());
+        assert!(config.context("init", "old", true).is_err());
+        config.selinux_types.clear();
+        assert_eq!(config.context("init", "legacy", true).unwrap(), "legacy");
+    }
+
+    #[test]
     fn host_namespace_is_rejected_before_startup_io() {
         let config = Config {
             host_mount_namespace: fs::read_link("/proc/thread-self/ns/mnt")
@@ -399,6 +460,7 @@ mod tests {
             host_socket_identity: [1, 4],
             property_contexts: vec![],
             build_props: vec![],
+            selinux_types: BTreeMap::new(),
         };
         assert!(check_isolation(&config).is_err());
     }

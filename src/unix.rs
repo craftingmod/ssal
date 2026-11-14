@@ -16,7 +16,30 @@ pub struct InheritedFd {
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn cloexec_unexpected_fds() -> io::Result<()> {
     if unsafe { libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 4u32) } < 0 {
-        return Err(io::Error::last_os_error());
+        let error = io::Error::last_os_error();
+        if matches!(error.raw_os_error(), Some(libc::ENOSYS | libc::EINVAL)) {
+            return cloexec_proc_fds();
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn cloexec_proc_fds() -> io::Result<()> {
+    // Called in the single-threaded pre-exec child; enumerate live FDs, not a parent snapshot.
+    for entry in fs::read_dir("/proc/self/fd")? {
+        let entry = entry?;
+        let Ok(fd) = entry.file_name().to_string_lossy().parse::<RawFd>() else {
+            continue;
+        };
+        if fd < 3 {
+            continue;
+        }
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
     }
     Ok(())
 }
@@ -135,6 +158,10 @@ pub struct Request {
     pub image_name: Option<String>,
     #[serde(default)]
     pub profile_name: Option<String>,
+    #[serde(default)]
+    pub force_regen: bool,
+    #[serde(default)]
+    pub native_sepolicy: bool,
 }
 
 pub fn valid_image_name(name: &str) -> bool {
@@ -257,19 +284,29 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn close_range_marks_fds_in_child_only() {
-        let file = File::open("/dev/null").unwrap();
-        let fd = file.as_raw_fd();
-        let pid = unsafe { libc::fork() };
-        assert!(pid >= 0);
-        if pid == 0 {
-            let ok = unsafe { libc::fcntl(fd, libc::F_SETFD, 0) } == 0
-                && cloexec_unexpected_fds().is_ok()
-                && unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC != 0;
-            unsafe { libc::_exit(if ok { 0 } else { 1 }) }
+        for mark in [
+            cloexec_unexpected_fds as fn() -> io::Result<()>,
+            cloexec_proc_fds,
+        ] {
+            let file = File::open("/dev/null").unwrap();
+            let fd = file.as_raw_fd();
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0);
+            if pid == 0 {
+                let high = unsafe { libc::fcntl(fd, libc::F_DUPFD, 256) };
+                let stdio = unsafe { libc::fcntl(1, libc::F_GETFD) };
+                let ok = unsafe { libc::fcntl(fd, libc::F_SETFD, 0) } == 0
+                    && high >= 256
+                    && mark().is_ok()
+                    && unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC != 0
+                    && unsafe { libc::fcntl(high, libc::F_GETFD) } & libc::FD_CLOEXEC != 0
+                    && unsafe { libc::fcntl(1, libc::F_GETFD) } == stdio;
+                unsafe { libc::_exit(if ok { 0 } else { 1 }) }
+            }
+            let mut status = 0;
+            assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+            assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
         }
-        let mut status = 0;
-        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
-        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
     }
 
     fn inherited(fd: RawFd, file: &File) -> io::Result<InheritedFd> {

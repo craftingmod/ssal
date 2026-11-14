@@ -1,4 +1,5 @@
 pub mod guest_lock_compat;
+pub mod guest_policy;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub mod guest_properties;
 #[cfg(unix)]

@@ -30,13 +30,29 @@ pub(crate) fn command(
     root: &Path,
     executable: &str,
     uid: u32,
-    exec_context: Option<&'static [u8]>,
+    exec_context: Option<&[u8]>,
 ) -> io::Result<Command> {
     crate::memory_cgroup::check_interrupted()?;
     // A real Guest mount root also gives Zygote's FD allowlist Guest-relative proc paths.
     let pivot = executable == "/system/bin/app_process64"
         && std::env::var_os("SSAL_PHASE7FB_FORK").is_some();
     let mut command = crate::guest_probe::root_command(root, executable, pivot)?;
+    let exec_context = if let Some(plan) = ssal::guest_policy::runtime::load(root)? {
+        let original = if exec_context == Some(PROPERTY_SERVICE_CONTEXT) {
+            "init"
+        } else {
+            match executable {
+                "/system/bin/app_process64" => "zygote",
+                "/system/bin/servicemanager" => "servicemanager",
+                _ => "shell",
+            }
+        };
+        let mut context = plan.context(original, true)?.into_bytes();
+        context.push(0);
+        Some(context)
+    } else {
+        exec_context.map(<[u8]>::to_vec)
+    };
     command.env("LD_LIBRARY_PATH", "/run/ssal");
     if executable == "/system/bin/bootstrap/linker64" {
         command.env("LD_LIBRARY_PATH", "/system/lib64/bootstrap:/system/lib64");
@@ -79,7 +95,7 @@ pub(crate) fn command(
                 Path::new("/sys/fs/cgroup"),
                 Path::new("/sys/fs/cgroup"),
             )?;
-            if let Some(context) = exec_context {
+            if let Some(context) = &exec_context {
                 fs::write("/proc/thread-self/attr/exec", context)?;
             }
             if libc::setgroups(0, std::ptr::null()) != 0
@@ -249,7 +265,7 @@ impl Service {
         args: &[&str],
         name: &str,
         uid: u32,
-        exec_context: Option<&'static [u8]>,
+        exec_context: Option<&[u8]>,
         env: &[(&str, &str)],
     ) -> io::Result<Self> {
         let log = root.join(format!("run/ssal/{name}.log"));
@@ -294,11 +310,15 @@ impl Service {
                 let preload = command
                     .get_envs()
                     .find_map(|(key, value)| {
-                        (key == "LD_PRELOAD").then_some(value.unwrap().to_string_lossy().into_owned())
+                        (key == "LD_PRELOAD")
+                            .then_some(value.unwrap().to_string_lossy().into_owned())
                     })
                     .unwrap();
                 command
-                    .env("LD_PRELOAD", format!("/run/ssal/ssal-zygote-selinux-noop.so:{preload}"))
+                    .env(
+                        "LD_PRELOAD",
+                        format!("/run/ssal/ssal-zygote-selinux-noop.so:{preload}"),
+                    )
                     .env("SSAL_PHASE8B3B_NOOP", "1")
                     .env_remove("SSAL_PHASE7FC_BYPASS_SETCONTEXT");
             }
@@ -315,6 +335,21 @@ impl Service {
         } else {
             Vec::new()
         };
+        if ssal::guest_policy::runtime::load(root)?.is_some() {
+            let preload = command
+                .get_envs()
+                .find_map(|(key, value)| {
+                    (key == "LD_PRELOAD").then(|| value.map(|s| s.to_string_lossy().into_owned()))
+                })
+                .flatten();
+            command.env(
+                "LD_PRELOAD",
+                preload.map_or_else(
+                    || "/run/ssal/ssal-context-map.so".into(),
+                    |s| format!("/run/ssal/ssal-context-map.so:{s}"),
+                ),
+            );
+        }
         let launch_ms = crate::zygote_diagnostics::launch_time();
         let started = Instant::now();
         let child = command.args(args).spawn()?;
@@ -808,7 +843,7 @@ fn start_property_service(
     let host_socket_identity = identity(Path::new("/dev/socket"))?;
     let host_data_identity = identity(Path::new("/data"))?;
     let host_persistent_identity = identity(Path::new("/data/property"))?;
-    let config = serde_json::json!({
+    let mut config = serde_json::json!({
         "host_mount_namespace": host_mount_namespace.display().to_string(),
         "host_property_identity": host_property_identity,
         "host_socket_identity": host_socket_identity,
@@ -817,6 +852,19 @@ fn start_property_service(
         "property_contexts": ["/run/ssal/guest_property_contexts"],
         "build_props": ["/system/build.prop", "/run/ssal/guest_build.prop"],
     });
+    let plan = ssal::guest_policy::runtime::load(root)?;
+    if let Some(plan) = &plan {
+        let mut paths = Vec::new();
+        for (path, text) in &plan.contexts {
+            if path.ends_with("property_contexts") {
+                let name = format!("mapped_{}", path.replace('/', "_"));
+                fs::write(runtime.join(&name), text)?;
+                paths.push(format!("/run/ssal/{name}"));
+            }
+        }
+        config["property_contexts"] = serde_json::to_value(paths)?;
+        config["selinux_types"] = serde_json::to_value(&plan.types)?;
+    }
     fs::write(
         runtime.join("property-service.json"),
         serde_json::to_vec(&config).map_err(io::Error::other)?,
@@ -825,7 +873,9 @@ fn start_property_service(
     let property_dir = crate::guest_mounts::directory(root, "data/property", 0o700)?;
     let metadata = fs::metadata(&property_dir)?;
     if metadata.uid() != 0 || metadata.mode() & 0o077 != 0 {
-        return Err(io::Error::other("Guest /data/property must be root-owned mode 0700"));
+        return Err(io::Error::other(
+            "Guest /data/property must be root-owned mode 0700",
+        ));
     }
     let area = crate::guest_mounts::directory(root, "dev/__properties__", 0o755)?;
     if fs::read_dir(&area)?.next().is_some() {
@@ -833,7 +883,12 @@ fn start_property_service(
     }
     let executable = runtime.join("property-service");
     File::create(&executable)?;
-    mounts.bind(&bin.join("ssal-property-service"), &executable, true, false)?;
+    ssal::guest_policy::runtime::bind_file(
+        mounts,
+        root,
+        &bin.join("ssal-property-service"),
+        &executable,
+    )?;
     let mut service = Service::start(
         root,
         "/system/bin/bootstrap/linker64",
@@ -849,23 +904,28 @@ fn start_property_service(
     )?;
     service.wait_text("guest_property_service_ready")?;
     let process_context = fs::read_to_string(format!("/proc/{}/attr/current", service.child.id()))?;
-    if process_context.trim_matches('\0').trim() != "u:r:ssal_property:s0" {
+    let expected = plan
+        .as_ref()
+        .map(|p| p.context("init", true))
+        .transpose()?
+        .unwrap_or_else(|| "u:r:ssal_property:s0".into());
+    if process_context.trim_matches('\0').trim() != expected {
         return Err(io::Error::other(format!(
             "Guest property service SID mismatch: {process_context:?}"
         )));
     }
     for (guest, host, name) in [
-        (
-            identity(&area)?,
-            host_property_identity,
-            "property area",
-        ),
+        (identity(&area)?, host_property_identity, "property area"),
         (
             identity(&root.join("dev/socket"))?,
             host_socket_identity,
             "socket directory",
         ),
-        (identity(&root.join("data"))?, host_data_identity, "userdata"),
+        (
+            identity(&root.join("data"))?,
+            host_data_identity,
+            "userdata",
+        ),
         (
             identity(&property_dir)?,
             host_persistent_identity,
@@ -931,13 +991,31 @@ pub(crate) fn verify(
     host_mount_namespace: &Path,
 ) -> io::Result<()> {
     let phase7i_properties = phase7a && std::env::var_os("SSAL_PHASE7I_PROPERTIES").is_some();
+    if ssal::guest_policy::runtime::load(root)?.is_some()
+        && [
+            "SSAL_PHASE7FC_BYPASS_SETCONTEXT",
+            "SSAL_PHASE8B3B_NOOP",
+            "SSAL_PHASE8B3D_SAME_CONTEXT",
+            "SSAL_PHASE8B5_ONCE",
+        ]
+        .iter()
+        .any(|key| std::env::var_os(key).is_some())
+    {
+        return Err(io::Error::other(
+            "profile SELinux mapping cannot use fixed-SID or SELinux-bypass diagnostic runtimes",
+        ));
+    }
     let system_server_preflight = system_server_preflight::enabled()?;
     let runtime_sid = system_server_runtime_sid::enabled(phase7i_properties)?;
     if system_server_preflight
         && (!phase7i_properties
-            || ["SSAL_PHASE8B3B_NOOP", "SSAL_PHASE8B3D_TRACE", "SSAL_PHASE8B3D_SAME_CONTEXT"]
-                .iter()
-                .any(|key| std::env::var_os(key).is_some()))
+            || [
+                "SSAL_PHASE8B3B_NOOP",
+                "SSAL_PHASE8B3D_TRACE",
+                "SSAL_PHASE8B3D_SAME_CONTEXT",
+            ]
+            .iter()
+            .any(|key| std::env::var_os(key).is_some()))
     {
         return Err(io::Error::other(
             "8B-4B-1 requires Phase 7I and unmodified Guest SELinux libraries",
@@ -987,7 +1065,7 @@ pub(crate) fn verify(
         }
         let target = runtime.join(name);
         File::create(&target)?;
-        mounts.bind(&bin.join(name), &target, true, false)?;
+        ssal::guest_policy::runtime::bind_file(mounts, root, &bin.join(name), &target)?;
     }
     if phase7a && std::env::var_os("SSAL_PHASE8B3D_SAME_CONTEXT").is_some() {
         mounts.bind(
@@ -1050,12 +1128,7 @@ test "$(getprop persist.ssal_probe)" = 7
 echo SSAL_PROPERTY_BIONIC=PASS
 "#
             };
-            let property_output = run(
-                root,
-                "/system/bin/sh",
-                &["-c", property_script],
-                1000,
-            )?;
+            let property_output = run(root, "/system/bin/sh", &["-c", property_script], 1000)?;
             if !property_output.contains("SSAL_PROPERTY_") {
                 return Err(io::Error::other("Guest Bionic property evidence missing"));
             }
@@ -1196,7 +1269,11 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
             }
             if std::env::var_os("SSAL_PHASE8B3B_NOOP").is_some() {
                 // App trace uses the same overlay as Zygote; startup diagnostic uses stock rules.
-                for probe_uid in if app_trace { &[0, 1000, 10000][..] } else { &[1000][..] } {
+                for probe_uid in if app_trace {
+                    &[0, 1000, 10000][..]
+                } else {
+                    &[1000][..]
+                } {
                     let output = crate::guest_probe::run_with_timeout(
                         command(
                             root,
@@ -1216,7 +1293,9 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
                         String::from_utf8_lossy(&output.stderr)
                     );
                     if !output.status.success() {
-                        return Err(io::Error::other("SELinux startup diagnostic failed to execute"));
+                        return Err(io::Error::other(
+                            "SELinux startup diagnostic failed to execute",
+                        ));
                     }
                 }
             }
@@ -1267,9 +1346,7 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
             if phase7i_properties {
                 zygote_env.push(("SSAL_PHASE7I_PROPERTIES", "1"));
             }
-            if controlled_fork
-                && std::env::var_os("SSAL_PHASE7FC_BYPASS_SETCONTEXT").is_some()
-            {
+            if controlled_fork && std::env::var_os("SSAL_PHASE7FC_BYPASS_SETCONTEXT").is_some() {
                 zygote_env.push(("SSAL_PHASE7FC_BYPASS_SETCONTEXT", "1"));
             }
             if runtime_sid {
@@ -1310,7 +1387,11 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
                 return Err(io::Error::other("Guest Zygote root identity mismatch"));
             }
             let domain = fs::read_to_string(format!("/proc/{pid}/attr/current"))?;
-            if domain.trim_matches('\0').trim() != "u:r:ssal_guest_probe:s0" {
+            let expected = ssal::guest_policy::runtime::load(root)?
+                .map(|p| p.context("zygote", true))
+                .transpose()?
+                .unwrap_or_else(|| "u:r:ssal_guest_probe:s0".into());
+            if domain.trim_matches('\0').trim() != expected {
                 return Err(io::Error::other(format!(
                     "Guest Zygote domain mismatch: {domain:?}"
                 )));

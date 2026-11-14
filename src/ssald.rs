@@ -228,6 +228,7 @@ mod daemon {
                 (!value.is_empty()).then_some(value)
             };
             let manifest = serde_json::json!({"version": 3, "name": name, "image_name": image_name, "image_id": id,
+                "selinux_id": ssal::guest_policy::allocate_id(root)?,
                 "mount_profile": super::guest_mounts::PROFILE_NAME,
                 "guest_lock_compat": ssal::guest_lock_compat::Config::default(),
                 "guest_lock_compat_creation": {"version": 1, "userdata_state": "empty-at-creation", "application_phase": "before-first-service", "migration_allowed": false},
@@ -341,6 +342,9 @@ mod daemon {
         if req.version != VERSION {
             return reply(&mut stream, false, "unsupported protocol version");
         }
+        if (req.force_regen || req.native_sepolicy) && req.command != "prepare" {
+            return reply(&mut stream, false, "--regen is only supported by prepare");
+        }
         match req.command.as_str() {
             "status" => { let job = fs::read_to_string(root.join("state/last-job.json")).unwrap_or_else(|_| "none".into()); let images = image_list(&root)?; let profiles = profile_list(&root)?; reply(&mut stream, true, format!("HOST_ACTIVE\nimages:\n{images}\nprofiles:\n{profiles}\nlast job: {job}")) }
             "doctor" if req.profile_name.is_some() => {
@@ -354,7 +358,7 @@ mod daemon {
                 let Some(name) = req.profile_name.as_deref().filter(|name| valid_image_name(name)) else { return reply(&mut stream, false, "invalid profile name"); };
                 let guard = busy.lock().unwrap();
                 if *guard { return reply(&mut stream, false, "another operation is running"); }
-                let result = prepare_session(&root, name, &req.command);
+                let result = prepare_session(&root, name, &req.command, req.force_regen, req.native_sepolicy);
                 match result { Ok(message) => { log(&root, &message); reply(&mut stream, true, message) }, Err(e) => { let message = format!("prepare failed: {e}"); log(&root, &message); reply(&mut stream, false, message) } }
             }
             "remove" => {
@@ -404,7 +408,13 @@ mod daemon {
             _ => reply(&mut stream, false, "unknown command")
         }
     }
-    fn prepare_session(root: &Path, name: &str, mode: &str) -> io::Result<String> {
+    fn prepare_session(
+        root: &Path,
+        name: &str,
+        mode: &str,
+        force_regen: bool,
+        native_sepolicy: bool,
+    ) -> io::Result<String> {
         super::selinux_probe::servicemanager::check_recovery()?;
         let profile = super::prepare::check(root, name)?;
         let base = root
@@ -414,7 +424,8 @@ mod daemon {
         let result = (|| {
             fs::create_dir(base.join("system"))?;
             fs::create_dir(base.join("data"))?;
-            let output = Command::new(std::env::current_exe()?)
+            let mut worker = Command::new(std::env::current_exe()?);
+            worker
                 .arg(match mode {
                     "probe-binder" => "--binder-probe-worker",
                     "probe-servicemanager" => "--servicemanager-worker",
@@ -428,8 +439,15 @@ mod daemon {
                 })
                 .arg(&profile.system)
                 .arg(&profile.userdata)
-                .arg(&base)
-                .output()?;
+                .arg(&base);
+            if force_regen {
+                worker.arg("--regen");
+            }
+            worker.env(
+                "SSAL_PREPARE_SEPOLICY_BACKEND",
+                if native_sepolicy { "native" } else { "ksud" },
+            );
+            let output = worker.output()?;
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
             if !output.status.success() {
@@ -464,7 +482,7 @@ mod daemon {
             root,
             "prepare host namespace residual mount check: verified absent for session path",
         );
-        for scratch in ["rootfs", "apex-cache", "loop-devices"] {
+        for scratch in ["rootfs", "apex-cache", "loop-devices", "selinux-overlay"] {
             let path = base.join(scratch);
             if let Err(e) = fs::remove_dir_all(&path) {
                 if e.kind() != io::ErrorKind::NotFound {
@@ -492,7 +510,7 @@ mod daemon {
     #[cfg(feature = "phase2c-diagnostic")]
     pub fn run_phase2c_diagnostic(root: &Path, profile: &str, probe: &Path) -> io::Result<String> {
         std::env::set_var("SSAL_PHASE2C_RSBINDER_PROBE", probe);
-        prepare_session(root, profile, "probe-servicemanager")
+        prepare_session(root, profile, "probe-servicemanager", false)
     }
     #[cfg(feature = "phase3-diagnostic")]
     pub fn run_phase3_diagnostic(
@@ -503,7 +521,7 @@ mod daemon {
     ) -> io::Result<String> {
         std::env::set_var("SSAL_PHASE2C_RSBINDER_PROBE", phase2_probe);
         std::env::set_var("SSAL_PHASE3_RSBINDER_PROBE", phase3_probe);
-        prepare_session(root, profile, "probe-servicemanager")
+        prepare_session(root, profile, "probe-servicemanager", false)
     }
     pub fn run() -> io::Result<()> {
         if unsafe { libc::geteuid() } != 0 {
@@ -817,7 +835,11 @@ fn main() {
             || arg == "--guest-services-6b-worker"
             || arg == "--guest-zygote-7a-worker"
     }) {
-        if args.len() != 5 || unsafe { libc::geteuid() } != 0 {
+        let force_regen = args.len() == 6 && args[5] == "--regen";
+        if (args.len() != 5 && !force_regen)
+            || (force_regen && args[1] != "--prepare-worker")
+            || unsafe { libc::geteuid() } != 0
+        {
             eprintln!("invalid prepare worker invocation");
             std::process::exit(1);
         }
@@ -826,6 +848,7 @@ fn main() {
             std::path::Path::new(&args[3]),
             std::path::Path::new(&args[4]),
             args[1].to_str().unwrap_or(""),
+            force_regen,
         ) {
             eprintln!("prepare worker: {e}");
             std::process::exit(1);
