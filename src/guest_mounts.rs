@@ -1184,6 +1184,19 @@ pub fn verify(
             }
         }
         prepare_guest_dev(&mut mounts, &root)?;
+        if let Some(plan) = &policy {
+            let socket = root.join("dev/socket");
+            let expected = plan.context("socket_device", false)?;
+            ssal::guest_policy::runtime::set_label(&socket, &expected)
+                .map_err(|error| io::Error::other(format!("label Guest /dev/socket: {error}")))?;
+            let actual = ssal::unix::image_context(&File::open(&socket)?)?;
+            if actual != expected {
+                return Err(io::Error::other(format!(
+                    "Guest /dev/socket label mismatch: expected {expected}, got {actual}"
+                )));
+            }
+            println!("Guest /dev/socket label verified as {actual}");
+        }
         for path in &profile.tmpfs {
             directory(&root, path, 0o755)?;
             mounts.tmpfs(&root.join(path), 0o755)?;

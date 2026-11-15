@@ -155,6 +155,79 @@ pub(super) fn handle(
     result
 }
 
+fn ensure_socket_label(
+    context: &[u8],
+    mut read: impl FnMut() -> io::Result<Vec<u8>>,
+    write: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    let matches = |actual: &[u8]| actual.strip_suffix(&[0]).unwrap_or(actual) == context;
+    if matches(&read()?) {
+        return Ok(());
+    }
+    write()?;
+    if !matches(&read()?) {
+        return Err(io::Error::other("Guest socket label mismatch"));
+    }
+    Ok(())
+}
+
+fn label_socket(path: &Path, context: &str) -> io::Result<()> {
+    let name = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(io::Error::other)?;
+    let target = std::ffi::CString::new(context).map_err(io::Error::other)?;
+    let error = |syscall: &str| {
+        let error = io::Error::last_os_error();
+        io::Error::new(
+            error.kind(),
+            format!("{syscall} {} as {context}: {error}", path.display()),
+        )
+    };
+    ensure_socket_label(
+        target.as_bytes(),
+        || {
+            let mut actual = vec![0u8; 512];
+            let size = unsafe {
+                libc::lgetxattr(
+                    name.as_ptr(),
+                    c"security.selinux".as_ptr(),
+                    actual.as_mut_ptr().cast(),
+                    actual.len(),
+                )
+            };
+            if size < 0 {
+                return Err(error("lgetxattr"));
+            }
+            actual.truncate(size as usize);
+            eprintln!(
+                "property_socket_label path={} actual_sid={} target_sid={} lsetxattr={}",
+                path.display(),
+                String::from_utf8_lossy(actual.strip_suffix(&[0]).unwrap_or(&actual)),
+                context,
+                if actual.strip_suffix(&[0]).unwrap_or(&actual) == target.as_bytes() {
+                    "unnecessary"
+                } else {
+                    "required"
+                }
+            );
+            Ok(actual)
+        },
+        || {
+            if unsafe {
+                libc::lsetxattr(
+                    name.as_ptr(),
+                    c"security.selinux".as_ptr(),
+                    target.as_ptr().cast(),
+                    target.as_bytes_with_nul().len(),
+                    0,
+                )
+            } != 0
+            {
+                return Err(error("lsetxattr"));
+            }
+            Ok(())
+        },
+    )
+}
+
 pub(super) fn serve(properties: &mut Properties) -> io::Result<()> {
     let path = Path::new(SOCKET);
     // Fresh /dev/socket belongs to this session. Never replace a running/stale server's socket.
@@ -171,37 +244,7 @@ pub(super) fn serve(properties: &mut Properties) -> io::Result<()> {
     }
     let listener = UnixListener::bind(path)?;
     let result: io::Result<()> = (|| {
-        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(io::Error::other)?;
-        let context =
-            std::ffi::CString::new(properties.socket_context.as_str()).map_err(io::Error::other)?;
-        if unsafe {
-            libc::lsetxattr(
-                name.as_ptr(),
-                c"security.selinux".as_ptr(),
-                context.as_ptr().cast(),
-                context.as_bytes_with_nul().len(),
-                0,
-            )
-        } != 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        let mut actual = [0u8; 512];
-        let size = unsafe {
-            libc::lgetxattr(
-                name.as_ptr(),
-                c"security.selinux".as_ptr(),
-                actual.as_mut_ptr().cast(),
-                actual.len(),
-            )
-        };
-        if size < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let actual = &actual[..size as usize];
-        if actual.strip_suffix(&[0]).unwrap_or(actual) != context.as_bytes() {
-            return Err(io::Error::other("Guest socket label mismatch"));
-        }
+        label_socket(path, &properties.socket_context)?;
         // Bionic clients of all UIDs connect; authorization is per property via SO_PEERSEC.
         fs::set_permissions(path, fs::Permissions::from_mode(0o666))?;
         println!("{{\"event\":\"guest_property_service_ready\",\"persistent_file\":\"/data/property/persistent_properties\"}}");
@@ -239,6 +282,57 @@ pub(super) fn serve(properties: &mut Properties) -> io::Result<()> {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn socket_label_skips_only_an_exact_match() {
+        for actual in [b"target".to_vec(), b"target\0".to_vec()] {
+            ensure_socket_label(
+                b"target",
+                || Ok(actual.clone()),
+                || panic!("already labeled"),
+            )
+            .unwrap();
+        }
+        let mut labels = [b"old".to_vec(), b"target\0".to_vec()].into_iter();
+        let mut writes = 0;
+        ensure_socket_label(
+            b"target",
+            || Ok(labels.next().unwrap()),
+            || {
+                writes += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(writes, 1);
+        assert!(labels.next().is_none(), "must verify after setting");
+
+        let denied = || io::Error::from_raw_os_error(libc::EACCES);
+        let error =
+            ensure_socket_label(b"target", || Err(denied()), || panic!("read failed")).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EACCES));
+        let error =
+            ensure_socket_label(b"target", || Ok(b"old".to_vec()), || Err(denied())).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EACCES));
+        assert!(
+            ensure_socket_label(b"target", || Ok(b"target-prefix".to_vec()), || Ok(())).is_err()
+        );
+        let mut reads = 0;
+        assert!(ensure_socket_label(
+            b"target",
+            || {
+                reads += 1;
+                if reads == 1 {
+                    Ok(b"old".to_vec())
+                } else {
+                    Err(denied())
+                }
+            },
+            || Ok(()),
+        )
+        .is_err());
+    }
+
     #[test]
     fn v1_v2_bounds_and_truncation() {
         let mut bytes = Vec::new();

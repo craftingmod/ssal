@@ -18,6 +18,24 @@ system_file 쓰기 권한이나 Host 정책을 추가·완화하지 않았다.
 - attempt22: 단계 진단을 추가해 `property area initialization`에서 EACCES가 반환됨을 확인했다 (`attempt22/worker.log:177`). 격리 검사, property context·seed 읽기, persistent store 열기는 통과했다.
 - attempt23: `/dev/__properties__/u:object_r:ssal_p0001_net_radio_prop:s0`를 같은 context로 라벨 처리하는 helper에서 EACCES가 반환됐다 (`attempt23/worker.log:177`). 이 helper는 파일 open, fsetxattr, label readback을 포함한다. 정확한 실패 syscall이나 SELinux 규칙까지 확정한 것은 아니다.
 
+### attempt29: syscall 분리와 동일 라벨 검사
+
+재부팅 후 기기 잠금을 해제한 상태에서 실행했다. Enforcing과 별도 userdata 사본을 유지했다. 진단용으로만 동일 SID 파일에 `fsetxattr`를 강제했고, 재시도 직후 일반 구현(동일 SID면 생략)으로 복원·재빌드했다.
+
+`out/property-readiness-20261115/attempt29/worker.log:183–185`에서 `open`과 최초 `fgetxattr`가 성공한 뒤, 아래 조건에서 `fsetxattr` 자체가 EACCES를 반환한 것을 확인했다.
+
+- 경로: `/dev/__properties__/u:object_r:ssal_p0001_net_radio_prop:s0`
+- UID:GID `0:0`, mode `0444`, filesystem magic `0x1021994` (tmpfs)
+- process SID `u:r:ssal_p0001_init:s0`
+- 실제 및 목표 SID 모두 `u:object_r:ssal_p0001_net_radio_prop:s0`
+- syscall 결과 `Permission denied (os error 13)`
+
+`attempt29/applied.json:9810`의 Guest rule plan에는 `ssal_p0001_init -> ssal_p0001_properties_device:file relabelfrom`이 있고, `:9999`는 `ssal_p0001_targets_property_type:file relabelto`를 포함하며 `:43399`가 net_radio 타입을 그 attribute에 넣는다. target attribute에 대한 `relabelfrom`은 없다. GSI-derived mapped plan `out/guest-first-boot-20261115/policy-meta/plan.json:13751,13940`에서도 baseline properties_device file access에는 relabelfrom이 없고 target attribute에는 relabelto가 있다. 두 파일은 번역된 Guest rule plan이지 원본 GSI 바이너리 policy가 아니다. `applied.json`은 `rule readback not verified`라고 기록하고, 이번 실행의 logcat/dmesg에서 관련 enforcing AVC도 찾지 못했다. 따라서 syscall과 EACCES는 확정했지만, 커널의 최종 AVC 결정인지 filesystem/VFS 동작인지까지는 현재 증거로 단정하지 않는다. 추측 allow를 추가하지 않았다.
+
+정상 구현은 실제 SID와 요청 SID가 같으면 `fsetxattr`를 건너뛴다. attempt28에서는 같은 파일의 `already_labeled fsetxattr=skipped`가 기록됐고 (`attempt28/worker.log:184`), helper가 이후 단계까지 진행했다. attempt29는 정확한 경로에서 이 호출을 진단 목적으로만 강제해 실패를 재현했다. 이후 단계의 socket `lsetxattr` 거부는 별도 문제로 남아 있다.
+
+원본 GSI의 바이너리 policy를 이번 attempt에서 추출·검사하지 않아 원본 GSI AV table과의 직접 대조는 미완료다. 이번에 감사한 것은 적용된 Guest rule plan이다.
+
 attempt23 PID 7094의 08:48:27.226–27.246 AVC (`attempt23/logcat-targeted.txt:134–138`)는
 permissive transition/inherited-process 관련 기록이며, 해당 파일 작업을 거부한 enforcing AVC는 없다.
 
@@ -91,5 +109,5 @@ Luna는 프로세스·Host mountinfo·loop backing 참조 부재를 확인한 �
 운영 바이너리, 원본 userdata, device stage/cache와 로컬 증거는 보존했다.
 필터링한 로그와 정리 증거는 `out/property-readiness-20261115/cleanup-summary.md` 및 각 attempt 디렉터리에 있다.
 
-남은 실패는 property area 라벨 처리의 권한 오류다. readiness의 런타임 PASS, 다른 worker의
+남은 실패는 property area 라벨 처리의 `fsetxattr` 거부와 이후 socket `lsetxattr` 거부다. readiness의 런타임 PASS, 다른 worker의
 개별 실기기 PASS, 전체 Guest 부팅과 하드 재부팅 후 복구를 검증한 결과가 아니다.

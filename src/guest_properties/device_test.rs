@@ -44,7 +44,7 @@ fn initialize_area() -> Properties {
     initialize(
         policy,
         seeds,
-        persistent::Store::open(Path::new(PERSIST_DIRECTORY)).unwrap(),
+        persistent::Store::open(Path::new(PERSIST_DIRECTORY), None).unwrap(),
         Path::new(AREA),
         |path, context| {
             let actual = match context {

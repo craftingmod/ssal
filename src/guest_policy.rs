@@ -11,7 +11,7 @@ pub mod native;
 pub mod runtime;
 mod symbols;
 
-const VERSION: u32 = 10;
+const VERSION: u32 = 11;
 
 type Names = BTreeMap<String, String>;
 
@@ -141,6 +141,26 @@ pub struct Plan {
 }
 
 impl Plan {
+    fn ensure_kernel_av_access(&mut self) -> io::Result<()> {
+        // selinuxfs computes decisions against the live kernel SID, not its Guest copy.
+        for original in ["init", "servicemanager"] {
+            let domain = self
+                .types
+                .get(original)
+                .ok_or_else(|| invalid(format!("GSI type missing: {original}")))?;
+            let rule = format!("allow {domain} kernel security {{ compute_av }}");
+            self.rules.insert(rule.clone());
+            native::record(
+                &mut self.native_rules,
+                rule,
+                1,
+                1,
+                &[domain, "kernel", "security", "compute_av"],
+            );
+        }
+        Ok(())
+    }
+
     pub fn context(&self, original: &str, process: bool) -> io::Result<String> {
         let name = self
             .types
@@ -151,6 +171,35 @@ impl Plan {
             if process { "r" } else { "object_r" }
         ))
     }
+
+    fn ensure_property_socket_transition(&mut self) -> io::Result<()> {
+        let init = self
+            .types
+            .get("init")
+            .ok_or_else(|| invalid("GSI type missing: init"))?
+            .clone();
+        let socket_device = self
+            .types
+            .get("socket_device")
+            .ok_or_else(|| invalid("GSI type missing: socket_device"))?
+            .clone();
+        let property_socket = self
+            .types
+            .get("property_socket")
+            .ok_or_else(|| invalid("GSI type missing: property_socket"))?
+            .clone();
+        let rule = format!("type_transition {init} {socket_device} sock_file {property_socket}");
+        self.rules.insert(rule.clone());
+        native::record(
+            &mut self.native_rules,
+            rule,
+            7,
+            0,
+            &[&init, &socket_device, "sock_file", &property_socket, ""],
+        );
+        Ok(())
+    }
+
     pub fn usable(&self) -> io::Result<()> {
         if self.types.len() >= 8192 {
             return Err(invalid(
@@ -1043,7 +1092,13 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
         }
     }
     // exec opens the ELF as ksu; only these launcher clients receive its isolated stdio.
-    for original in ["init", "shell", "linkerconfig", "servicemanager"] {
+    for original in [
+        "init",
+        "shell",
+        "linkerconfig",
+        "servicemanager",
+        "aidl_lazy_test_server",
+    ] {
         if let Some(domain) = plan.types.get(original) {
             for (class, permission) in [("fd", "use"), ("fifo_file", "write")] {
                 let rule = format!("allow {domain} ksu {class} {{ {permission} }}");
@@ -1140,6 +1195,35 @@ pub fn prepare(
 mod tests {
     use super::*;
     #[test]
+    fn live_kernel_av_access_is_guest_only_and_idempotent() -> io::Result<()> {
+        let mut plan = generate(
+            "p0001",
+            &BTreeMap::from([(
+                "policy.cil".into(),
+                "(type init) (type servicemanager)".into(),
+            )]),
+        )?;
+        let before = plan.rules.clone();
+        plan.ensure_kernel_av_access()?;
+        plan.ensure_kernel_av_access()?;
+        let added: Vec<_> = plan.rules.difference(&before).cloned().collect();
+        assert_eq!(
+            added,
+            vec![
+                "allow ssal_p0001_init kernel security { compute_av }",
+                "allow ssal_p0001_servicemanager kernel security { compute_av }",
+            ]
+        );
+        assert_eq!(
+            native::encode(&plan, &added)?
+                .iter()
+                .map(|b| b.commands)
+                .sum::<usize>(),
+            2
+        );
+        Ok(())
+    }
+    #[test]
     fn self_rules_expand_to_each_concrete_member_without_cross_grants() -> io::Result<()> {
         let plan = generate(
             "p0001",
@@ -1198,7 +1282,7 @@ mod tests {
         inputs
             .get_mut("system/etc/selinux/plat_sepolicy.cil")
             .unwrap()
-            .push_str(" (type init) (type shell) (type linkerconfig) (type servicemanager) (type properties_device)");
+            .push_str(" (type init) (type shell) (type linkerconfig) (type servicemanager) (type aidl_lazy_test_server) (type properties_device)");
         let plan = generate("p0001", &inputs)?;
         let rules: Vec<_> = plan
             .rules
@@ -1206,11 +1290,17 @@ mod tests {
             .filter(|r| r.contains(" ksu "))
             .cloned()
             .collect();
-        assert_eq!(rules.len(), 8);
+        assert_eq!(rules.len(), 10);
         let relabel = "allow ssal_p0001_init ssal_p0001_properties_device file { relabelfrom }";
         assert!(plan.rules.contains(relabel));
         assert!(plan.native_rules.contains_key(relabel));
-        for source in ["init", "shell", "linkerconfig", "servicemanager"] {
+        for source in [
+            "init",
+            "shell",
+            "linkerconfig",
+            "servicemanager",
+            "aidl_lazy_test_server",
+        ] {
             for (class, permission) in [("fd", "use"), ("fifo_file", "write")] {
                 let rule = format!("allow ssal_p0001_{source} ksu {class} {{ {permission} }}");
                 assert!(rules.contains(&rule));

@@ -17,10 +17,13 @@ pub(crate) use fork_probe::client as fork_client;
 
 const GUEST_PROBE_CONTEXT: &[u8] = b"u:r:ssal_guest_probe:s0\0";
 const PROPERTY_SERVICE_CONTEXT: &[u8] = b"u:r:ssal_property:s0\0";
+const AIDL_SERVER_CONTEXT: &[u8] = b"u:r:aidl_lazy_test_server:s0\0";
 
 fn mapped_exec_domain(executable: &str, exec_context: Option<&[u8]>) -> &'static str {
     if exec_context == Some(PROPERTY_SERVICE_CONTEXT) {
         "init"
+    } else if exec_context == Some(AIDL_SERVER_CONTEXT) {
+        "aidl_lazy_test_server"
     } else {
         match executable {
             "/system/bin/app_process64" => "zygote",
@@ -252,20 +255,14 @@ pub(crate) fn readiness_client() -> io::Result<()> {
 }
 
 fn guest_servicemanager_property(root: &Path) -> io::Result<String> {
-    let mut command = command(root, "/system/bin/getprop", 1000, Some(GUEST_PROBE_CONTEXT))?;
-    command.arg("servicemanager.ready");
-    let output = crate::guest_probe::run_with_timeout(
-        &mut command,
-        "Guest servicemanager.ready readback",
-        Duration::from_secs(2),
-    )?;
-    if !output.status.success() {
-        return Err(io::Error::other(format!(
-            "Guest getprop servicemanager.ready: {}",
-            output.status
-        )));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    Ok(run(
+        root,
+        "/system/bin/sh",
+        &["-c", "getprop servicemanager.ready"],
+        1000,
+    )?
+    .trim()
+    .to_owned())
 }
 
 fn probe_guest_context_manager(root: &Path) -> io::Result<String> {
@@ -360,7 +357,7 @@ impl Service {
         env: &[(&str, &str)],
     ) -> io::Result<Self> {
         let log = root.join(format!("run/ssal/{name}.log"));
-        let output = File::create(&log)?;
+        File::create(&log)?;
         let mut command = command(root, exe, uid, exec_context)?;
         command
             .stdin(Stdio::null())
@@ -418,10 +415,8 @@ impl Service {
             if std::env::var_os("SSAL_PHASE8B5_ONCE").is_some() {
                 command.env("LD_PRELOAD", "/run/ssal/ssal-system-server-runtime-sid.so:/run/ssal/ssal-phase2-log.so:/run/ssal/ssal-zygote-diag.so:/run/ssal/ssal-zygote-fd-reopen.so");
             }
-        } else if diagnostic || name == "guest-property-service" {
-            command.stdout(Stdio::piped()).stderr(Stdio::piped());
         } else {
-            command.stdout(output.try_clone()?).stderr(output);
+            command.stdout(Stdio::piped()).stderr(Stdio::piped());
         }
         let sockets = if is_zygote {
             zygote_sockets(&mut command, Path::new("/dev/socket"))?
@@ -447,7 +442,13 @@ impl Service {
         let started = Instant::now();
         let child = command.args(args).spawn()?;
         drop(sockets);
-        println!("Guest service={name} pid={} executable={exe}", child.id());
+        let context = fs::read_to_string(format!("/proc/{}/attr/current", child.id()))
+            .map(|context| context.trim_matches('\0').trim().to_owned())
+            .unwrap_or_else(|error| format!("unavailable: {error}"));
+        println!(
+            "Guest service={name} pid={} sid={context:?} executable={exe}",
+            child.id()
+        );
         let mut service = Self {
             child,
             log,
@@ -455,8 +456,8 @@ impl Service {
             diagnostics: None,
             output: Vec::new(),
         };
-        if name == "guest-property-service" {
-            // The parent writes logs; Guest init need not write a system_file.
+        if !diagnostic {
+            // The parent writes logs; Guest daemons need not write a system_file.
             service.output.push(crate::zygote_diagnostics::Stream::new(
                 service.child.stdout.take().unwrap(),
                 File::options().append(true).open(&service.log)?,
@@ -540,7 +541,10 @@ impl Service {
             std::thread::sleep(Duration::from_millis(50));
         }
     }
-    fn readiness_diagnostics(&self, root: &Path, reason: &str, service_lookup: &str) {
+    fn readiness_diagnostics(&mut self, root: &Path, reason: &str, service_lookup: &str) {
+        if let Err(error) = self.drain_output() {
+            eprintln!("Guest servicemanager log drain failed: {error}");
+        }
         let pid = self.child.id();
         let wchan = fs::read_to_string(format!("/proc/{pid}/wchan"))
             .unwrap_or_else(|error| format!("unavailable: {error}"));
@@ -640,6 +644,7 @@ impl Service {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             crate::memory_cgroup::check_interrupted()?;
+            self.drain_output()?;
             if self.exited()? {
                 self.readiness_diagnostics(root, "Guest servicemanager exited", service_lookup);
                 return Err(io::Error::other(
@@ -1186,7 +1191,26 @@ fn start_property_service(
             return Err(io::Error::other(format!("Host {name} selected")));
         }
     }
-    let guest_socket = identity(&root.join("dev/socket/property_service"))?;
+    let guest_socket_path = root.join("dev/socket/property_service");
+    let guest_socket = identity(&guest_socket_path)?;
+    if !fs::symlink_metadata(&guest_socket_path)?
+        .file_type()
+        .is_socket()
+    {
+        return Err(io::Error::other(
+            "Guest property-service endpoint is not a Unix socket",
+        ));
+    }
+    println!("Guest property socket type=unix");
+    let socket_entries = fs::read_dir(root.join("dev/socket"))?
+        .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
+        .collect::<io::Result<Vec<_>>>()?;
+    if socket_entries.len() != 1 || socket_entries[0] != "property_service" {
+        return Err(io::Error::other(format!(
+            "unexpected Guest /dev/socket entries: {socket_entries:?}"
+        )));
+    }
+    println!("Guest property socket isolation=PASS");
     if guest_socket == identity(Path::new("/dev/socket/property_service"))? {
         return Err(io::Error::other("Host property socket selected"));
     }
@@ -1317,7 +1341,30 @@ pub(crate) fn verify(
         let target = runtime.join(name);
         File::create(&target)?;
         ssal::guest_policy::runtime::bind_file(mounts, root, &bin.join(name), &target)?;
+        if name == "phase3-ipc" {
+            let helper = File::open(&target)?;
+            println!(
+                "Guest phase3-ipc helper mode={:o} label={}",
+                helper.metadata()?.mode() & 0o7777,
+                ssal::unix::image_context(&helper)?
+            );
+        }
     }
+    let aidl_server = runtime.join("phase3-ipc-server");
+    File::create(&aidl_server)?;
+    let plan = ssal::guest_policy::runtime::load(root)?
+        .ok_or_else(|| io::Error::other("Guest SELinux plan missing for AIDL server"))?;
+    ssal::guest_policy::runtime::set_label(
+        &aidl_server,
+        &plan.context("aidl_lazy_test_server_exec", false)?,
+    )?;
+    ssal::guest_policy::runtime::bind_file(mounts, root, &bin.join("phase3-ipc"), &aidl_server)?;
+    let aidl_server_file = File::open(&aidl_server)?;
+    println!(
+        "Guest phase3-ipc server mode={:o} label={}",
+        aidl_server_file.metadata()?.mode() & 0o7777,
+        ssal::unix::image_context(&aidl_server_file)?
+    );
     if phase7a && std::env::var_os("SSAL_PHASE8B3D_SAME_CONTEXT").is_some() {
         mounts.bind(
             &bin.join("ssal-libselinux-same-context.so"),
@@ -1403,6 +1450,13 @@ echo SSAL_PROPERTY_BIONIC=PASS
         if unsafe { libc::fchmod(device.as_raw_fd(), 0o666) } != 0 {
             return Err(io::Error::last_os_error());
         }
+        let binder = fs::metadata(root.join("dev/binder"))?;
+        println!(
+            "Guest private Binder DAC uid={} gid={} mode={:04o}",
+            binder.uid(),
+            binder.gid(),
+            binder.mode() & 0o7777
+        );
         let area = fs::metadata(root.join("dev/__properties__"))?;
         let host = fs::metadata("/dev/__properties__")?;
         if (area.dev(), area.ino()) == (host.dev(), host.ino()) {
@@ -1451,13 +1505,17 @@ echo SSAL_PROPERTY_BIONIC=PASS
             .unwrap_or_else(|| "u:r:ssal_guest_probe:s0".into());
         let shell_script = format!(
             r#"set -eu
+echo "Guest property snapshot sdk=$(getprop ro.build.version.sdk) abi64=$(getprop ro.product.cpu.abilist64) gl_preload=$(getprop ro.zygote.disable_gl_preload) servicemanager.ready=$(getprop servicemanager.ready)"
 test "$(getprop ro.build.version.sdk)" = 36
 test "$(getprop ro.product.cpu.abilist64)" = arm64-v8a
 test "$(getprop ro.zygote.disable_gl_preload)" = 1
 test "$(getprop servicemanager.ready)" = false
-test -z "$(getprop ro.boot.serialno)"
-if test -e /run/ssal/property-service.json; then test -S /dev/socket/property_service; else test ! -e /dev/socket/property_service; fi
-for p in /dev/socket/property_service_for_system /dev/socket/init; do test ! -e "$p"; done
+if test -z "$(getprop ro.boot.serialno)"; then echo "Guest boot serial property=withheld"; else echo "Guest boot serial property=unexpectedly-present"; exit 1; fi
+test -e /run/ssal/property-service.json
+echo "Guest property-service marker=present"
+test -r /run/ssal/phase3-ipc
+test -x /run/ssal/phase3-ipc
+echo "Guest phase3-ipc access=PASS"
 for fd in /proc/$$/fd/*; do
     target=$(readlink "$fd") || continue
     echo "Guest post-exec fd=$fd target=$target"
@@ -1499,12 +1557,12 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
         manager.wait_guest_context_manager(root, guest_binder)?;
         let mut server = Service::start(
             root,
-            "/system/bin/bootstrap/linker64",
-            &["/run/ssal/phase3-ipc", "server"],
+            "/run/ssal/phase3-ipc-server",
+            &["server"],
             "aidl-server",
             1000,
-            Some(GUEST_PROBE_CONTEXT),
-            &[],
+            Some(AIDL_SERVER_CONTEXT),
+            &[("LD_LIBRARY_PATH", "/system/lib64/bootstrap:/system/lib64")],
         )?;
         if let Err(error) = server.wait_text("\"event\":\"registered\"") {
             manager.readiness_diagnostics(
@@ -2019,7 +2077,7 @@ mod tests {
     }
 
     #[test]
-    fn property_failure_stderr_survives_child_exit() -> io::Result<()> {
+    fn daemon_failure_stderr_survives_child_exit() -> io::Result<()> {
         let log = std::env::temp_dir().join(format!("ssal-property-stderr-{}", std::process::id()));
         let output = File::create(&log)?;
         let mut command = Command::new("/bin/sh");
@@ -2117,6 +2175,10 @@ mod tests {
                 domain
             );
         }
+        assert_eq!(
+            mapped_exec_domain("/run/ssal/phase3-ipc-server", Some(AIDL_SERVER_CONTEXT)),
+            "aidl_lazy_test_server"
+        );
     }
 
     #[test]

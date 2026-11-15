@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
@@ -151,24 +152,179 @@ fn check_isolation(config: &Config) -> io::Result<()> {
 }
 
 fn label(path: &Path, context: &str) -> io::Result<()> {
-    let file = OpenOptions::new()
+    let target = std::ffi::CString::new(context).map_err(io::Error::other)?;
+    let process_sid = fs::read_to_string("/proc/self/attr/current")
+        .unwrap_or_else(|_| "unavailable".into())
+        .trim_matches(['\0', '\n'])
+        .to_owned();
+    let path_identity = fs::symlink_metadata(path)
+        .map(|m| {
+            format!(
+                "uid={} gid={} mode={:o}",
+                m.uid(),
+                m.gid(),
+                m.mode() & 0o7777
+            )
+        })
+        .unwrap_or_else(|e| format!("unavailable({e})"));
+    let path_fs_type = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .ok()
+        .and_then(|path| {
+            let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+            (unsafe { libc::statfs(path.as_ptr(), &mut stat) } == 0)
+                .then(|| format!("0x{:x}", stat.f_type as u64))
+        })
+        .unwrap_or_else(|| "unavailable".into());
+    let file = match OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)?;
-    let context = std::ffi::CString::new(context).map_err(io::Error::other)?;
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) => {
+            eprintln!(
+                "property_label syscall=open path={} {} fs_type={} process_sid={} target_sid={} error={error}",
+                path.display(), path_identity, path_fs_type, process_sid, context
+            );
+            return Err(error);
+        }
+    };
+    let metadata = file.metadata()?;
+    let mut filesystem: libc::statfs = unsafe { std::mem::zeroed() };
+    let fs_result = unsafe { libc::fstatfs(file.as_raw_fd(), &mut filesystem) };
+    let fs_type = if fs_result == 0 {
+        format!("0x{:x}", filesystem.f_type as u64)
+    } else {
+        format!("unavailable(errno={})", io::Error::last_os_error())
+    };
+    let identity = format!(
+        "uid={} gid={} mode={:o} fs_type={}",
+        metadata.uid(),
+        metadata.gid(),
+        metadata.mode() & 0o7777,
+        fs_type
+    );
+    let mut actual = [0u8; 512];
+    let size = unsafe {
+        libc::fgetxattr(
+            file.as_raw_fd(),
+            c"security.selinux".as_ptr(),
+            actual.as_mut_ptr().cast(),
+            actual.len(),
+        )
+    };
+    if size < 0 {
+        let error = io::Error::last_os_error();
+        eprintln!(
+            "property_label syscall=fgetxattr path={} {identity} process_sid={} target_sid={} error={error}",
+            path.display(), process_sid, context
+        );
+        return Err(error);
+    }
+    let actual_sid = String::from_utf8_lossy(
+        actual[..size as usize]
+            .strip_suffix(&[0])
+            .unwrap_or(&actual[..size as usize]),
+    )
+    .into_owned();
+    eprintln!(
+        "property_label stage=before path={} {identity} process_sid={} actual_sid={} target_sid={}",
+        path.display(),
+        process_sid,
+        actual_sid,
+        context
+    );
+    if actual_sid == context {
+        eprintln!(
+            "property_label result=already_labeled fsetxattr=skipped path={} actual_sid={}",
+            path.display(),
+            actual_sid
+        );
+        return Ok(());
+    }
     if unsafe {
         libc::fsetxattr(
             file.as_raw_fd(),
             c"security.selinux".as_ptr(),
-            context.as_ptr().cast(),
-            context.as_bytes_with_nul().len(),
+            target.as_ptr().cast(),
+            target.as_bytes().len() + 1,
+            0,
+        )
+    } != 0
+    {
+        let error = io::Error::last_os_error();
+        eprintln!(
+            "property_label syscall=fsetxattr path={} {identity} process_sid={} actual_sid={} target_sid={} error={error}",
+            path.display(), process_sid, actual_sid, context
+        );
+        return Err(error);
+    }
+    let size = unsafe {
+        libc::fgetxattr(
+            file.as_raw_fd(),
+            c"security.selinux".as_ptr(),
+            actual.as_mut_ptr().cast(),
+            actual.len(),
+        )
+    };
+    if size < 0 {
+        let error = io::Error::last_os_error();
+        eprintln!(
+            "property_label syscall=fgetxattr_after_fsetxattr path={} {identity} process_sid={} previous_sid={} target_sid={} error={error}",
+            path.display(), process_sid, actual_sid, context
+        );
+        return Err(error);
+    }
+    let actual_sid = actual[..size as usize]
+        .strip_suffix(&[0])
+        .unwrap_or(&actual[..size as usize]);
+    if actual_sid != context.as_bytes() {
+        eprintln!(
+            "property_label result=label_mismatch path={} {identity} process_sid={} actual_sid={} target_sid={}",
+            path.display(), process_sid, String::from_utf8_lossy(actual_sid), context
+        );
+        return Err(io::Error::other("Guest property label readback mismatch"));
+    }
+    eprintln!(
+        "property_label result=verified path={} {identity} process_sid={} actual_sid={} target_sid={}",
+        path.display(), process_sid, context, context
+    );
+    Ok(())
+}
+
+pub(super) fn label_file(file: &File, context: &str) -> io::Result<()> {
+    let target = std::ffi::CString::new(context).map_err(io::Error::other)?;
+    let mut actual = [0u8; 512];
+    let size = unsafe {
+        libc::fgetxattr(
+            file.as_raw_fd(),
+            c"security.selinux".as_ptr(),
+            actual.as_mut_ptr().cast(),
+            actual.len(),
+        )
+    };
+    if size < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if actual[..size as usize]
+        .strip_suffix(&[0])
+        .unwrap_or(&actual[..size as usize])
+        == context.as_bytes()
+    {
+        return Ok(());
+    }
+    if unsafe {
+        libc::fsetxattr(
+            file.as_raw_fd(),
+            c"security.selinux".as_ptr(),
+            target.as_ptr().cast(),
+            target.as_bytes_with_nul().len(),
             0,
         )
     } != 0
     {
         return Err(io::Error::last_os_error());
     }
-    let mut actual = [0u8; 512];
     let size = unsafe {
         libc::fgetxattr(
             file.as_raw_fd(),
@@ -285,7 +441,8 @@ pub fn serve(config: Config) -> io::Result<()> {
     policy.default_context = config.context("default_prop", &policy.default_context, false)?;
     let seeds = load_seeds(&config.build_props, &policy)
         .map_err(|e| io::Error::new(e.kind(), format!("property seeds: {e}")))?;
-    let store = persistent::Store::open(Path::new(PERSIST_DIRECTORY))
+    let persistent_context = config.context("property_data_file", DIRECTORY_CONTEXT, false)?;
+    let store = persistent::Store::open(Path::new(PERSIST_DIRECTORY), Some(&persistent_context))
         .map_err(|e| io::Error::new(e.kind(), format!("property persistent store: {e}")))?;
     let mapped_label = |path: &Path, original: &str| {
         let context = match original {
@@ -442,7 +599,7 @@ mod tests {
         initialize(
             policy,
             seeds,
-            persistent::Store::open(&data).unwrap(),
+            persistent::Store::open(&data, None).unwrap(),
             &directory,
             |_, _| Ok(()),
         )

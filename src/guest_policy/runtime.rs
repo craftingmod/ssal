@@ -611,7 +611,9 @@ pub fn prepare_mounted(system: &Path, profile: &Path, force_regen: bool) -> io::
     let id = profile_id(root, profile)?;
     drop(registry_lock);
     let files = inputs(system)?;
-    let (plan, regenerated) = prepare(profile, &id, &files, force_regen)?;
+    let (mut plan, regenerated) = prepare(profile, &id, &files, force_regen)?;
+    plan.ensure_property_socket_transition()?;
+    plan.ensure_kernel_av_access()?;
     println!(
         "Guest SELinux: id={} input_hash={} regenerated={} types={} rules={} unsupported={}",
         plan.id,

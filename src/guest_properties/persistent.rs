@@ -32,31 +32,63 @@ pub(super) struct Store {
 }
 
 impl Store {
-    pub fn open(path: &Path) -> io::Result<Self> {
-        let directory = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(path)?;
-        check_file(&directory, true)?;
-        let lock = open_at(
-            &directory,
-            c".ssal-writer-lock",
-            libc::O_RDWR | libc::O_CREAT,
-            0o600,
+    pub fn open(path: &Path, label_context: Option<&str>) -> io::Result<Self> {
+        let directory = context(
+            OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(path),
+            "open property directory",
         )?;
-        check_file(&lock, false)?;
-        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            return Err(io::Error::last_os_error());
+        context(check_file(&directory, true), "validate property directory")?;
+        if let Some(label) = label_context {
+            context(
+                super::label_file(&directory, label),
+                "label property directory",
+            )?;
         }
-        let values = match open_at(&directory, c"persistent_properties", libc::O_RDONLY, 0) {
+        let lock = context(
+            open_at(
+                &directory,
+                c".ssal-writer-lock",
+                libc::O_RDWR | libc::O_CREAT,
+                0o600,
+            ),
+            "open writer lock",
+        )?;
+        context(check_file(&lock, false), "validate writer lock")?;
+        if let Some(label) = label_context {
+            context(super::label_file(&lock, label), "label writer lock")?;
+        }
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let error = io::Error::last_os_error();
+            eprintln!(
+                "property_store flock_failure {}",
+                lock_identity(&directory, &lock)
+            );
+            return Err(context_error(error, "flock writer lock"));
+        }
+        let values = match context(
+            open_at(&directory, c"persistent_properties", libc::O_RDONLY, 0),
+            "open persistent properties",
+        ) {
             Ok(file) => {
-                check_file(&file, false)?;
+                context(check_file(&file, false), "validate persistent properties")?;
+                if let Some(label) = label_context {
+                    context(
+                        super::label_file(&file, label),
+                        "label persistent properties",
+                    )?;
+                }
                 let mut data = Vec::new();
-                file.take(MAX_FILE_SIZE + 1).read_to_end(&mut data)?;
+                context(
+                    file.take(MAX_FILE_SIZE + 1).read_to_end(&mut data),
+                    "read persistent properties",
+                )?;
                 if data.len() as u64 > MAX_FILE_SIZE {
                     return Err(io::Error::other("persistent property file too large"));
                 }
-                decode(&data)?
+                context(decode(&data), "decode persistent properties")?
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => BTreeMap::new(),
             Err(e) => return Err(e),
@@ -71,7 +103,10 @@ impl Store {
         } != 0
             && io::Error::last_os_error().kind() != io::ErrorKind::NotFound
         {
-            return Err(io::Error::last_os_error());
+            return Err(context_error(
+                io::Error::last_os_error(),
+                "remove stale persistent properties",
+            ));
         }
         Ok(Self {
             directory,
@@ -138,6 +173,56 @@ impl Store {
         self.values = values;
         Ok(())
     }
+}
+
+fn context<T>(result: io::Result<T>, stage: &str) -> io::Result<T> {
+    result.map_err(|error| context_error(error, stage))
+}
+
+fn context_error(error: io::Error, stage: &str) -> io::Error {
+    io::Error::new(error.kind(), format!("{stage}: {error}"))
+}
+
+fn file_identity(file: &File) -> String {
+    let metadata = file
+        .metadata()
+        .map(|m| {
+            format!(
+                "uid={} gid={} mode={:o}",
+                m.uid(),
+                m.gid(),
+                m.mode() & 0o7777
+            )
+        })
+        .unwrap_or_else(|error| format!("unavailable({error})"));
+    let mut label = [0u8; 512];
+    let label_length = unsafe {
+        libc::fgetxattr(
+            file.as_raw_fd(),
+            c"security.selinux".as_ptr(),
+            label.as_mut_ptr().cast(),
+            label.len(),
+        )
+    };
+    let directory_sid = if label_length >= 0 {
+        String::from_utf8_lossy(&label[..label_length as usize])
+            .trim_end_matches('\0')
+            .to_owned()
+    } else {
+        format!("unavailable({})", io::Error::last_os_error())
+    };
+    format!("{metadata} sid={directory_sid}")
+}
+
+fn lock_identity(directory: &File, lock: &File) -> String {
+    let process_sid = std::fs::read_to_string("/proc/self/attr/current")
+        .map(|sid| sid.trim_matches(['\0', '\n']).to_owned())
+        .unwrap_or_else(|error| format!("unavailable({error})"));
+    format!(
+        "process_sid={process_sid} directory=[{}] lock=[{}]",
+        file_identity(directory),
+        file_identity(lock)
+    )
 }
 
 fn open_at(directory: &File, name: &std::ffi::CStr, flags: i32, mode: u32) -> io::Result<File> {
@@ -234,8 +319,8 @@ mod tests {
     fn restart_atomic_failure_lock_and_symlink() {
         let path = super::super::tests::temp_dir("persistent");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let mut store = Store::open(&path).unwrap();
-        assert!(Store::open(&path).is_err());
+        let mut store = Store::open(&path, None).unwrap();
+        assert!(Store::open(&path, None).is_err());
         store.commit("persist.x", "old").unwrap();
         let committed = std::fs::read(path.join(FILENAME)).unwrap();
         std::fs::create_dir(path.join("persistent_properties.tmp")).unwrap();
@@ -245,13 +330,13 @@ mod tests {
         std::fs::remove_dir(path.join("persistent_properties.tmp")).unwrap();
         drop(store);
         std::fs::write(path.join("persistent_properties.tmp"), b"interrupted").unwrap();
-        let store = Store::open(&path).unwrap();
+        let store = Store::open(&path, None).unwrap();
         assert_eq!(store.values["persist.x"], "old");
         assert!(!path.join("persistent_properties.tmp").exists());
         drop(store);
         std::fs::rename(path.join(FILENAME), path.join("sentinel")).unwrap();
         symlink("sentinel", path.join(FILENAME)).unwrap();
-        assert!(Store::open(&path).is_err());
+        assert!(Store::open(&path, None).is_err());
         assert_eq!(std::fs::read(path.join("sentinel")).unwrap(), committed);
         std::fs::remove_dir_all(path).unwrap();
     }

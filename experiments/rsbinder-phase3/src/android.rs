@@ -137,12 +137,16 @@ fn identity() -> serde_json::Value {
 }
 
 fn serve() -> Result<(), Box<dyn std::error::Error>> {
+    eprintln!("aidl_server_stage=enter");
     init()?;
+    eprintln!("aidl_server_stage=binder_initialized");
     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
         return Err(std::io::Error::last_os_error().into());
     }
     let binder = BnPhase3Service::new_binder(TestService);
+    eprintln!("aidl_server_stage=registering");
     hub::add_service(SERVICE, binder)?;
+    eprintln!("aidl_server_stage=registered");
     println!(
         "{}",
         json!({

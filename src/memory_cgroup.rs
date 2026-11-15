@@ -195,6 +195,7 @@ pub(crate) fn backend() -> io::Result<Backend> {
     let root = Path::new(ROOT);
     if filesystem_magic(root).ok() == Some(CGROUP2_MAGIC)
         && mount_root(root, "cgroup2", None).is_ok()
+        && root.join("apps").is_dir()
         && fs::read_to_string(root.join("cgroup.controllers")).is_ok_and(|value| has_memory(&value))
     {
         return Ok(Backend::V2);
