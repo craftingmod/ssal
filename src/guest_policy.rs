@@ -11,7 +11,7 @@ pub mod native;
 pub mod runtime;
 mod symbols;
 
-const VERSION: u32 = 11;
+const VERSION: u32 = 12;
 
 type Names = BTreeMap<String, String>;
 
@@ -1141,6 +1141,19 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
         }
     }
     plan.native_rules = native_rules;
+    // Partial offline fixtures remain supported; mounted preparation requires these types.
+    if ["init", "socket_device", "property_socket"]
+        .iter()
+        .all(|name| plan.types.contains_key(*name))
+    {
+        plan.ensure_property_socket_transition()?;
+    }
+    if ["init", "servicemanager"]
+        .iter()
+        .all(|name| plan.types.contains_key(*name))
+    {
+        plan.ensure_kernel_av_access()?;
+    }
     Ok(plan)
 }
 
@@ -1203,10 +1216,16 @@ mod tests {
                 "(type init) (type servicemanager)".into(),
             )]),
         )?;
-        let before = plan.rules.clone();
+        let generated = serde_json::to_vec(&plan)?;
         plan.ensure_kernel_av_access()?;
         plan.ensure_kernel_av_access()?;
-        let added: Vec<_> = plan.rules.difference(&before).cloned().collect();
+        assert_eq!(serde_json::to_vec(&plan)?, generated);
+        let added: Vec<_> = plan
+            .rules
+            .iter()
+            .filter(|r| r.contains(" kernel security "))
+            .cloned()
+            .collect();
         assert_eq!(
             added,
             vec![
@@ -1498,6 +1517,86 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn desired_plan_matches_generation_cache_and_legacy_runtime_corrections() -> io::Result<()> {
+        let root = std::env::temp_dir().join(format!("ssal-desired-plan-{}", std::process::id()));
+        let mut files = fixture();
+        let cil = files
+            .get_mut("system/etc/selinux/plat_sepolicy.cil")
+            .unwrap();
+        cil.push_str(
+            " (type init) (type servicemanager) (type socket_device) (type property_socket)",
+        );
+        let generated = generate("p0001", &files)?;
+        let expected = serde_json::to_vec_pretty(&generated)?;
+        let (miss, regenerated) = prepare(&root, "p0001", &files, false)?;
+        assert!(regenerated);
+        let (hit, regenerated) = prepare(&root, "p0001", &files, false)?;
+        assert!(!regenerated);
+        for plan in [&miss, &hit] {
+            assert_eq!(serde_json::to_vec_pretty(plan)?, expected);
+        }
+        assert_eq!(fs::read(root.join("selinux/plan.json"))?, expected);
+        assert_eq!(
+            fs::read(root.join(format!(
+                "selinux/plans/v{VERSION}-{}.json",
+                generated.input_hash
+            )))?,
+            expected
+        );
+
+        let mut legacy = generated.clone();
+        legacy.version = 11;
+        let corrections = [
+            "allow ssal_p0001_init kernel security { compute_av }",
+            "allow ssal_p0001_servicemanager kernel security { compute_av }",
+            "type_transition ssal_p0001_init ssal_p0001_socket_device sock_file ssal_p0001_property_socket",
+        ];
+        for rule in corrections {
+            assert!(legacy.rules.remove(rule));
+            assert!(legacy.native_rules.remove(rule).is_some());
+        }
+        atomic(
+            &root.join("selinux/plan.json"),
+            &serde_json::to_vec(&legacy)?,
+        )?;
+        let (upgraded, regenerated) = prepare(&root, "p0001", &files, false)?;
+        assert!(regenerated);
+        assert_eq!(serde_json::to_vec_pretty(&upgraded)?, expected);
+        // Reproduce the old mounted-only correction without changing its rule/command set.
+        legacy.ensure_property_socket_transition()?;
+        legacy.ensure_kernel_av_access()?;
+        assert_eq!(legacy.rules, generated.rules);
+        assert_eq!(legacy.native_rules, generated.native_rules);
+        let mut repeated = generated.clone();
+        repeated.ensure_property_socket_transition()?;
+        repeated.ensure_kernel_av_access()?;
+        assert_eq!(serde_json::to_vec_pretty(&repeated)?, expected);
+
+        files.get_mut("system/etc/selinux/plat_sepolicy.cil").unwrap().push_str(
+            " (typetransition init socket_device sock_file property_socket) (typetransition init socket_device sock_file property_socket)",
+        );
+        let duplicate = generate("p0001", &files)?;
+        assert_eq!(duplicate.rules, generated.rules);
+        assert_eq!(duplicate.native_rules, generated.native_rules);
+        #[cfg(unix)]
+        {
+            let expected_batches = runtime::encode_native(&generated)?;
+            for plan in [&miss, &hit, &upgraded, &duplicate] {
+                let batches = runtime::encode_native(plan)?;
+                assert_eq!(batches.len(), expected_batches.len());
+                for (actual, expected) in batches.iter().zip(&expected_batches) {
+                    assert_eq!(actual.payload, expected.payload);
+                    assert_eq!(actual.statements, expected.statements);
+                }
+            }
+            let mut missing = generated.clone();
+            missing.native_rules.remove(corrections[0]);
+            assert!(runtime::check_native(&missing).is_err());
+        }
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+    #[test]
     #[ignore = "set SSAL_POLICY_FIXTURE to a saved guest partition export"]
     fn saved_gsi() -> io::Result<()> {
         let root = std::path::PathBuf::from(std::env::var("SSAL_POLICY_FIXTURE").unwrap());
@@ -1528,13 +1627,13 @@ mod tests {
                 .iter()
                 .all(|b| b.payload.len() <= native::BATCH_BYTES));
             assert_eq!(plan.types.len(), 2040);
-            assert_eq!(plan.rules.len(), 49802);
+            assert_eq!(plan.rules.len(), 49817);
             assert_eq!(
                 plan.rules
                     .iter()
                     .filter(|r| r.starts_with("type_transition "))
                     .count(),
-                346
+                347
             );
             assert_eq!(
                 plan.rules
@@ -1544,12 +1643,12 @@ mod tests {
                     .count(),
                 51
             );
-            assert_eq!(batches.iter().map(|b| b.commands).sum::<usize>(), 133794);
+            assert_eq!(batches.iter().map(|b| b.commands).sum::<usize>(), 133809);
             assert_eq!(
                 batches.iter().map(|b| b.payload.len()).sum::<usize>(),
-                11258910
+                11259969
             );
-            println!("native batches={} commands=133794 bytes=11258910 transitions=346 special_transitions=51", batches.len());
+            println!("native batches={} commands=133809 bytes=11259969 transitions=347 special_transitions=51", batches.len());
         }
         for original in [
             "zygote",

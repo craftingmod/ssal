@@ -16,6 +16,8 @@ struct Applied {
     result: String,
     #[serde(default)]
     native_batches: Vec<NativeBatchResult>,
+    #[serde(default)]
+    rule_readback_verified: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -483,13 +485,20 @@ pub fn apply_with_backend(profile: &Path, plan: &Plan, backend: Backend) -> io::
     let (compatible, omitted) =
         compatible_plan(plan, &symbols, &applied, Path::new("/sys/fs/selinux/class"))?;
     let backend = select_backend(&compatible, backend);
+    let compatible_bytes = serde_json::to_vec_pretty(&compatible)?;
+    atomic(&directory.join("compatible-plan.json"), &compatible_bytes)?;
     atomic(
         &directory.join("compatibility.json"),
         &serde_json::to_vec_pretty(
-            &serde_json::json!({"boot_id":applied.boot_id,"omitted":omitted,"placeholders":compatible.placeholders,"backend":if backend == Backend::KernelSuNative {"native"} else {"ksud"},"gsi_unsupported":plan.unsupported}),
+            &serde_json::json!({"boot_id":applied.boot_id,"omitted":omitted,"placeholders":compatible.placeholders,"backend":if backend == Backend::KernelSuNative {"native"} else {"ksud"},"gsi_unsupported":plan.unsupported,
+                "desired_plan_sha256":digest(&serde_json::to_vec_pretty(plan)?),
+                "compatible_plan_sha256":digest(&compatible_bytes),
+                "applied_evidence":"applied.json is a cumulative backend acknowledgement ledger for this boot; additions are not removed",
+                "rule_readback_verified":false}),
         )?,
     )?;
     let ordered = delta(&compatible, &applied)?;
+    applied.rule_readback_verified = false;
     for declaration in &compatible.declarations {
         let name = declaration.split_whitespace().nth(1).unwrap();
         if symbols.contains(name) && !applied.symbols.contains(name) {
@@ -571,7 +580,9 @@ pub fn apply_with_backend(profile: &Path, plan: &Plan, backend: Backend) -> io::
         applied
             .placeholders
             .extend(compatible.placeholders.iter().cloned());
-        applied.result = "applied; Host Enforcing retained".into();
+        applied.result =
+            "backend acknowledged delta; rule readback not verified; Host Enforcing retained"
+                .into();
         atomic(&path, &serde_json::to_vec_pretty(&applied)?)?;
         enforcing()?;
     }
@@ -611,9 +622,10 @@ pub fn prepare_mounted(system: &Path, profile: &Path, force_regen: bool) -> io::
     let id = profile_id(root, profile)?;
     drop(registry_lock);
     let files = inputs(system)?;
-    let (mut plan, regenerated) = prepare(profile, &id, &files, force_regen)?;
-    plan.ensure_property_socket_transition()?;
-    plan.ensure_kernel_av_access()?;
+    let (plan, regenerated) = prepare(profile, &id, &files, force_regen)?;
+    for original in ["init", "servicemanager", "socket_device", "property_socket"] {
+        plan.context(original, false)?;
+    }
     println!(
         "Guest SELinux: id={} input_hash={} regenerated={} types={} rules={} unsupported={}",
         plan.id,
@@ -1109,6 +1121,15 @@ mod tests {
         assert!(membership < allow);
         applied.statements.extend(first);
         assert!(delta(&plan, &applied)?.is_empty());
+        let mut legacy = serde_json::to_value(&applied)?;
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("rule_readback_verified");
+        let legacy: Applied = serde_json::from_value(legacy)?;
+        assert!(!legacy.rule_readback_verified);
+        assert_eq!(legacy.statements, applied.statements);
+        assert!(delta(&plan, &legacy)?.is_empty());
         let mut removed = plan.clone();
         removed.rules.retain(|r| !r.starts_with("allow "));
         assert!(delta(&removed, &applied)?.is_empty());
@@ -1216,7 +1237,9 @@ mod tests {
         let root = std::env::temp_dir().join(format!("ssal-policy-classes-{}", std::process::id()));
         fs::create_dir_all(root.join("file/perms"))?;
         fs::write(root.join("file/perms/read"), "1")?;
+        let desired = serde_json::to_vec(&plan)?;
         let (live, omitted) = compatible_plan(&plan, &BTreeSet::new(), &Applied::default(), &root)?;
+        assert_eq!(serde_json::to_vec(&plan)?, desired);
         assert!(live
             .rules
             .contains("allow ssal_p0001_foo ssal_p0001_target file { read }"));
