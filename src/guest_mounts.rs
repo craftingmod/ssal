@@ -474,6 +474,12 @@ fn apex(
     policy: Option<&ssal::guest_policy::Plan>,
 ) -> io::Result<()> {
     fs::create_dir(cache)?;
+    if let Some(plan) = policy {
+        ssal::guest_policy::runtime::set_label(
+            &root.join("apex"),
+            &plan.context("apex_mnt_dir", false)?,
+        )?;
+    }
     let mut packages = Vec::new();
     for source in [
         "system/apex",
@@ -568,6 +574,12 @@ fn apex(
     }
     metadata.push_str("</apex-info-list>\n");
     fs::write(root.join("apex/apex-info-list.xml"), metadata)?;
+    if let Some(plan) = policy {
+        ssal::guest_policy::runtime::set_label(
+            &root.join("apex/apex-info-list.xml"),
+            &plan.context("apex_info_file", false)?,
+        )?;
+    }
     // Read-only module mounts remain executable. The parent tmpfs becomes RO too.
     mount(
         Path::new("tmpfs"),
@@ -814,6 +826,37 @@ impl GuestCgroups {
                     fs::write(source.join(name), value)?;
                 }
             }
+            // libprocessgroup creates uid_1000 below this Guest-owned parent.
+            let system_cgroup = if target == "sys/fs/cgroup"
+                && std::env::var_os("SSAL_START_SYSTEM_SERVER").is_some()
+            {
+                let system = source.join("system");
+                fs::create_dir(&system)?;
+                for entry in [
+                    system.clone(),
+                    system.join("cgroup.procs"),
+                    system.join("tasks"),
+                    system.join("cgroup.threads"),
+                ] {
+                    if entry.exists() {
+                        let path = cpath(&entry)?;
+                        if unsafe { libc::chown(path.as_ptr(), 1000, 1000) } != 0 {
+                            return Err(io::Error::last_os_error());
+                        }
+                        fs::set_permissions(
+                            &entry,
+                            fs::Permissions::from_mode(if entry == system {
+                                0o755
+                            } else {
+                                0o664
+                            }),
+                        )?;
+                    }
+                }
+                Some(system)
+            } else {
+                None
+            };
             // sysfs is read-only; its existing cgroup mountpoint needs no mkdir.
             let target = if target == "sys/fs/cgroup" {
                 guest_path(root, target)?
@@ -822,6 +865,13 @@ impl GuestCgroups {
             };
             mounts.bind(&source, &target, false, false)?;
             same_directory(&source, &target)?;
+            if let Some(system) = system_cgroup {
+                same_directory(&system, &target.join("system"))?;
+                println!(
+                    "Guest SystemServer cgroup prepared: {} uid=1000 gid=1000",
+                    system.display()
+                );
+            }
             println!(
                 "Guest cgroup bind: {} -> {}",
                 source.display(),
@@ -1483,7 +1533,10 @@ pub fn verify(
         Ok(())
     };
     let descendants = descendants.and_then(|()| {
-        if mode == "--guest-zygote-7a-worker" && std::env::var_os("SSAL_PHASE7FB_FORK").is_some() {
+        if mode == "--guest-zygote-7a-worker"
+            && (std::env::var_os("SSAL_PHASE7FB_FORK").is_some()
+                || std::env::var_os("SSAL_START_SYSTEM_SERVER").is_some())
+        {
             for path in &cgroups.created {
                 remove_empty_cgroup_children(path)?;
             }

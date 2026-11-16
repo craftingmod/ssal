@@ -108,6 +108,34 @@ static void access_query(const char *source, const char *target, const char *cla
     string(reply); puts("}");
 }
 
+static void validate_query(const char *source, const char *target, const char *task, const char *class_name) {
+    char path[256], text[128], request[2048];
+    unsigned int index = 0;
+    int error = 0;
+    snprintf(path, sizeof(path), "/sys/fs/selinux/class/%s/index", class_name);
+    error = read_text(path, text, sizeof(text));
+    if (!error) index = (unsigned int)strtoul(text, NULL, 10);
+    if (!error && !index) error = EINVAL;
+    if (!error) {
+        int fd = open("/sys/fs/selinux/validatetrans", O_WRONLY | O_CLOEXEC);
+        if (fd < 0) error = errno;
+        else {
+            int length = snprintf(request, sizeof(request), "%s %s %u %s", source, target, index, task);
+            if (length < 0 || (size_t)length >= sizeof(request)) error = EOVERFLOW;
+            else {
+                ssize_t n = write(fd, request, (size_t)length);
+                error = n < 0 ? errno : ((size_t)n == (size_t)length ? 0 : EIO);
+            }
+            close(fd);
+        }
+    }
+    printf("{\"kind\":\"validatetrans\",\"source\":"); string(source);
+    printf(",\"target\":"); string(target);
+    printf(",\"task\":"); string(task);
+    printf(",\"class\":"); string(class_name);
+    printf(",\"valid\":%s,\"errno\":%d}\n", error ? "false" : "true", error);
+}
+
 int main(int argc, char **argv) {
     if (argc != 2 || geteuid() != 0) return 2;
     FILE *input = fopen(argv[1], "r");
@@ -123,6 +151,7 @@ int main(int argc, char **argv) {
         for (char *p = strtok_r(line, "\t", &save); p && count < 6; p = strtok_r(NULL, "\t", &save)) fields[count++] = p;
         if (count == 2 && !strcmp(fields[0], "C")) context_query(fields[1]);
         else if (count == 5 && !strcmp(fields[0], "A")) access_query(fields[1], fields[2], fields[3], fields[4]);
+        else if (count == 5 && !strcmp(fields[0], "V")) validate_query(fields[1], fields[2], fields[3], fields[4]);
         else { status = 4; break; }
     }
     if (ferror(input)) status = 5;

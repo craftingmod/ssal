@@ -717,6 +717,13 @@ pub fn install(plan: &Plan, mounts: &mut Mounts, root: &Path) -> io::Result<()> 
     let runtime = root.join("run/ssal");
     fs::create_dir_all(&runtime)?;
     let file_context = plan.context("system_file", false)?;
+    // compose_system creates these links on the Guest tmpfs, outside the system overlay.
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        if entry.file_type()?.is_symlink() {
+            set_label(&entry.path(), &file_context)?;
+        }
+    }
     set_label(&root.join("run"), &file_context)?;
     set_label(&runtime, &file_context)?;
     let mut runtime_plan = plan.clone();

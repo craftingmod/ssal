@@ -83,7 +83,12 @@ impl PolicyCommand {
             4 => guest(0) && guest(1),
             5 => guest(1), // Shared Host labels may join a Guest target attribute.
             6 => guest(0),
-            7 | 8 => guest(0) && guest(1) && guest(3),
+            7 => {
+                guest(0)
+                    && guest(3)
+                    && (guest(1) || (self.args[1] == "tmpfs" && self.args[2] == "file"))
+            }
+            8 => guest(0) && guest(1) && guest(3),
             _ => false,
         }
     }
@@ -374,6 +379,33 @@ pub use driver::{KernelSuInfo, KernelSuNative};
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn shared_tmpfs_transition_still_requires_guest_source_and_output() {
+        let command = PolicyCommand {
+            cmd: 7,
+            subcmd: 0,
+            args: [
+                "ssal_p0001_zygote",
+                "tmpfs",
+                "file",
+                "ssal_p0001_zygote_tmpfs",
+                "",
+            ]
+            .map(String::from)
+            .to_vec(),
+        };
+        assert!(command.owned("ssal_p0001_"));
+        for (index, value) in [
+            (0, "zygote"),
+            (1, "rootfs"),
+            (2, "dir"),
+            (3, "zygote_tmpfs"),
+        ] {
+            let mut denied = command.clone();
+            denied.args[index] = value.into();
+            assert!(!denied.owned("ssal_p0001_"));
+        }
+    }
     #[test]
     fn binary_layout_and_special_objects() -> io::Result<()> {
         let command = PolicyCommand {

@@ -36,18 +36,37 @@ static int reattach(int fd, const char *path) {
     return result;
 }
 
+static int same_pipe(int fd, int stream) {
+    char fd_link[64], stream_link[64], fd_target[128], stream_target[128];
+    snprintf(fd_link, sizeof(fd_link), "/proc/self/fd/%d", fd);
+    snprintf(stream_link, sizeof(stream_link), "/proc/self/fd/%d", stream);
+    ssize_t fd_size = readlink(fd_link, fd_target, sizeof(fd_target));
+    ssize_t stream_size = readlink(stream_link, stream_target, sizeof(stream_target));
+    return fd_size >= 6 && fd_size < (ssize_t)sizeof(fd_target) && fd_size == stream_size &&
+        !memcmp(fd_target, "pipe:[", 6) && !memcmp(fd_target, stream_target, (size_t)fd_size);
+}
+
 static int detach_stdio_clone(int fd) {
     struct stat clone, standard;
-    if (fstat(fd, &clone) || !S_ISFIFO(clone.st_mode)) return 0;
-    for (int stream = 1; stream <= 2; ++stream) {
-        if (fstat(stream, &standard) || clone.st_dev != standard.st_dev || clone.st_ino != standard.st_ino) continue;
-        int flags = fcntl(fd, F_GETFD), nullfd = open("/dev/null", O_WRONLY | O_CLOEXEC);
-        if (flags < 0 || nullfd < 0) return -1;
-        int result = syscall(SYS_dup3, nullfd, fd, flags & FD_CLOEXEC ? O_CLOEXEC : 0) == fd ? 1 : -1;
-        close(nullfd);
-        return result;
+    int clone_stat = fstat(fd, &clone), denied = errno == EACCES, matched = 0;
+    if (clone_stat == 0) {
+        if (!S_ISFIFO(clone.st_mode)) return 0;
+        for (int stream = 1; stream <= 2; ++stream) {
+            if (fstat(stream, &standard) == 0 && clone.st_dev == standard.st_dev && clone.st_ino == standard.st_ino) {
+                matched = 1;
+                break;
+            }
+        }
+    } else if (denied) {
+        // shortcut: procfs names identify pipe clones when fstat is denied; revisit if pipe link names change.
+        for (int stream = 1; stream <= 2; ++stream) matched |= same_pipe(fd, stream);
     }
-    return 0;
+    if (!matched) return 0;
+    int flags = fcntl(fd, F_GETFD), nullfd = open("/dev/null", O_WRONLY | O_CLOEXEC);
+    if (flags < 0 || nullfd < 0) return -1;
+    int result = syscall(SYS_dup3, nullfd, fd, flags & FD_CLOEXEC ? O_CLOEXEC : 0) == fd ? 1 : -1;
+    close(nullfd);
+    return result;
 }
 
 void __android_log_close(void) {
@@ -70,8 +89,21 @@ void __android_log_close(void) {
         char link[64], raw[PATH_MAX], path[PATH_MAX];
         snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
         ssize_t size = readlink(link, raw, sizeof(raw) - 1);
-        if (size < 0) continue;
+        if (size < 0) {
+            if (fd == 55) dprintf(2, "SSAL_FD55 pid=%d readlink_errno=%d\n", getpid(), errno);
+            continue;
+        }
         raw[size] = 0;
+        // shortcut: diagnoses only the known FD 55, generalize if a later failure names another FD.
+        if (fd == 55) {
+            struct stat info = {0};
+            errno = 0;
+            int result = fstat(fd, &info), error = errno;
+            dprintf(2, "SSAL_FD55 pid=%d raw=%s fstat=%d errno=%d mode=%#o dev=%llu ino=%llu rdev=%llu\n",
+                getpid(), raw, result, error, (unsigned)info.st_mode,
+                (unsigned long long)info.st_dev, (unsigned long long)info.st_ino,
+                (unsigned long long)info.st_rdev);
+        }
         const char *base = strrchr(raw, '/');
         const char *resources[] = {"/system/framework/framework-res.apk", "/system/framework/org.lineageos.platform-res.apk", "/system/framework/am.jar", "/dev/urandom"};
         int resource = 0;

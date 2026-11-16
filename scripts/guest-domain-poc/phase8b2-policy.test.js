@@ -33,10 +33,3 @@ test('Guest source patch changes only the two system-server SID selectors',()=>{
   expect(gsiPatch).not.toContain('--start-system-server');
   expect(gsiPatch).not.toContain('SystemServer.main()');
 });
-
-test('the existing launcher still does not request system_server startup',()=>{
-  const launcher=readFileSync('src/guest_launcher.rs','utf8');
-  expect(launcher).toContain('start_system_server=false');
-  expect(launcher).not.toContain('"--start-system-server"');
-  expect(launcher).not.toContain('SystemServer.main()');
-});

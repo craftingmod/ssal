@@ -162,11 +162,11 @@ fn serve() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn service() -> Result<Strong<dyn IPhase3Service>, Box<dyn std::error::Error>> {
-    let service = hub::default()?
-        .check_interface::<dyn IPhase3Service>(SERVICE)
-        .map_err(|error| {
-            std::io::Error::other(format!("ServiceManager interface lookup: {error}"))
-        })?;
+    let binder = hub::default()?
+        .try_get_service(SERVICE)
+        .map_err(|error| std::io::Error::other(format!("ServiceManager service lookup: {error}")))?
+        .ok_or("Guest AIDL service not registered or find denied")?;
+    let service: Strong<dyn IPhase3Service> = rsbinder::FromIBinder::try_from(binder)?;
     let binder = service.as_binder();
     let remote = binder
         .as_remote()

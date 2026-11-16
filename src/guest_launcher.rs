@@ -1,5 +1,6 @@
 //! Disposable Guest service launcher; shared PID namespace is intentional.
 use ssal::namespace_mounts::Mounts;
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
@@ -18,16 +19,47 @@ pub(crate) use fork_probe::client as fork_client;
 const GUEST_PROBE_CONTEXT: &[u8] = b"u:r:ssal_guest_probe:s0\0";
 const PROPERTY_SERVICE_CONTEXT: &[u8] = b"u:r:ssal_property:s0\0";
 const AIDL_SERVER_CONTEXT: &[u8] = b"u:r:aidl_lazy_test_server:s0\0";
+const DERIVE_CLASSPATH_CONTEXT: &[u8] = b"u:r:derive_classpath:s0\0";
+
+fn system_server_requested(
+    value: Option<&std::ffi::OsStr>,
+    phase7a: bool,
+    mapped: bool,
+) -> io::Result<bool> {
+    match value {
+        None => Ok(false),
+        Some(value) if value == "1" && phase7a && mapped => Ok(true),
+        _ => Err(io::Error::other(
+            "SSAL_START_SYSTEM_SERVER=1 requires the mapped Guest Zygote worker",
+        )),
+    }
+}
+
+fn zygote_args(controlled_fork: bool, system_server: bool) -> Vec<&'static str> {
+    let mut args = vec!["-Xzygote"];
+    if controlled_fork {
+        args.push("-XX:ForceJavaZygoteForkLoop=true");
+    }
+    args.extend(["/system/bin", "--zygote"]);
+    if system_server {
+        args.push("--start-system-server");
+    }
+    args.push("--socket-name=zygote");
+    args
+}
 
 fn mapped_exec_domain(executable: &str, exec_context: Option<&[u8]>) -> &'static str {
     if exec_context == Some(PROPERTY_SERVICE_CONTEXT) {
         "init"
     } else if exec_context == Some(AIDL_SERVER_CONTEXT) {
         "aidl_lazy_test_server"
+    } else if exec_context == Some(DERIVE_CLASSPATH_CONTEXT) {
+        "derive_classpath"
     } else {
         match executable {
             "/system/bin/app_process64" => "zygote",
             "/system/bin/servicemanager" => "servicemanager",
+            "/apex/com.android.sdkext/bin/derive_classpath" => "derive_classpath",
             "/apex/com.android.runtime/bin/linkerconfig" | "/system/bin/linkerconfig" => {
                 "linkerconfig"
             }
@@ -70,7 +102,10 @@ pub(crate) fn command(
     crate::memory_cgroup::check_interrupted()?;
     // A real Guest mount root also gives Zygote's FD allowlist Guest-relative proc paths.
     let pivot = executable == "/system/bin/app_process64"
-        && std::env::var_os("SSAL_PHASE7FB_FORK").is_some();
+        && (std::env::var_os("SSAL_PHASE7FB_FORK").is_some()
+            || std::env::var_os("SSAL_START_SYSTEM_SERVER").is_some());
+    let derive_classpath_linker = executable == "/system/bin/bootstrap/linker64"
+        && exec_context == Some(DERIVE_CLASSPATH_CONTEXT);
     let mut command = crate::guest_probe::root_command(root, executable, pivot)?;
     let exec_context = if let Some(plan) = ssal::guest_policy::runtime::load(root)? {
         let original = mapped_exec_domain(executable, exec_context);
@@ -87,7 +122,14 @@ pub(crate) fn command(
             .collect();
     command.env("LD_LIBRARY_PATH", "/run/ssal");
     if executable == "/system/bin/bootstrap/linker64" {
-        command.env("LD_LIBRARY_PATH", "/system/lib64/bootstrap:/system/lib64");
+        command.env(
+            "LD_LIBRARY_PATH",
+            if derive_classpath_linker {
+                "/run/ssal:/apex/com.android.sdkext/lib64:/system/lib64"
+            } else {
+                "/system/lib64/bootstrap:/system/lib64"
+            },
+        );
     }
     command
         .env("ANDROID_ROOT", "/system")
@@ -133,7 +175,11 @@ pub(crate) fn command(
     Ok(command)
 }
 
-fn zygote_sockets(command: &mut Command, directory: &Path) -> io::Result<Vec<UnixListener>> {
+fn zygote_sockets(
+    command: &mut Command,
+    directory: &Path,
+    contexts: Option<(String, String)>,
+) -> io::Result<Vec<UnixListener>> {
     let mut sockets = Vec::new();
     for name in ["zygote", "usap_pool_primary"] {
         let raw = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
@@ -143,10 +189,19 @@ fn zygote_sockets(command: &mut Command, directory: &Path) -> io::Result<Vec<Uni
         let socket = unsafe { UnixListener::from_raw_fd(raw) };
         let fd = socket.as_raw_fd();
         let path = directory.join(name);
+        let contexts = contexts.clone();
         command.env(format!("ANDROID_SOCKET_{name}"), fd.to_string());
         unsafe {
             command.pre_exec(move || {
+                if let Some((socket, file)) = &contexts {
+                    fs::write("/proc/thread-self/attr/sockcreate", format!("{socket}\0"))?;
+                    fs::write("/proc/thread-self/attr/fscreate", format!("{file}\0"))?;
+                }
                 let bound = UnixListener::bind(&path)?;
+                if contexts.is_some() {
+                    fs::write("/proc/thread-self/attr/sockcreate", b"\0")?;
+                    fs::write("/proc/thread-self/attr/fscreate", b"\0")?;
+                }
                 if name == "zygote" {
                     let cpath = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())?;
                     if libc::chown(cpath.as_ptr(), !0, 1000) != 0 {
@@ -175,6 +230,14 @@ fn run(root: &Path, exe: &str, args: &[&str], uid: u32) -> io::Result<String> {
 fn run_as(root: &Path, exe: &str, args: &[&str], uid: u32, context: &[u8]) -> io::Result<String> {
     let mut child_command = command(root, exe, uid, Some(context))?;
     child_command.args(args);
+    if matches!(
+        exe,
+        "/apex/com.android.sdkext/bin/derive_classpath"
+            | "/apex/com.android.runtime/bin/linkerconfig"
+            | "/system/bin/linkerconfig"
+    ) {
+        child_command.env("LD_PRELOAD", "/run/ssal/ssal-phase2-log.so");
+    }
     if std::env::var_os("SSAL_TRACE_GUEST_SIGABRT").is_some()
         && (exe == "/apex/com.android.runtime/bin/linkerconfig"
             || exe == "/system/bin/linkerconfig")
@@ -378,6 +441,12 @@ impl Service {
             crate::zygote_diagnostics::Diagnostics::prepare(&diagnostic_dir)?;
         }
         if is_zygote {
+            if std::env::var_os("SSAL_CONTEXT_MAP_AVC_RESET").is_some() {
+                command.env("SSAL_CONTEXT_MAP_AVC_RESET", "1");
+            }
+            if std::env::var_os("SSAL_CONTEXT_MAP_RAW_SETCON").is_some() {
+                command.env("SSAL_CONTEXT_MAP_RAW_SETCON", "1");
+            }
             fs::copy(
                 root.join("linkerconfig/ld.config.txt"),
                 diagnostic_dir.join("ld.config.txt"),
@@ -392,7 +461,9 @@ impl Service {
                 )
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
-            if std::env::var_os("SSAL_PHASE7FB_FORK").is_some() {
+            if std::env::var_os("SSAL_PHASE7FB_FORK").is_some()
+                || std::env::var_os("SSAL_START_SYSTEM_SERVER").is_some()
+            {
                 command.env("LD_PRELOAD", "/run/ssal/ssal-phase2-log.so:/run/ssal/ssal-zygote-diag.so:/run/ssal/ssal-zygote-fd-reopen.so")
                     .env("SSAL_PHASE7FB_FD_REOPEN", "1");
             }
@@ -419,7 +490,15 @@ impl Service {
             command.stdout(Stdio::piped()).stderr(Stdio::piped());
         }
         let sockets = if is_zygote {
-            zygote_sockets(&mut command, Path::new("/dev/socket"))?
+            let contexts = ssal::guest_policy::runtime::load(root)?
+                .map(|plan| -> io::Result<_> {
+                    Ok((
+                        plan.context("zygote", true)?,
+                        plan.context("zygote_socket", false)?,
+                    ))
+                })
+                .transpose()?;
+            zygote_sockets(&mut command, Path::new("/dev/socket"), contexts)?
         } else {
             Vec::new()
         };
@@ -456,6 +535,16 @@ impl Service {
             diagnostics: None,
             output: Vec::new(),
         };
+        if diagnostic {
+            service.diagnostics = Some(crate::zygote_diagnostics::Diagnostics::attach(
+                &mut service.child,
+                &diagnostic_dir,
+                &crate::memory_cgroup::memory_group(crate::memory_cgroup::backend()?),
+                launch_ms,
+                started,
+            )?);
+            println!("Guest diagnostics={}", diagnostic_dir.display());
+        }
         if !diagnostic {
             // The parent writes logs; Guest daemons need not write a system_file.
             service.output.push(crate::zygote_diagnostics::Stream::new(
@@ -500,16 +589,6 @@ impl Service {
             "Guest service memory cgroup membership pid={} path={membership}",
             service.child.id()
         );
-        if diagnostic {
-            service.diagnostics = Some(crate::zygote_diagnostics::Diagnostics::attach(
-                &mut service.child,
-                &diagnostic_dir,
-                &crate::memory_cgroup::memory_group(crate::memory_cgroup::backend()?),
-                launch_ms,
-                started,
-            )?);
-            println!("Guest diagnostics={}", diagnostic_dir.display());
-        }
         Ok(service)
     }
     fn drain_output(&mut self) -> io::Result<()> {
@@ -702,7 +781,7 @@ impl Service {
                         Ok(())
                     });
                 }
-                let output = command.output()?;
+                let output = self.readiness_output(command)?;
                 if output.status.success() {
                     if self.exited()? {
                         return Err(io::Error::other("Guest Zygote exited after ABI response"));
@@ -725,6 +804,21 @@ impl Service {
             }
             std::thread::sleep(Duration::from_millis(100));
         }
+    }
+    fn readiness_output(&mut self, mut command: Command) -> io::Result<std::process::Output> {
+        std::thread::scope(|scope| {
+            let query = scope.spawn(move || command.output());
+            while !query.is_finished() {
+                crate::memory_cgroup::check_interrupted()?;
+                if let Some(diagnostics) = &mut self.diagnostics {
+                    diagnostics.tick()?;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            query
+                .join()
+                .map_err(|_| io::Error::other("Zygote readiness query panicked"))?
+        })
     }
     fn stop(&mut self) -> io::Result<()> {
         if self.stopped {
@@ -749,6 +843,107 @@ impl Service {
             fs::read_to_string(&self.log)?
         );
         Ok(())
+    }
+}
+
+fn wait_for_system_server(root: &Path, zygote: &mut Service) -> io::Result<u32> {
+    let parent = zygote.child.id();
+    let expected = ssal::guest_policy::runtime::load(root)?
+        .ok_or_else(|| io::Error::other("SystemServer requires Guest policy"))?
+        .context("system_server", true)?;
+    let group = crate::memory_cgroup::memory_group(crate::memory_cgroup::backend()?);
+    let deadline = Instant::now() + Duration::from_secs(180);
+    let mut last_candidate = None;
+    let mut observed_children = HashSet::new();
+    loop {
+        crate::memory_cgroup::check_interrupted()?;
+        if let Some(diagnostics) = &mut zygote.diagnostics {
+            diagnostics.tick()?;
+        }
+        if zygote.exited()? {
+            return Err(io::Error::other(
+                "Guest Zygote exited during SystemServer startup",
+            ));
+        }
+        let members = match fs::read_to_string(group.join("cgroup.procs")) {
+            Ok(members) => members,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        for pid in members
+            .split_whitespace()
+            .filter_map(|pid| pid.parse::<u32>().ok())
+        {
+            let process = Path::new("/proc").join(pid.to_string());
+            let status = match fs::read_to_string(process.join("status")) {
+                Ok(status) => status,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            let child_parent = status
+                .lines()
+                .find_map(|line| line.strip_prefix("PPid:"))
+                .and_then(|parent| parent.trim().parse::<u32>().ok());
+            if child_parent != Some(parent) {
+                continue;
+            }
+            let domain = fs::read_to_string(process.join("attr/current")).unwrap_or_default();
+            let domain = domain.trim_matches('\0').trim();
+            if observed_children.insert(pid) {
+                println!("Guest SystemServer child pid={pid} domain={domain} expected={expected}");
+            }
+            if domain != expected {
+                continue;
+            }
+            if last_candidate != Some(pid) {
+                println!("Guest SystemServer candidate pid={pid} domain={expected}");
+                last_candidate = Some(pid);
+            }
+            for key in ["Uid:", "Gid:"] {
+                if status
+                    .lines()
+                    .find_map(|line| line.strip_prefix(key))
+                    .map(|ids| ids.split_whitespace().all(|id| id == "1000"))
+                    != Some(true)
+                {
+                    return Err(io::Error::other("Guest SystemServer credentials mismatch"));
+                }
+            }
+            let guest = fs::metadata(root)?;
+            let actual = match fs::metadata(process.join("root")) {
+                Ok(actual) => actual,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            let network = match fs::read_link(process.join("ns/net")) {
+                Ok(network) => network,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            if (guest.dev(), guest.ino()) != (actual.dev(), actual.ino())
+                || network != fs::read_link("/proc/self/ns/net")?
+            {
+                return Err(io::Error::other(
+                    "Guest SystemServer root/network namespace mismatch",
+                ));
+            }
+            match crate::memory_cgroup::verify_guest_membership(pid) {
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            }
+            let stderr = fs::read_to_string(root.parent().unwrap().join("phase7b/stderr.log"))?;
+            if stderr.contains("Entered the Android system server!") {
+                println!("Guest SystemServer ready pid={pid} parent={parent} uid=1000 domain={expected} root=Guest isolated_netns=true framework_entry=true");
+                return Ok(pid);
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::other(
+                "Guest SystemServer Framework entry timeout",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -1025,21 +1220,53 @@ fn guest_env_value<'a>(environ: &'a [u8], name: &str) -> Option<&'a [u8]> {
 }
 
 fn derive_guest_classpath(root: &Path) -> io::Result<GuestClasspaths> {
-    const OUTPUT: &str = "/run/ssal/phase7a-classpath.env";
-    run(
+    let output = format!(
+        "/data/local/tmp/.ssal-phase7a-classpath-{}.env",
+        std::process::id()
+    );
+    let linker_config = run(
+        root,
+        "/system/bin/sh",
+        &[
+            "-c",
+            "set -eu; test -r /linkerconfig/ld.config.txt; stat -c '%n %s %a %u %g' /linkerconfig/ld.config.txt; sha256sum /linkerconfig/ld.config.txt; ls -lZ /linkerconfig/ld.config.txt; echo ro.build.type=$(getprop ro.build.type); echo ro.debuggable=$(getprop ro.debuggable); echo debug.ld.all=$(getprop debug.ld.all)",
+        ],
+        0,
+    )?;
+    println!("Guest linkerconfig preflight:\n{linker_config}");
+    let dependencies = run_as(
+        root,
+        "/system/bin/bootstrap/linker64",
+        &["--list", "/apex/com.android.sdkext/bin/derive_classpath"],
+        0,
+        DERIVE_CLASSPATH_CONTEXT,
+    )?;
+    println!("Guest derive_classpath linker dependency list:\n{dependencies}");
+    let derive = run(
         root,
         "/apex/com.android.sdkext/bin/derive_classpath",
         &[
             "--override-device-sdk-version=36",
             "--override-device-codename=REL",
-            OUTPUT,
+            &output,
         ],
         0,
-    )?;
-    let result = classpath_exports(&fs::read_to_string(
-        root.join(OUTPUT.trim_start_matches('/')),
-    )?);
-    fs::remove_file(root.join(OUTPUT.trim_start_matches('/')))?;
+    );
+    if let Err(error) = derive {
+        let diagnostic = format!(
+            "for path in /data/local /data/local/tmp /system/etc/classpaths /apex/*/etc/classpaths /apex/*/etc/classpaths/bootclasspath.pb /apex/*/etc/classpaths/systemserverclasspath.pb {output} {output}.tmp; do if [ -e \"$path\" ]; then ls -ldZ \"$path\"; else echo missing=$path; fi; done"
+        );
+        match run(root, "/system/bin/sh", &["-c", &diagnostic], 0) {
+            Ok(output) => println!("Guest derive_classpath failure inputs:\n{output}"),
+            Err(diagnostic_error) => {
+                println!("Guest derive_classpath input diagnostic failed: {diagnostic_error}")
+            }
+        }
+        return Err(error);
+    }
+    let output_path = root.join(output.trim_start_matches('/'));
+    let result = classpath_exports(&fs::read_to_string(&output_path)?);
+    fs::remove_file(output_path)?;
     let classpaths = result?;
     let paths = checked_guest_classpath_paths(&classpaths)?;
     let mut args = vec![
@@ -1079,7 +1306,11 @@ fn start_property_service(
         &overrides,
         [
             "servicemanager.ready=false",
+            // This worker starts only app_process64; ZygoteInit otherwise waits 60s for a secondary.
+            "ro.product.cpu.abilist=arm64-v8a",
             "ro.product.cpu.abilist64=arm64-v8a",
+            "ro.product.cpu.abilist32=",
+            "ro.zygote=zygote64",
             "ro.build.version.codename=REL",
             "dalvik.vm.dex2oat64.enabled=true",
             "ro.zygote.disable_gl_preload=1",
@@ -1264,6 +1495,16 @@ pub(crate) fn verify(
     phase7a: bool,
     host_mount_namespace: &Path,
 ) -> io::Result<()> {
+    let start_system_server = system_server_requested(
+        std::env::var_os("SSAL_START_SYSTEM_SERVER").as_deref(),
+        phase7a,
+        ssal::guest_policy::runtime::load(root)?.is_some(),
+    )?;
+    if start_system_server && std::env::var_os("SSAL_PHASE7FB_FORK").is_some() {
+        return Err(io::Error::other(
+            "SystemServer bring-up cannot use the app fork diagnostic",
+        ));
+    }
     let phase7i_property_tests = std::env::var_os("SSAL_PHASE7I_PROPERTIES").is_some();
     if ssal::guest_policy::runtime::load(root)?.is_some()
         && [
@@ -1328,6 +1569,9 @@ pub(crate) fn verify(
         "ssal-zygote-diag.so",
         "ssal-property-service",
     ];
+    if start_system_server {
+        runtime_bins.push("ssal-zygote-fd-reopen.so");
+    }
     if std::env::var_os("SSAL_TRACE_GUEST_SIGABRT").is_some() {
         runtime_bins.push("ssal-abort-trace.so");
     }
@@ -1505,10 +1749,12 @@ echo SSAL_PROPERTY_BIONIC=PASS
             .unwrap_or_else(|| "u:r:ssal_guest_probe:s0".into());
         let shell_script = format!(
             r#"set -eu
-echo "Guest property snapshot sdk=$(getprop ro.build.version.sdk) abi64=$(getprop ro.product.cpu.abilist64) gl_preload=$(getprop ro.zygote.disable_gl_preload) servicemanager.ready=$(getprop servicemanager.ready)"
+echo "Guest property snapshot sdk=$(getprop ro.build.version.sdk) abilist=$(getprop ro.product.cpu.abilist) abi64=$(getprop ro.product.cpu.abilist64) zygote=$(getprop ro.zygote) gl_preload=$(getprop ro.zygote.disable_gl_preload) servicemanager.ready=$(getprop servicemanager.ready)"
 test "$(getprop ro.build.version.sdk)" = 36
 test "$(getprop ro.product.cpu.abilist64)" = arm64-v8a
 test "$(getprop ro.zygote.disable_gl_preload)" = 1
+test "$(getprop ro.product.cpu.abilist)" = "$(getprop ro.product.cpu.abilist64)"
+test -z "$(getprop ro.product.cpu.abilist32)"
 test "$(getprop servicemanager.ready)" = false
 if test -z "$(getprop ro.boot.serialno)"; then echo "Guest boot serial property=withheld"; else echo "Guest boot serial property=unexpectedly-present"; exit 1; fi
 test -e /run/ssal/property-service.json
@@ -1642,12 +1888,33 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
                 system_server_runtime_sid::prepare(mounts, root, &bin)?;
             }
             crate::guest_mounts::directory(root, "data/dalvik-cache", 0o771)?;
+            if let Some(plan) = ssal::guest_policy::runtime::load(root)? {
+                ssal::guest_policy::runtime::set_label(
+                    &root.join("data/dalvik-cache"),
+                    &plan.context("dalvikcache_data_file", false)?,
+                )?;
+            }
+            // The Guest shell cannot getattr the protected Zygote socket type.
+            let zygote_socket = root.join("dev/socket/zygote");
+            match fs::symlink_metadata(&zygote_socket) {
+                Ok(_) => return Err(io::Error::other("Guest Zygote socket already exists")),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+                Err(error) => return Err(error),
+            }
+            if fs::metadata(root.join("system/bin/app_process64"))?
+                .permissions()
+                .mode()
+                & 0o111
+                == 0
+            {
+                return Err(io::Error::other("Guest Zygote binary is not executable"));
+            }
             let binary = run(
                 root,
                 "/system/bin/sh",
                 &[
                     "-c",
-                    "set -eu; test -x /system/bin/app_process64; test -x /apex/com.android.sdkext/bin/derive_classpath; test ! -e /dev/socket/zygote; if test -e /run/ssal/property-service.json; then test -S /dev/socket/property_service; else test ! -e /dev/socket/property_service; fi; stat -c '%n %s %a %u %g' /system/bin/app_process64; sha256sum /system/bin/app_process64; getprop ro.product.cpu.abilist64; getprop ro.zygote.disable_gl_preload",
+                    "set -eu; stat -c '%n %s %a %u %g' /system/bin/app_process64; sha256sum /system/bin/app_process64; getprop ro.product.cpu.abilist64; getprop ro.zygote.disable_gl_preload",
                 ],
                 0,
             )?;
@@ -1684,33 +1951,24 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
                 return system_server_runtime_sid::run(root, &bin, &zygote_env);
             }
             println!(
-                "Guest Zygote launch socket=/dev/socket/zygote start_system_server=false private_binder={major}:{minor}"
+                "Guest Zygote launch socket=/dev/socket/zygote start_system_server={start_system_server} private_binder={major}:{minor}"
             );
+            let args = zygote_args(controlled_fork, start_system_server);
             let mut zygote = Service::start(
                 root,
                 "/system/bin/app_process64",
-                &if controlled_fork {
-                    vec![
-                        "-Xzygote",
-                        "-XX:ForceJavaZygoteForkLoop=true",
-                        "/system/bin",
-                        "--zygote",
-                        "--socket-name=zygote",
-                    ]
-                } else {
-                    vec![
-                        "-Xzygote",
-                        "/system/bin",
-                        "--zygote",
-                        "--socket-name=zygote",
-                    ]
-                },
+                &args,
                 "guest-zygote",
                 0,
                 Some(GUEST_PROBE_CONTEXT),
                 &zygote_env,
             )?;
             zygote.wait_for_socket(&root.join("dev/socket/zygote"))?;
+            let system_server_pid = if start_system_server {
+                Some(wait_for_system_server(root, &mut zygote)?)
+            } else {
+                None
+            };
             let pid = zygote.child.id();
             let guest_root = fs::metadata(root)?;
             let process_root = fs::metadata(format!("/proc/{pid}/root"))?;
@@ -1883,13 +2141,26 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
             }
             crate::memory_cgroup::verify_guest_membership(pid)?;
             println!("Guest Zygote residence pid={pid} starttime={starttime} seconds=5 membership=verified");
+            if let Some(expected) = system_server_pid {
+                if wait_for_system_server(root, &mut zygote)? != expected {
+                    return Err(io::Error::other("Guest SystemServer identity changed"));
+                }
+                println!("PHASE7A_SYSTEM_SERVER=PASS framework_entry=true residence_seconds=5");
+            }
             if controlled_fork {
                 fork_probe::run(root, &mut zygote, true)?;
             }
             zygote.stop()?;
             fs::remove_file(root.join("dev/socket/zygote"))?;
             fs::remove_file(root.join("dev/socket/usap_pool_primary"))?;
-            println!("PHASE7A_ZYGOTE=PASS preload_complete=true socket_removed=true system_server=not_started");
+            println!(
+                "PHASE7A_ZYGOTE=PASS preload_complete=true socket_removed=true system_server={}",
+                if start_system_server {
+                    "started"
+                } else {
+                    "not_started"
+                }
+            );
         }
         if phase6a {
             println!("PHASE6A=START installd/artd through common launcher");
@@ -2182,6 +2453,38 @@ mod tests {
     }
 
     #[test]
+    fn system_server_requires_explicit_mapped_zygote_worker() {
+        use std::ffi::OsStr;
+        assert!(!system_server_requested(None, true, true).unwrap());
+        assert!(system_server_requested(Some(OsStr::new("1")), true, true).unwrap());
+        for (value, zygote, mapped) in [
+            ("0", true, true),
+            ("", true, true),
+            ("1", false, true),
+            ("1", true, false),
+        ] {
+            assert!(system_server_requested(Some(OsStr::new(value)), zygote, mapped).is_err());
+        }
+    }
+
+    #[test]
+    fn native_zygote_options_precede_java_socket_argument() {
+        let args = zygote_args(false, true);
+        assert_eq!(
+            args,
+            [
+                "-Xzygote",
+                "/system/bin",
+                "--zygote",
+                "--start-system-server",
+                "--socket-name=zygote"
+            ]
+        );
+        assert!(!zygote_args(false, false).contains(&"--start-system-server"));
+        assert!(zygote_args(true, false).contains(&"-XX:ForceJavaZygoteForkLoop=true"));
+    }
+
+    #[test]
     fn abi_query_requires_valid_response() -> io::Result<()> {
         for reply in [
             b"\0\0\0\x09arm64-v8a".as_slice(),
@@ -2210,7 +2513,7 @@ mod tests {
         unsafe {
             command.pre_exec(ssal::unix::cloexec_unexpected_fds);
         }
-        let sockets = zygote_sockets(&mut command, &root.join("dev/socket"))?;
+        let sockets = zygote_sockets(&mut command, &root.join("dev/socket"), None)?;
         let status = command.args(["-c", "test -S /proc/self/fd/$ANDROID_SOCKET_zygote && test -S /proc/self/fd/$ANDROID_SOCKET_usap_pool_primary && test \"$ANDROID_SOCKET_zygote\" != \"$ANDROID_SOCKET_usap_pool_primary\""]).status()?;
         assert!(status.success());
         assert!(root.join("dev/socket/zygote").exists());
@@ -2298,6 +2601,11 @@ mod tests {
             diagnostics: None,
             output: Vec::new(),
         };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while service.exit_status()?.is_none() {
+            assert!(Instant::now() < deadline, "fixture did not exit");
+            std::thread::sleep(Duration::from_millis(10));
+        }
         service.diagnostics = Some(crate::zygote_diagnostics::Diagnostics::attach(
             &mut service.child,
             &directory,
@@ -2317,6 +2625,53 @@ mod tests {
         let exit: serde_json::Value = serde_json::from_str(metadata.lines().last().unwrap())?;
         assert_eq!(exit["signal"], libc::SIGABRT);
         assert!(fs::read_to_string(directory.join("stderr.log"))?.contains("zygote fatal fixture"));
+        fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[test]
+    fn readiness_wait_drains_zygote_stderr_before_abi_reply() -> io::Result<()> {
+        let directory =
+            std::env::temp_dir().join(format!("ssal-readiness-drain-{}", std::process::id()));
+        crate::zygote_diagnostics::Diagnostics::prepare(&directory)?;
+        let log = directory.join("legacy.log");
+        File::create(&log)?;
+        let mut command = Command::new("/bin/sh");
+        command
+            .current_dir(&directory)
+            .args(["-c", "head -c 131072 /dev/zero >&2; touch ready; sleep 30"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        let mut service = Service {
+            child: command.spawn()?,
+            log,
+            stopped: false,
+            diagnostics: None,
+            output: Vec::new(),
+        };
+        service.diagnostics = Some(crate::zygote_diagnostics::Diagnostics::attach(
+            &mut service.child,
+            &directory,
+            &directory.join("missing-cgroup"),
+            crate::zygote_diagnostics::launch_time(),
+            Instant::now(),
+        )?);
+        let mut query = Command::new("/bin/sh");
+        query.current_dir(&directory).args(["-c", "i=0; while [ $i -lt 200 ]; do if [ -f ready ]; then echo abi-ready; exit 0; fi; i=$((i+1)); sleep 0.01; done; exit 1"]);
+        let output = service.readiness_output(query)?;
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"abi-ready\n");
+        drop(service);
+        assert_eq!(fs::metadata(directory.join("stderr.log"))?.len(), 131072);
         fs::remove_dir_all(directory)?;
         Ok(())
     }

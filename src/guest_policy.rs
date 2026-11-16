@@ -11,7 +11,7 @@ pub mod native;
 pub mod runtime;
 mod symbols;
 
-const VERSION: u32 = 12;
+const VERSION: u32 = 27;
 
 type Names = BTreeMap<String, String>;
 
@@ -156,6 +156,17 @@ impl Plan {
                 1,
                 1,
                 &[domain, "kernel", "security", "compute_av"],
+            );
+        }
+        if let Some(domain) = self.types.get("zygote") {
+            let rule = format!("allow {domain} kernel security {{ check_context }}");
+            self.rules.insert(rule.clone());
+            native::record(
+                &mut self.native_rules,
+                rule,
+                1,
+                1,
+                &[domain, "kernel", "security", "check_context"],
             );
         }
         Ok(())
@@ -1077,7 +1088,7 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
     }
     // The launcher directly executes the Guest linker for its private helper binaries.
     if let Some(linker) = plan.types.get("system_linker_exec") {
-        for domain in ["init", "shell"] {
+        for domain in ["init", "shell", "derive_classpath"] {
             if let Some(domain) = plan.types.get(domain) {
                 native::record(
                     &mut native_rules,
@@ -1091,13 +1102,17 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
             }
         }
     }
-    // exec opens the ELF as ksu; only these launcher clients receive its isolated stdio.
+    // Launcher stdio stays KSU-owned across exec and SystemServer specialization.
     for original in [
         "init",
         "shell",
+        "derive_classpath",
         "linkerconfig",
         "servicemanager",
         "aidl_lazy_test_server",
+        "zygote",
+        "system_server_startup",
+        "system_server",
     ] {
         if let Some(domain) = plan.types.get(original) {
             for (class, permission) in [("fd", "use"), ("fifo_file", "write")] {
@@ -1111,6 +1126,126 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
                 );
                 plan.rules.insert(rule);
             }
+        }
+    }
+    if let Some(domain) = plan.types.get("derive_classpath") {
+        let rule = format!("allow {domain} tmpfs lnk_file {{ read }}");
+        native::record(
+            &mut native_rules,
+            rule.clone(),
+            1,
+            1,
+            &[domain, "tmpfs", "lnk_file", "read"],
+        );
+        plan.rules.insert(rule);
+        // derive_classpath's glob walks are widened only by permissions observed at runtime.
+        for (target, permissions) in [
+            (Some("vendor_file".to_owned()), &["search"][..]),
+            (
+                plan.types.get("shell_data_file").cloned(),
+                &["search", "read"][..],
+            ),
+            (
+                plan.types.get("system_data_root_file").cloned(),
+                &["read"][..],
+            ),
+        ] {
+            if let Some(target) = target {
+                let rule = format!(
+                    "allow {domain} {target} dir {{ {} }}",
+                    permissions.join(" ")
+                );
+                for permission in permissions {
+                    native::record(
+                        &mut native_rules,
+                        rule.clone(),
+                        1,
+                        1,
+                        &[domain, &target, "dir", permission],
+                    );
+                }
+                plan.rules.insert(rule);
+            }
+        }
+        for (target, permissions) in [
+            (Some("vendor_file".to_owned()), &["read", "getattr"][..]),
+            (plan.types.get("shell_data_file").cloned(), &["getattr"][..]),
+            (Some("tmpfs".to_owned()), &["read"][..]),
+        ] {
+            if let Some(target) = target {
+                let rule = format!(
+                    "allow {domain} {target} dir {{ {} }}",
+                    permissions.join(" ")
+                );
+                for permission in permissions {
+                    native::record(
+                        &mut native_rules,
+                        rule.clone(),
+                        1,
+                        1,
+                        &[domain, &target, "dir", permission],
+                    );
+                }
+                plan.rules.insert(rule);
+            }
+        }
+        for (target, permissions) in [
+            (Some("tmpfs".to_owned()), &["open"][..]),
+            (plan.types.get("shell_data_file").cloned(), &["write"][..]),
+            (
+                plan.types.get("shell_data_file").cloned(),
+                &["add_name", "remove_name"][..],
+            ),
+        ] {
+            if let Some(target) = target {
+                let rule = format!(
+                    "allow {domain} {target} dir {{ {} }}",
+                    permissions.join(" ")
+                );
+                for permission in permissions {
+                    native::record(
+                        &mut native_rules,
+                        rule.clone(),
+                        1,
+                        1,
+                        &[domain, &target, "dir", permission],
+                    );
+                }
+                plan.rules.insert(rule);
+            }
+        }
+        if let Some(target) = plan.types.get("shell_data_file") {
+            // /data exports are committed by renaming the successfully written .tmp file.
+            let rule = format!("allow {domain} {target} file {{ create open write rename }}");
+            for permission in ["create", "open", "write", "rename"] {
+                native::record(
+                    &mut native_rules,
+                    rule.clone(),
+                    1,
+                    1,
+                    &[domain, target, "file", permission],
+                );
+            }
+            plan.rules.insert(rule);
+        }
+    }
+    // The launcher's shell client exchanges Binder objects with the test server and its callback.
+    if let (Some(shell), Some(server)) = (
+        plan.types.get("shell"),
+        plan.types.get("aidl_lazy_test_server"),
+    ) {
+        for (source, target) in [(shell, server), (server, shell)] {
+            let rule = format!("allow {source} {target} binder {{ call transfer }}");
+            for permission in ["call", "transfer"] {
+                native::record(
+                    &mut native_rules,
+                    rule.clone(),
+                    1,
+                    1,
+                    &[source, target, "binder", permission],
+                );
+            }
+            plan.rules.insert(rule);
         }
     }
     // Property files are created under the directory type, then receive their final Guest label.
@@ -1138,6 +1273,38 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
                 1,
                 &[device, device, "filesystem", "associate"],
             );
+        }
+    }
+    // memfd uses the shared kernel tmpfs SID, outside the relabeled Guest mounts.
+    if let Some(tmpfs) = plan.types.get("tmpfs") {
+        let transitions: Vec<_> = native_rules
+            .values()
+            .flatten()
+            .filter(|command| {
+                command.cmd == 7 && command.args[1] == *tmpfs && command.args[2] == "file"
+            })
+            .cloned()
+            .collect();
+        for command in transitions {
+            let args = &command.args;
+            let rule = format!(
+                "type_transition {} tmpfs file {}{}",
+                args[0],
+                args[3],
+                if args[4].is_empty() {
+                    String::new()
+                } else {
+                    format!(" {}", args[4])
+                }
+            );
+            native::record(
+                &mut native_rules,
+                rule.clone(),
+                7,
+                0,
+                &[&args[0], "tmpfs", "file", &args[3], &args[4]],
+            );
+            plan.rules.insert(rule);
         }
     }
     plan.native_rules = native_rules;
@@ -1207,6 +1374,49 @@ pub fn prepare(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn classpath_exports_can_commit_temp_file_with_guest_only_permissions() -> io::Result<()> {
+        let plan = generate(
+            "p0001",
+            &BTreeMap::from([(
+                "policy.cil".into(),
+                "(type derive_classpath) (type shell_data_file)".into(),
+            )]),
+        )?;
+        for (class, permissions) in [
+            ("dir", &["add_name", "remove_name"][..]),
+            ("file", &["create", "open", "write", "rename"][..]),
+        ] {
+            let rule = format!(
+                "allow ssal_p0001_derive_classpath ssal_p0001_shell_data_file {class} {{ {} }}",
+                permissions.join(" ")
+            );
+            assert!(plan.rules.contains(&rule));
+            let commands = &plan.native_rules[&rule];
+            assert_eq!(commands.len(), permissions.len());
+            for permission in permissions {
+                assert!(commands.iter().any(|command| command.args
+                    == [
+                        "ssal_p0001_derive_classpath",
+                        "ssal_p0001_shell_data_file",
+                        class,
+                        permission
+                    ]));
+            }
+            assert_eq!(
+                native::encode(&plan, &[rule])?
+                    .iter()
+                    .map(|b| b.commands)
+                    .sum::<usize>(),
+                permissions.len()
+            );
+        }
+        assert!(!plan
+            .rules
+            .iter()
+            .any(|rule| rule.starts_with("allow derive_classpath ")));
+        Ok(())
+    }
     #[test]
     fn live_kernel_av_access_is_guest_only_and_idempotent() -> io::Result<()> {
         let mut plan = generate(
@@ -1296,12 +1506,40 @@ mod tests {
         ])
     }
     #[test]
+    fn launcher_aidl_calls_only_extend_guest_peers() -> io::Result<()> {
+        let mut inputs = fixture();
+        inputs
+            .get_mut("system/etc/selinux/plat_sepolicy.cil")
+            .unwrap()
+            .push_str(" (type shell) (type aidl_lazy_test_server)");
+        let plan = generate("p0001", &inputs)?;
+        for (source, target) in [
+            ("shell", "aidl_lazy_test_server"),
+            ("aidl_lazy_test_server", "shell"),
+        ] {
+            let rule =
+                format!("allow ssal_p0001_{source} ssal_p0001_{target} binder {{ call transfer }}");
+            assert!(plan.rules.contains(&rule));
+            assert_eq!(
+                native::encode(&plan, &[rule])?
+                    .iter()
+                    .map(|b| b.commands)
+                    .sum::<usize>(),
+                2
+            );
+        }
+        assert!(!plan.rules.iter().any(
+            |r| r.starts_with("allow shell ") || r.starts_with("allow aidl_lazy_test_server ")
+        ));
+        Ok(())
+    }
+    #[test]
     fn launcher_fd_permissions_only_extend_guest_helper_clients() -> io::Result<()> {
         let mut inputs = fixture();
         inputs
             .get_mut("system/etc/selinux/plat_sepolicy.cil")
             .unwrap()
-            .push_str(" (type init) (type shell) (type linkerconfig) (type servicemanager) (type aidl_lazy_test_server) (type properties_device)");
+            .push_str(" (type init) (type shell) (type derive_classpath) (type linkerconfig) (type servicemanager) (type aidl_lazy_test_server) (type properties_device) (type system_server_startup)");
         let plan = generate("p0001", &inputs)?;
         let rules: Vec<_> = plan
             .rules
@@ -1309,16 +1547,20 @@ mod tests {
             .filter(|r| r.contains(" ksu "))
             .cloned()
             .collect();
-        assert_eq!(rules.len(), 10);
+        assert_eq!(rules.len(), 18);
         let relabel = "allow ssal_p0001_init ssal_p0001_properties_device file { relabelfrom }";
         assert!(plan.rules.contains(relabel));
         assert!(plan.native_rules.contains_key(relabel));
         for source in [
             "init",
             "shell",
+            "derive_classpath",
             "linkerconfig",
             "servicemanager",
             "aidl_lazy_test_server",
+            "zygote",
+            "system_server_startup",
+            "system_server",
         ] {
             for (class, permission) in [("fd", "use"), ("fifo_file", "write")] {
                 let rule = format!("allow ssal_p0001_{source} ksu {class} {{ {permission} }}");
@@ -1332,6 +1574,35 @@ mod tests {
                 );
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_tmpfs_transitions_keep_guest_sources_and_outputs() -> io::Result<()> {
+        let mut inputs = fixture();
+        inputs.get_mut("system/etc/selinux/plat_sepolicy.cil").unwrap().push_str(
+            " (type tmpfs) (type zygote_tmpfs) (type system_server_tmpfs) (typetransition zygote tmpfs file zygote_tmpfs) (typetransition system_server tmpfs file system_server_tmpfs)");
+        let plan = generate("p0001", &inputs)?;
+        for domain in ["zygote", "system_server"] {
+            for target in ["tmpfs", "ssal_p0001_tmpfs"] {
+                let rule = format!(
+                    "type_transition ssal_p0001_{domain} {target} file ssal_p0001_{domain}_tmpfs"
+                );
+                assert!(plan.rules.contains(&rule));
+                assert_eq!(
+                    native::encode(&plan, &[rule])?
+                        .iter()
+                        .map(|batch| batch.commands)
+                        .sum::<usize>(),
+                    1
+                );
+            }
+        }
+        assert!(!plan
+            .rules
+            .iter()
+            .any(|rule| rule.starts_with("type_transition zygote ")
+                || rule.starts_with("type_transition system_server ")));
         Ok(())
     }
     #[test]
@@ -1627,13 +1898,19 @@ mod tests {
                 .iter()
                 .all(|b| b.payload.len() <= native::BATCH_BYTES));
             assert_eq!(plan.types.len(), 2040);
-            assert_eq!(plan.rules.len(), 49817);
+            println!(
+                "native batches={} commands={} bytes={}",
+                batches.len(),
+                batches.iter().map(|b| b.commands).sum::<usize>(),
+                batches.iter().map(|b| b.payload.len()).sum::<usize>()
+            );
+            assert_eq!(plan.rules.len(), 49895);
             assert_eq!(
                 plan.rules
                     .iter()
                     .filter(|r| r.starts_with("type_transition "))
                     .count(),
-                347
+                407
             );
             assert_eq!(
                 plan.rules
@@ -1643,12 +1920,11 @@ mod tests {
                     .count(),
                 51
             );
-            assert_eq!(batches.iter().map(|b| b.commands).sum::<usize>(), 133809);
+            assert_eq!(batches.iter().map(|b| b.commands).sum::<usize>(), 133895);
             assert_eq!(
                 batches.iter().map(|b| b.payload.len()).sum::<usize>(),
-                11259969
+                11267592
             );
-            println!("native batches={} commands=133809 bytes=11259969 transitions=347 special_transitions=51", batches.len());
         }
         for original in [
             "zygote",
