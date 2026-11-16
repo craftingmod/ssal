@@ -268,6 +268,61 @@ fn prepare_guest_dev(mounts: &mut Mounts, root: &Path) -> io::Result<()> {
     Ok(())
 }
 
+fn ashmem_device_name(boot_id: &str) -> io::Result<String> {
+    let id = boot_id.trim();
+    if id.len() != 36
+        || !id.bytes().enumerate().all(|(i, c)| {
+            if [8, 13, 18, 23].contains(&i) {
+                c == b'-'
+            } else {
+                c.is_ascii_hexdigit()
+            }
+        })
+    {
+        return Err(io::Error::other("invalid kernel boot ID for Guest ashmem"));
+    }
+    Ok(format!("ashmem{id}"))
+}
+
+fn prepare_guest_ashmem(root: &Path, plan: &ssal::guest_policy::Plan) -> io::Result<()> {
+    let name = ashmem_device_name(&fs::read_to_string("/proc/sys/kernel/random/boot_id")?)?;
+    let host = fs::symlink_metadata(Path::new("/dev").join(&name))?;
+    let legacy = fs::symlink_metadata("/dev/ashmem")?;
+    if !host.file_type().is_char_device()
+        || !legacy.file_type().is_char_device()
+        || host.rdev() == 0
+        || host.rdev() != legacy.rdev()
+        || (host.uid(), host.gid(), host.mode() & 0o7777) != (0, 0, 0o666)
+    {
+        return Err(io::Error::other(
+            "unsafe Host ashmem device identity or permissions",
+        ));
+    }
+    let target = root.join("dev").join(&name);
+    // A private inode allows Guest labeling without relabeling either Host ashmem node.
+    if unsafe { libc::mknod(cpath(&target)?.as_ptr(), libc::S_IFCHR | 0o666, host.rdev()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o666))?;
+    let context = plan.context("ashmem_libcutils_device", false)?;
+    ssal::guest_policy::runtime::set_label(&target, &context)?;
+    let guest = fs::symlink_metadata(&target)?;
+    if !guest.file_type().is_char_device()
+        || guest.rdev() != host.rdev()
+        || (guest.dev(), guest.ino()) == (host.dev(), host.ino())
+        || (guest.uid(), guest.gid(), guest.mode() & 0o7777) != (0, 0, 0o666)
+    {
+        return Err(io::Error::other(
+            "Guest ashmem identity or permissions mismatch",
+        ));
+    }
+    println!(
+        "Guest /dev/{name}: private ashmem node label={context} rdev={}",
+        guest.rdev()
+    );
+    Ok(())
+}
+
 fn compose_system(mounts: &mut Mounts, system: &Path, root: &Path) -> io::Result<()> {
     if !fs::symlink_metadata(system.join("system")).is_ok_and(|meta| meta.is_dir()) {
         let target = directory(root, "system", 0o755)?;
@@ -1235,6 +1290,9 @@ pub fn verify(
         }
         prepare_guest_dev(&mut mounts, &root)?;
         if let Some(plan) = &policy {
+            if mapped_launch {
+                prepare_guest_ashmem(&root, plan)?;
+            }
             let socket = root.join("dev/socket");
             let expected = plan.context("socket_device", false)?;
             ssal::guest_policy::runtime::set_label(&socket, &expected)
@@ -1798,6 +1856,22 @@ mod tests {
         );
         fs::remove_dir_all(root)?;
         Ok(())
+    }
+
+    #[test]
+    fn ashmem_path_uses_only_kernel_boot_id() {
+        assert_eq!(
+            ashmem_device_name("187ab5ca-c953-4032-b5fb-38875175d198\n").unwrap(),
+            "ashmem187ab5ca-c953-4032-b5fb-38875175d198"
+        );
+        for invalid in [
+            "",
+            "../ashmem",
+            "187ab5ca/c953-4032-b5fb-38875175d198",
+            "z87ab5ca-c953-4032-b5fb-38875175d198",
+        ] {
+            assert!(ashmem_device_name(invalid).is_err());
+        }
     }
 
     #[test]

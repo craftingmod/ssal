@@ -309,3 +309,15 @@ mount/loop reference checks; no `.userdata-*.img*` remains in the y702 profile.
 The disabled attempt111 trace instance and accidental local payload duplicate
 were removed. Original userdata size/mtime/inode and all evidence are preserved.
 Record: `out/guest-first-boot-20261116/cleanup-phase7b-111.txt`.
+
+## Ashmem fix — attempt113 (2026-11-17)
+
+The missing boot-ID ashmem device is fixed with a private Guest node using the
+existing mapped SELinux type. A no-boot diagnostic first confirmed ENOENT,
+memfd/sealing support and missing ashmem-on-memfd ioctl compatibility; the same
+diagnostic then passed create, mmap, fork sharing and protection checks.
+Attempt113 passes Framework entry, SystemServer/Zygote five-second residence,
+service readiness and teardown, with Host state and active policy hash unchanged.
+Full boot remains unverified. See
+[the ashmem investigation report](guest-ashmem-compatibility-20261117.md) for
+source conditions, evidence, changes and remaining limits.

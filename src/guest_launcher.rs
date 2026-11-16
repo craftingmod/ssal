@@ -1569,6 +1569,10 @@ pub(crate) fn verify(
         "ssal-zygote-diag.so",
         "ssal-property-service",
     ];
+    let ashmem_probe = std::env::var_os("SSAL_ASHMEM_PROBE").is_some();
+    if ashmem_probe {
+        runtime_bins.push("ssal-ashmem-probe");
+    }
     if start_system_server {
         runtime_bins.push("ssal-zygote-fd-reopen.so");
     }
@@ -1688,6 +1692,16 @@ echo SSAL_PROPERTY_BIONIC=PASS
             if !property_output.contains(expected_marker) {
                 return Err(io::Error::other("Guest Bionic property evidence missing"));
             }
+        }
+        if ashmem_probe {
+            let output = run(
+                root,
+                "/system/bin/bootstrap/linker64",
+                &["/run/ssal/ssal-ashmem-probe"],
+                1000,
+            )?;
+            println!("Guest ashmem diagnostic (no Zygote/SystemServer launched):\n{output}");
+            return Ok(());
         }
         let (major, minor, _) = binder.provision(root)?;
         let device = binder.private_device()?;
