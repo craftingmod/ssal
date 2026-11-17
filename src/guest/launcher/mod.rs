@@ -48,22 +48,7 @@ fn mapped_exec_domain(executable: &str, exec_context: Option<&[u8]>) -> &'static
     }
 }
 
-fn join_cgroups(groups: &[std::path::PathBuf]) -> io::Result<()> {
-    let pid = std::process::id().to_string();
-    for group in groups {
-        fs::write(group.join("cgroup.procs"), &pid)?;
-    }
-    for group in groups {
-        let members = fs::read_to_string(group.join("cgroup.procs"))?;
-        if !members.split_whitespace().any(|member| member == pid) {
-            return Err(io::Error::other(format!(
-                "Guest pre-exec membership missing: pid={pid} group={}",
-                group.display()
-            )));
-        }
-    }
-    Ok(())
-}
+use ssal::platform::process::join_cgroups;
 
 pub(crate) fn command(
     root: &Path,

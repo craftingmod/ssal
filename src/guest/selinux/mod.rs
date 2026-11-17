@@ -11,7 +11,7 @@ pub mod native;
 pub mod runtime;
 mod symbols;
 
-const VERSION: u32 = 29;
+const VERSION: u32 = 31;
 
 type Names = BTreeMap<String, String>;
 
@@ -1102,6 +1102,30 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
             }
         }
     }
+    // Rust's Guest property worker creates its own exec-error pipe before spawning services.
+    if let Some(init) = plan.types.get("init") {
+        let rule = format!("allow {init} {init} fifo_file {{ create }}");
+        native::record(
+            &mut native_rules,
+            rule.clone(),
+            1,
+            1,
+            &[init, init, "fifo_file", "create"],
+        );
+        plan.rules.insert(rule);
+        if let Some(shell) = plan.types.get("shell") {
+            // Guest system mounts remain nosuid; permit only the explicit Guest mock domain transition.
+            let rule = format!("allow {init} {shell} process2 {{ nosuid_transition }}");
+            native::record(
+                &mut native_rules,
+                rule.clone(),
+                1,
+                1,
+                &[init, shell, "process2", "nosuid_transition"],
+            );
+            plan.rules.insert(rule);
+        }
+    }
     // Launcher stdio stays KSU-owned across exec and SystemServer specialization.
     if let Some(shell) = plan.types.get("shell") {
         // mksh queries inherited stdin pipes before reading beyond the first line.
@@ -1600,6 +1624,47 @@ mod tests {
                 );
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn guest_property_spawn_pipe_permission_is_guest_only() -> io::Result<()> {
+        let plan = generate(
+            "p0001",
+            &BTreeMap::from([(
+                "policy.cil".into(),
+                "(type init) (type shell) (type unrelated)".into(),
+            )]),
+        )?;
+        let rule = "allow ssal_p0001_init ssal_p0001_init fifo_file { create }";
+        assert!(plan.rules.contains(rule));
+        assert_eq!(plan.native_rules[rule].len(), 1);
+        assert_eq!(
+            plan.native_rules[rule][0].args,
+            ["ssal_p0001_init", "ssal_p0001_init", "fifo_file", "create"]
+        );
+        assert!(!plan
+            .rules
+            .iter()
+            .any(|rule| rule.starts_with("allow init ")));
+        let transition = "allow ssal_p0001_init ssal_p0001_shell process2 { nosuid_transition }";
+        assert!(plan.rules.contains(transition));
+        assert_eq!(
+            plan.native_rules[transition][0].args,
+            [
+                "ssal_p0001_init",
+                "ssal_p0001_shell",
+                "process2",
+                "nosuid_transition"
+            ]
+        );
+        assert_eq!(
+            plan.rules
+                .iter()
+                .filter(|rule| rule.contains("nosuid_transition"))
+                .count(),
+            1
+        );
         Ok(())
     }
 

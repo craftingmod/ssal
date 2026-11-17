@@ -139,6 +139,9 @@ fn response(stream: &mut UnixStream, command: u32, status: i32) {
 
 fn rejection_code(name: &str, error: &io::Error) -> i32 {
     use rsproperties::wire::*;
+    if name.starts_with("ctl.") && validate_property_name(name).is_ok() {
+        return PROP_ERROR_HANDLE_CONTROL_MESSAGE;
+    }
     match error.kind() {
         io::ErrorKind::InvalidInput if validate_property_name(name).is_err() => {
             PROP_ERROR_INVALID_NAME
@@ -154,8 +157,8 @@ fn rejection_code(name: &str, error: &io::Error) -> i32 {
 pub(super) fn handle(
     stream: &mut UnixStream,
     properties: &mut Properties,
-    authorize: impl FnOnce(&UnixStream, &str) -> io::Result<PeerCredentials>,
-    control_handler: impl FnOnce(&str, &str, PeerCredentials) -> bool,
+    mut authorize: impl FnMut(&UnixStream, &str, bool) -> io::Result<PeerCredentials>,
+    control_handler: impl FnOnce(&str, &str, PeerCredentials, &mut Properties) -> io::Result<bool>,
     powerctl_handler: impl FnOnce(&str, PeerCredentials) -> bool,
 ) -> io::Result<()> {
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
@@ -181,22 +184,24 @@ pub(super) fn handle(
             return Ok(());
         }
     };
-    let credentials =
-        match properties.check_write(&name, &value, |target| authorize(stream, target)) {
-            Ok(credentials) => credentials,
-            Err(error) => {
-                response(stream, command, rejection_code(&name, &error));
-                return Ok(());
-            }
-        };
+    let credentials = match properties.check_write(&name, &value, |target| {
+        authorize(stream, target, name.starts_with("ctl."))
+    }) {
+        Ok(credentials) => credentials,
+        Err(error) => {
+            response(stream, command, rejection_code(&name, &error));
+            return Ok(());
+        }
+    };
     if let Some(action) = name.strip_prefix("ctl.") {
-        let status = if control_handler(action, &value, credentials) {
+        let result = control_handler(action, &value, credentials, properties);
+        let status = if matches!(result, Ok(true)) {
             rsproperties::wire::PROP_SUCCESS
         } else {
             rsproperties::wire::PROP_ERROR_HANDLE_CONTROL_MESSAGE
         };
         response(stream, command, status);
-        return Ok(());
+        return result.map(|_| ());
     }
     if name == "sys.powerctl" {
         if !super::control::valid_powerctl(&value) {
@@ -303,7 +308,12 @@ fn label_socket(path: &Path, context: &str) -> io::Result<()> {
     )
 }
 
-pub(super) fn serve(properties: &mut Properties, session_owner_pid: i32) -> io::Result<()> {
+pub(super) fn serve(
+    properties: &mut Properties,
+    session_owner_pid: i32,
+    services: &mut super::services::Registry,
+) -> io::Result<()> {
+    let guest_sources = services.guest_sources();
     let path = Path::new(SOCKET);
     let system_path = Path::new(SYSTEM_SOCKET);
     // Fresh /dev/socket belongs to this session. Never replace a running/stale server's socket.
@@ -333,6 +343,7 @@ pub(super) fn serve(properties: &mut Properties, session_owner_pid: i32) -> io::
     let result: io::Result<()> = (|| {
         println!("{{\"event\":\"guest_property_service_ready\",\"persistent_file\":\"/data/property/persistent_properties\",\"sockets\":[\"property_service\",\"property_service_for_system\"]}}");
         loop {
+            services.tick(properties)?;
             let mut ready = [
                 libc::pollfd {
                     fd: listener.as_raw_fd(),
@@ -345,12 +356,16 @@ pub(super) fn serve(properties: &mut Properties, session_owner_pid: i32) -> io::
                     revents: 0,
                 },
             ];
-            if unsafe { libc::poll(ready.as_mut_ptr(), ready.len() as _, -1) } < 0 {
+            let polled = unsafe { libc::poll(ready.as_mut_ptr(), ready.len() as _, 100) };
+            if polled < 0 {
                 let error = io::Error::last_os_error();
                 if error.kind() == io::ErrorKind::Interrupted {
                     continue;
                 }
                 return Err(error);
+            }
+            if polled == 0 {
+                continue;
             }
             let system_ready = ready[1].revents & libc::POLLIN != 0;
             if ready
@@ -371,13 +386,19 @@ pub(super) fn serve(properties: &mut Properties, session_owner_pid: i32) -> io::
             handle(
                 &mut stream,
                 properties,
-                |stream, target| {
+                |stream, target, control| {
                     let (credentials, source) = peer(stream).map_err(|_| {
                         io::Error::new(
                             io::ErrorKind::PermissionDenied,
                             "property peer identity unavailable",
                         )
                     })?;
+                    if control && !guest_sources.contains(&source) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "control caller is not in this Guest policy",
+                        ));
+                    }
                     policy::check_access(&source, target).map_err(|e| {
                         eprintln!(
                             "Guest property denied: pid={} uid={} gid={} source={} target={}: {}",
@@ -390,7 +411,9 @@ pub(super) fn serve(properties: &mut Properties, session_owner_pid: i32) -> io::
                     })?;
                     Ok(credentials)
                 },
-                super::control::service,
+                |action, target, peer, properties| {
+                    services.dispatch(action, target, peer, properties)
+                },
                 |command, peer| super::control::powerctl(command, peer, session_owner_pid),
             )?;
         }
@@ -552,7 +575,7 @@ mod tests {
         let result = handle(
             &mut stream,
             properties,
-            |_, _| {
+            |_, _, _| {
                 if allowed {
                     Ok(PeerCredentials {
                         pid: 1,
@@ -563,7 +586,7 @@ mod tests {
                     Err(io::Error::new(io::ErrorKind::PermissionDenied, "denied"))
                 }
             },
-            |_, _, _| false,
+            |_, _, _, _| Ok(false),
             |_, _| true,
         );
         (result, read_u32(&mut client).unwrap())
@@ -669,14 +692,14 @@ mod tests {
         handle(
             &mut stream,
             &mut properties,
-            |_, _| {
+            |_, _, _| {
                 Ok(PeerCredentials {
                     pid: 1,
                     uid: 0,
                     gid: 0,
                 })
             },
-            |_, _, _| false,
+            |_, _, _, _| Ok(false),
             |_, _| false,
         )
         .unwrap();
@@ -717,12 +740,12 @@ mod tests {
             handle(
                 &mut stream,
                 &mut properties,
-                |_, _| Ok(peer),
-                |action, target, actual_peer| {
+                |_, _, _| Ok(peer),
+                |action, target, actual_peer, _| {
                     assert_eq!(actual_peer.pid, peer.pid);
                     assert_eq!((action, target), ("start", "zygote"));
                     service_called = true;
-                    true
+                    Ok(true)
                 },
                 |command, actual_peer| {
                     assert_eq!(actual_peer.pid, peer.pid);

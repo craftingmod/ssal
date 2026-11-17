@@ -10,15 +10,6 @@ pub(super) fn valid_powerctl(command: &str) -> bool {
     }
 }
 
-pub(super) fn service(action: &str, target: &str, peer: PeerCredentials) -> bool {
-    // shortcut: Guest init has no service table; add ctl routing when the supervisor owns one.
-    eprintln!(
-        "Guest ctl refused: action={action:?} target={target:?} pid={} uid={} gid={} (no Guest init service table)",
-        peer.pid, peer.uid, peer.gid
-    );
-    false
-}
-
 pub(super) fn powerctl(command: &str, peer: PeerCredentials, session_owner_pid: i32) -> bool {
     if !valid_powerctl(command) || unsafe { libc::getppid() } != session_owner_pid {
         eprintln!(

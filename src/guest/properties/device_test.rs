@@ -139,7 +139,7 @@ fn bionic_set_get_persist_restart() {
                     server::handle(
                         &mut stream,
                         &mut properties,
-                        |stream, _target| {
+                        |stream, _target, _control| {
                             let (credentials, context) = server::peer(stream)?;
                             assert!(!context.is_empty());
                             // shortcut: ABI test uses its real KSU peer but synthetic allow/deny; validate Guest MAC separately.
@@ -152,7 +152,7 @@ fn bionic_set_get_persist_restart() {
                                 ))
                             }
                         },
-                        control::service,
+                        |_, _, _, _| Ok(false),
                         |_, _| false,
                     )
                     .unwrap();

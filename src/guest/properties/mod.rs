@@ -4,6 +4,9 @@ mod device_test;
 mod persistent;
 mod policy;
 mod server;
+mod services;
+
+pub use services::ServiceDefinition;
 
 use rsproperties::{MatchKeyword, PropertyInfoEntry, SystemProperties};
 use serde::Deserialize;
@@ -37,6 +40,8 @@ pub struct Config {
     pub build_props: Vec<PathBuf>,
     #[serde(default)]
     pub selinux_types: BTreeMap<String, String>,
+    #[serde(default)]
+    pub services: Vec<ServiceDefinition>,
 }
 
 impl Config {
@@ -73,12 +78,28 @@ impl Properties {
         &self,
         name: &str,
         value: &str,
-        authorize: impl FnOnce(&str) -> io::Result<server::PeerCredentials>,
+        mut authorize: impl FnMut(&str) -> io::Result<server::PeerCredentials>,
     ) -> io::Result<server::PeerCredentials> {
         rsproperties::wire::validate_property_name(name)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         rsproperties::wire::validate_value_len(name, value)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        if let Some(action) = name.strip_prefix("ctl.") {
+            services::validate_control(action, value)?;
+            if matches!(action, "start" | "stop" | "restart") {
+                let legacy = self.policy.resolve(&format!("ctl.{value}")).0.to_owned();
+                if let Ok(peer) = authorize(&legacy) {
+                    return Ok(peer);
+                }
+            }
+            return authorize(self.policy.resolve(&format!("{name}${value}")).0);
+        }
+        if name.starts_with("init.svc.") {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Guest service state is owned by the control dispatcher",
+            ));
+        }
         let property_name = if let Some(actual) = name.strip_prefix("next_boot.") {
             if !actual.starts_with("persist.") {
                 return Err(io::Error::new(
@@ -98,7 +119,7 @@ impl Properties {
         }
         let (context, kind) = self.policy.resolve(property_name);
         let peer = authorize(context)?;
-        if !name.starts_with("ctl.") && !policy::check_type(kind, value) {
+        if !policy::check_type(kind, value) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "property type mismatch",
@@ -498,7 +519,9 @@ pub fn serve(config: Config) -> io::Result<()> {
     let mut properties = initialize(policy, seeds, store, Path::new(AREA), mapped_label)
         .map_err(|e| io::Error::new(e.kind(), format!("property area initialization: {e}")))?;
     properties.socket_context = config.context("property_socket", SOCKET_CONTEXT, false)?;
-    server::serve(&mut properties, config.session_owner_pid)
+    let mut services = services::Registry::new(config.services, &config.selinux_types)?;
+    services.publish(&mut properties)?;
+    server::serve(&mut properties, config.session_owner_pid, &mut services)
         .map_err(|e| io::Error::new(e.kind(), format!("property socket server: {e}")))
 }
 
@@ -651,6 +674,100 @@ mod tests {
     }
 
     #[test]
+    fn control_permissions_resolve_service_specific_legacy_and_action_targets() {
+        let root = temp_dir("ctl-permissions");
+        let mut properties = fixture(&root);
+        properties.policy.entries.extend([
+            PropertyInfoEntry::exact("ctl.mock", "legacy", "string").unwrap(),
+            PropertyInfoEntry::exact("ctl.start$mock", "start_mock", "string").unwrap(),
+        ]);
+        let mut targets = Vec::new();
+        properties
+            .check_write("ctl.start", "mock", |target| {
+                targets.push(target.to_owned());
+                if target == "start_mock" {
+                    Ok(test_peer())
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "denied SID",
+                    ))
+                }
+            })
+            .unwrap();
+        assert_eq!(targets, ["legacy", "start_mock"]);
+        targets.clear();
+        properties
+            .check_write("ctl.stop", "mock", |target| {
+                targets.push(target.to_owned());
+                Ok(test_peer())
+            })
+            .unwrap();
+        assert_eq!(targets, ["legacy"]);
+        assert!(properties
+            .check_write("ctl.start", "mock", |_| Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "unauthorized SID"
+            )))
+            .is_err());
+        assert!(properties
+            .check_write("init.svc.mock", "running", |_| panic!(
+                "state cannot be spoofed"
+            ))
+            .is_err());
+        drop(properties);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn interface_permissions_only_use_original_action_and_interface() {
+        let root = temp_dir("ctl-interface-permissions");
+        let mut properties = fixture(&root);
+        let interface = "aidl/dev.ssal.IMock/default";
+        properties.policy.entries.push(
+            PropertyInfoEntry::exact(&format!("ctl.{interface}"), "legacy", "string").unwrap(),
+        );
+        for action in ["start", "stop", "restart"] {
+            let property = format!("ctl.interface_{action}");
+            let context = format!("interface_{action}");
+            properties.policy.entries.push(
+                PropertyInfoEntry::exact(&format!("{property}${interface}"), &context, "string")
+                    .unwrap(),
+            );
+            let mut targets = Vec::new();
+            properties
+                .check_write(&property, interface, |target| {
+                    targets.push(target.to_owned());
+                    assert_eq!(target, context);
+                    Ok(test_peer())
+                })
+                .unwrap();
+            assert_eq!(targets, [context]);
+            let mut denied = Vec::new();
+            assert!(properties
+                .check_write(&property, interface, |target| {
+                    denied.push(target.to_owned());
+                    if target == "legacy" {
+                        Ok(test_peer())
+                    } else {
+                        Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "denied SID",
+                        ))
+                    }
+                })
+                .is_err());
+            assert_eq!(
+                denied.len(),
+                1,
+                "interface controls must not try legacy permission"
+            );
+        }
+        drop(properties);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn profile_contexts_do_not_fall_back_to_fixed_guest_types() {
         let mut config: Config = serde_json::from_value(serde_json::json!({
             "host_mount_namespace":"mnt:[1]", "host_property_identity":[1,1],
@@ -690,6 +807,7 @@ mod tests {
             property_contexts: vec![],
             build_props: vec![],
             selinux_types: BTreeMap::new(),
+            services: vec![],
         };
         assert!(check_isolation(&config).is_err());
     }
