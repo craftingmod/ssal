@@ -3,6 +3,7 @@ use crate::namespace_mounts::Mounts;
 use std::ffi::CString;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::process::Command;
 
 #[derive(Default, Serialize, Deserialize)]
@@ -673,9 +674,30 @@ pub fn isolate_tree(
     scratch: &Path,
 ) -> io::Result<()> {
     fs::create_dir(scratch)?;
-    for name in ["upper", "work"] {
-        fs::create_dir(scratch.join(name))?;
-    }
+    let lower = File::open(target)?;
+    let original = crate::unix::image_context(&lower)?;
+    let mut parts: Vec<_> = original.split(':').collect();
+    let mapped = context_type(&original)
+        .and_then(|t| plan.types.get(t))
+        .ok_or_else(|| {
+            invalid(format!(
+                "unmapped lower root label {}: {original}",
+                target.display()
+            ))
+        })?;
+    parts[2] = mapped;
+    create_upper_root(&lower, &scratch.join("upper"), |upper| {
+        let expected = parts.join(":");
+        set_label(upper, &expected)?;
+        let actual = crate::unix::image_context(&File::open(upper)?)?;
+        if actual != expected {
+            return Err(invalid(format!(
+                "upper label mismatch: expected {expected}, got {actual}"
+            )));
+        }
+        Ok(())
+    })?;
+    fs::create_dir(scratch.join("work"))?;
     if [target, scratch]
         .iter()
         .any(|p| p.as_os_str().as_bytes().iter().any(|b| b",:\\".contains(b)))
@@ -705,6 +727,48 @@ pub fn isolate_tree(
         })?;
     relabel_tree(target, plan)?;
     Ok(())
+}
+
+fn create_upper_root(
+    lower: &File,
+    upper: &Path,
+    label: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    let result = (|| {
+        let metadata = lower.metadata()?;
+        if !metadata.is_dir() {
+            return Err(invalid("lower root is not a directory"));
+        }
+        // Refuse existing uppers: their metadata and contents belong to an earlier session.
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(upper)
+            .map_err(|e| {
+                io::Error::new(e.kind(), format!("create new upper (reuse refused): {e}"))
+            })?;
+        let file = File::open(upper)?;
+        if unsafe { libc::fchown(file.as_raw_fd(), metadata.uid(), metadata.gid()) } != 0 {
+            return Err(io::Error::other(format!(
+                "chown: {}",
+                io::Error::last_os_error()
+            )));
+        }
+        // chown may clear special mode bits; restore the complete mode afterwards.
+        if unsafe { libc::fchmod(file.as_raw_fd(), metadata.mode() & 0o7777) } != 0 {
+            return Err(io::Error::other(format!(
+                "chmod: {}",
+                io::Error::last_os_error()
+            )));
+        }
+        label(upper).map_err(|e| io::Error::other(format!("setxattr security.selinux: {e}")))?;
+        Ok(())
+    })();
+    result.map_err(|e: io::Error| {
+        io::Error::new(
+            e.kind(),
+            format!("initialize Guest upper {}: {e}", upper.display()),
+        )
+    })
 }
 
 pub fn install(plan: &Plan, mounts: &mut Mounts, root: &Path) -> io::Result<()> {
@@ -879,6 +943,35 @@ pub fn load(root: &Path) -> io::Result<Option<Plan>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn upper_root_copies_metadata_and_refuses_reuse() -> io::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("ssal-upper-root-{}", std::process::id()));
+        fs::create_dir(&root)?;
+        let lower = root.join("lower");
+        fs::create_dir(&lower)?;
+        fs::set_permissions(&lower, fs::Permissions::from_mode(0o2751))?;
+        let lower = File::open(lower)?;
+        let upper = root.join("upper");
+        let expected = lower.metadata()?;
+        create_upper_root(&lower, &upper, |_| Ok(()))?;
+        let actual = fs::metadata(&upper)?;
+        assert_eq!(
+            (actual.uid(), actual.gid(), actual.mode() & 0o7777),
+            (expected.uid(), expected.gid(), expected.mode() & 0o7777)
+        );
+        let error =
+            create_upper_root(&lower, &upper, |_| panic!("existing upper relabeled")).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        let error = create_upper_root(&lower, &root.join("failed-label"), |_| {
+            Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP))
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("setxattr security.selinux"));
+        assert!(error.to_string().contains("failed-label"));
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
     #[test]
     fn special_transition_names_select_native() -> io::Result<()> {
         let plan = generate(
