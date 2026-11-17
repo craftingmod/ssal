@@ -37,7 +37,7 @@ Phase 2 기기 결과(2026-11-03)는 Guest `/data`가 `/data/local/ssal/guests/p
 
 ### 경로, FD 및 Host mount 노출
 
-`src/namespace_mounts.rs::guest_path`는 절대 symlink를 Guest root 안에서 해석하고, 입력 경로의 absolute/`.`/`..`, 누락된 symlink target 및 loop를 거부한다. `guest_data_probe::real_directory`는 userdata source의 각 구성요소를 symlink 없이 검사한다. 기존 unit tests는 이 경로 조건과 symlink escape를 다룬다. Phase 5A에서 새로운 adversarial Guest 경로/FD 검사는 하지 않았다.
+`src/platform/mount.rs::guest_path`는 절대 symlink를 Guest root 안에서 해석하고, 입력 경로의 absolute/`.`/`..`, 누락된 symlink target 및 loop를 거부한다. `guest_data_probe::real_directory`는 userdata source의 각 구성요소를 symlink 없이 검사한다. 기존 unit tests는 이 경로 조건과 symlink escape를 다룬다. Phase 5A에서 새로운 adversarial Guest 경로/FD 검사는 하지 않았다.
 
 기본 profile은 `/dev`를 Host `/dev`에서 recursive bind한다. `/dev/socket`, `/dev/block`은 Guest tmpfs로 가리고 `/mnt`, `/storage`, `/data_mirror`, `/apex`, `/linkerconfig`, `/run`도 Guest tmpfs로 시작한다. `/vendor`, `/odm`, `/vendor_dlkm`은 Host read-only bind다. 반면 `/sys/fs/cgroup` 및 `/sys/fs/bpf`는 Host 경로를 read-write bind한다. 따라서 mount namespace가 있다고 Host kernel resource가 모두 분리된 것은 아니다.
 
@@ -88,6 +88,6 @@ Guest와 Host는 동일 커널, UID namespace, SELinux policy를 사용한다. �
 
 ## 근거 문서 및 코드
 
-- Mount/data: [prepare.rs](../src/prepare.rs), [guest_mounts.rs](../src/guest_mounts.rs), [guest_data_probe.rs](../src/guest_data_probe.rs), [namespace_mounts.rs](../src/namespace_mounts.rs), [기존 Phase 2 data 결과](phase2-data-isolation.md), [기기 JSON](phase2-data-isolation-device-20261103.json)
+- Mount/data: [prepare.rs](../src/prepare.rs), [guest_mounts.rs](../src/guest_mounts.rs), [guest_data_probe.rs](../src/guest_data_probe.rs), [namespace_mounts.rs](../src/platform/mount.rs), [기존 Phase 2 data 결과](phase2-data-isolation.md), [기기 JSON](phase2-data-isolation-device-20261103.json)
 - Binder: [binder_probe.rs](../src/binder_probe.rs), [binder_wire.rs](../src/binder_wire.rs), [Phase 2 결과](rsbinder-phase2-results.md), [Phase 3 결과](rsbinder-phase3-results.md), [Phase 4 결과](rsbinder-phase4-results.md)
 - Property/Test B: [servicemanager-test-b-device-20261103.md](servicemanager-test-b-device-20261103.md), [Phase 2C 진단 JSON](rsbinder-phase2c-diagnostics-20261103.json)

@@ -8,7 +8,7 @@ vendor has huge codebase so don't read unless explicit request.
 
 ## Rule
 
-- Run WSL and WSLc commands outside the sandbox.
+- Run WSL and WSLc commands outside of the sandbox to build.
 - Prioritize incremental runtime validation and first boot over exhaustive preemptive hardening. Avoid blocking all progress on unverified risks.
 - Cleanup work sholud be run on Luna sub-agent.
 - Erase temp userdata img like `.userdata-*.img`
