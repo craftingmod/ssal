@@ -11,7 +11,7 @@ pub mod native;
 pub mod runtime;
 mod symbols;
 
-const VERSION: u32 = 27;
+const VERSION: u32 = 29;
 
 type Names = BTreeMap<String, String>;
 
@@ -1103,6 +1103,20 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
         }
     }
     // Launcher stdio stays KSU-owned across exec and SystemServer specialization.
+    if let Some(shell) = plan.types.get("shell") {
+        // mksh queries inherited stdin pipes before reading beyond the first line.
+        for permission in ["read", "getattr", "ioctl"] {
+            let rule = format!("allow {shell} ksu fifo_file {{ {permission} }}");
+            native::record(
+                &mut native_rules,
+                rule.clone(),
+                1,
+                1,
+                &[shell, "ksu", "fifo_file", permission],
+            );
+            plan.rules.insert(rule);
+        }
+    }
     for original in [
         "init",
         "shell",
@@ -1547,7 +1561,19 @@ mod tests {
             .filter(|r| r.contains(" ksu "))
             .cloned()
             .collect();
-        assert_eq!(rules.len(), 18);
+        assert_eq!(rules.len(), 21);
+        assert!(rules.contains(&"allow ssal_p0001_shell ksu fifo_file { read }".to_owned()));
+        for permission in ["getattr", "ioctl"] {
+            let rule = format!("allow ssal_p0001_shell ksu fifo_file {{ {permission} }}");
+            assert!(rules.contains(&rule));
+            assert_eq!(
+                native::encode(&plan, &[rule])?
+                    .iter()
+                    .map(|batch| batch.commands)
+                    .sum::<usize>(),
+                1
+            );
+        }
         let relabel = "allow ssal_p0001_init ssal_p0001_properties_device file { relabelfrom }";
         assert!(plan.rules.contains(relabel));
         assert!(plan.native_rules.contains_key(relabel));

@@ -30,7 +30,7 @@ pub(crate) fn enable_subreaper() -> io::Result<()> {
     Ok(())
 }
 
-pub(crate) fn cleanup_descendants() -> io::Result<()> {
+pub(crate) fn cleanup_descendants(require_guest_cgroup: bool) -> io::Result<()> {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     let self_pid = std::process::id();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -106,11 +106,15 @@ pub(crate) fn cleanup_descendants() -> io::Result<()> {
                 return Err(io::Error::last_os_error());
             }
             if unsafe { exited.si_pid() } != 0 {
-                println!("Guest descendant reaped pid={pid} pidfd=verified");
+                if require_guest_cgroup {
+                    println!("Guest descendant reaped pid={pid} pidfd=verified");
+                }
                 continue;
             }
-            let path = verify_guest_membership(pid as u32)?;
-            println!("Guest owned descendant pid={pid} membership={path} pidfd=verified");
+            if require_guest_cgroup {
+                let path = verify_guest_membership(pid as u32)?;
+                println!("Guest owned descendant pid={pid} membership={path} pidfd=verified");
+            }
             let rc = unsafe {
                 libc::syscall(
                     libc::SYS_pidfd_send_signal,

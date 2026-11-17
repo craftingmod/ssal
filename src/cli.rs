@@ -1,6 +1,16 @@
 use ssal::unix::{valid_image_name, Request, VERSION};
 
 const COMMANDS: &[(&str, &str, &str)] = &[
+    (
+        "shell",
+        "[PROFILE_NAME]",
+        "Open an independent Guest shell with a PTY",
+    ),
+    (
+        "exec",
+        "[PROFILE_NAME] -- COMMAND [ARG]...",
+        "Execute a command in the Guest environment",
+    ),
     ("status", "", "Show images, profiles and background jobs"),
     ("logs", "", "Show daemon logs"),
     (
@@ -73,6 +83,10 @@ const COMMANDS: &[(&str, &str, &str)] = &[
 ];
 
 pub enum Action {
+    Shell {
+        profile: Option<String>,
+        command: Vec<String>,
+    },
     Help(Option<String>),
     Version,
     Probe,
@@ -132,6 +146,33 @@ pub fn parse(args: &[String]) -> Result<Action, String> {
             format!("unknown command '{first}'")
         }
     })?;
+    if matches!(*command, "shell" | "exec") {
+        let tail = &args[1..];
+        if matches!(tail.first().map(String::as_str), Some("-h" | "--help")) {
+            return Ok(Action::Help(Some(first.clone())));
+        }
+        let separator = tail.iter().position(|arg| arg == "--");
+        let names = &tail[..separator.unwrap_or(tail.len())];
+        if names.len() > 1
+            || names
+                .first()
+                .is_some_and(|name| !valid_image_name(name) || name.starts_with('-'))
+        {
+            return Err(format!(
+                "{command}: expected at most one valid profile name"
+            ));
+        }
+        let words = separator
+            .map(|index| tail[index + 1..].to_vec())
+            .unwrap_or_default();
+        if (*command == "exec" && words.is_empty()) || (*command == "shell" && !words.is_empty()) {
+            return Err(format!("Usage: ssal {command} {usage}"));
+        }
+        return Ok(Action::Shell {
+            profile: names.first().cloned(),
+            command: words,
+        });
+    }
     // The probe has its own value-taking parser and execution safety checks.
     if *command == "probe" {
         return if matches!(args.get(1).map(String::as_str), Some("-h" | "--help")) {
@@ -213,6 +254,40 @@ mod tests {
     }
 
     #[test]
+    fn shell_and_exec_preserve_command_arguments() {
+        let Action::Shell { profile, command } = parse_words(&[
+            "exec",
+            "one",
+            "--",
+            "/system/bin/sh",
+            "-c",
+            "printf '%s' 'a b'",
+            "--help",
+        ])
+        .unwrap() else {
+            panic!()
+        };
+        assert_eq!(profile.as_deref(), Some("one"));
+        assert_eq!(
+            command,
+            ["/system/bin/sh", "-c", "printf '%s' 'a b'", "--help"]
+        );
+        assert!(matches!(
+            parse_words(&["shell"]),
+            Ok(Action::Shell { profile: None, .. })
+        ));
+        for args in [
+            vec!["exec"],
+            vec!["exec", "--"],
+            vec!["exec", "one", "id"],
+            vec!["shell", "../host"],
+            vec!["shell", "--", "id"],
+        ] {
+            assert!(parse_words(&args).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
     fn help_and_version_do_not_need_daemon() {
         for args in [
             vec!["--help"],
@@ -274,7 +349,10 @@ mod tests {
 
     #[test]
     fn existing_requests_and_internal_commands_are_preserved() {
-        for (command, _, _) in COMMANDS.iter().filter(|c| c.0 != "probe") {
+        for (command, _, _) in COMMANDS
+            .iter()
+            .filter(|c| !matches!(c.0, "probe" | "shell" | "exec"))
+        {
             let args = match *command {
                 "add" => vec![*command, "image", "/tmp/image.img"],
                 "create" | "switch" => vec![*command, "image"],

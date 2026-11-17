@@ -5,6 +5,8 @@ pub(crate) mod cgroup;
 #[cfg(unix)]
 pub(crate) mod compat;
 #[cfg(unix)]
+pub(crate) mod environment;
+#[cfg(unix)]
 pub(crate) mod init;
 #[cfg(unix)]
 pub(crate) mod launcher;
@@ -16,4 +18,6 @@ pub(crate) mod prepare;
 pub(crate) mod process;
 #[cfg(unix)]
 pub(crate) mod runtime;
+#[cfg(unix)]
+pub(crate) mod shell;
 pub(crate) mod userdata;

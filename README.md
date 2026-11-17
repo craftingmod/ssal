@@ -39,6 +39,25 @@ ssal doctor profile1 2>error.txt
 
 정상 결과와 도움말은 stdout으로, 입력 오류·파일 오류·연결 실패·데몬이 거부한 결과는 `ssal:` 접두사와 함께 stderr로 출력합니다. 종료 코드는 성공 `0`, 실행 실패 `1`, 일반 명령의 사용법 오류 `2`입니다. 기존에 실패 결과를 stdout에서 읽던 스크립트는 stderr를 읽거나 `2>&1`로 합쳐야 합니다. 인자 없이 실행하면 사용법 오류로 종료하며, 백그라운드 이미지 등록의 성공 코드는 작업 접수만 의미합니다. 완료 여부는 `ssal status`로 확인합니다.
 
+## 독립 Guest Shell
+
+root에서 `ssal shell [PROFILE_NAME]`은 대화형 PTY를, `ssal exec [PROFILE_NAME] -- COMMAND [ARG]...`는 단일 명령을 실행합니다. 프로필이 하나면 이름을 생략할 수 있습니다. 실행 파일 옆의 `ssald`, `ssal-property-service`, `ssal-context-map.so`를 사용하며 데몬 소켓이나 Android 부팅 완료를 요구하지 않습니다.
+
+```sh
+ssal shell y702
+ssal exec -- /system/bin/id
+ssal exec y702 -- /system/bin/sh -c 'getprop ro.build.version.sdk; exit 37'
+printf 'id\ngetprop ro.build.version.sdk\n' | ssal exec -- /system/bin/sh
+```
+
+기존 공용 환경이 준비돼 있으면 해당 mount/network namespace와 Property/APEX를 재사용합니다. Android worker가 환경을 준비하는 중이면 준비 완료 또는 실패 후 lock 해제까지 기다립니다. 사용할 환경이 없으면 기존 mount 준비 경로로 독립 환경을 만들고 `/system/bin/sh`를 실행합니다. 독립 Shell은 Binder, Zygote, SystemServer를 시작하지 않습니다. 준비 상세 로그는 `/data/local/ssal/logs/shell-PID.log`에 남습니다.
+
+Shell은 프로필별 mapped `shell` SID와 UID/GID 2000, 빈 supplementary groups 및 capability 집합을 사용합니다. exec는 입출력 파이프를 중계하므로 Host 파일 FD를 Guest에 상속하지 않습니다. PTY는 Guest 전용 devpts를 사용하며 창 크기 변경·Ctrl-C·작업 제어를 지원합니다. 명령의 종료 코드를 그대로 반환합니다.
+
+Android 서비스 종료·실패 시 열린 Shell의 lease가 해제될 때까지 공용 mount와 Property 서비스를 유지합니다. 마지막 Shell 종료 후 자식을 회수하고 기존 mount/loop 정리를 실행합니다. PID namespace 지원 커널은 별도 PID namespace를 사용합니다. `CONFIG_PID_NS`가 없는 순정 커널은 PID를 공유하며 SELinux, UID/GID, private proc mount와 FD 제한으로 격리합니다. 이 경우 `/proc`의 PID 번호까지 숨기는 보장은 없습니다. 강제 `SIGKILL`·전원 차단 뒤 scratch 디렉터리 회수는 일반 종료 정리와 별개입니다.
+
+로컬 PTY 회귀는 `python3 tests/shell_transport.py /build/target/debug/ssal`, 기기 회귀는 `scripts/test-guest-shell.sh`, Android 실패 시 수명 분리 검증은 `scripts/test-shell-android-lifecycle.sh`를 사용합니다. 수명 분리 검증 스크립트는 지정 프로필의 mapped SID를 가진 Guest 서비스에만 실패를 주입합니다.
+
 ## 빌드
 
 WSLc, Bun과 네트워크가 필요합니다. PowerShell에서 실행합니다.

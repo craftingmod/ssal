@@ -1,0 +1,466 @@
+//! Shared environment resources, independent of Android service lifetime.
+use crate::guest::init::Service;
+use ssal::namespace_mounts::Mounts;
+use std::fs::{self, File, OpenOptions};
+use std::io;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
+const PROPERTY_SERVICE_CONTEXT: &[u8] = b"u:r:ssal_property:s0\0";
+
+pub(crate) fn start_property_service(
+    mounts: &mut Mounts,
+    root: &Path,
+    bin: &Path,
+    host_mount_namespace: &Path,
+) -> io::Result<Service> {
+    // Reuse the established servicemanager view: libselinux rejects an RO root.
+    // All control endpoints stay RO; only existing AV/context query files are RW.
+    mounts.bind(
+        Path::new("/sys/fs/selinux"),
+        &root.join("sys/fs/selinux"),
+        false,
+        false,
+    )?;
+    for entry in fs::read_dir("/sys/fs/selinux")? {
+        let entry = entry?;
+        if ["access", "context", "create", "relabel", "member", "user"]
+            .contains(&entry.file_name().to_str().unwrap_or(""))
+        {
+            continue;
+        }
+        mounts.bind(
+            &entry.path(),
+            &root.join("sys/fs/selinux").join(entry.file_name()),
+            true,
+            entry.file_type()?.is_dir(),
+        )?;
+    }
+    let runtime = crate::guest::mount::directory(root, "run/ssal", 0o755)?;
+    let contexts = runtime.join("guest_property_contexts");
+    fs::write(
+        &contexts,
+        "persist.ssal_probe u:object_r:ssal_guest_property_area:s0 exact uint\n",
+    )?;
+    let overrides = runtime.join("guest_build.prop");
+    fs::write(
+        &overrides,
+        [
+            "servicemanager.ready=false",
+            // This worker starts only app_process64; ZygoteInit otherwise waits 60s for a secondary.
+            "ro.product.cpu.abilist=arm64-v8a",
+            "ro.product.cpu.abilist64=arm64-v8a",
+            "ro.product.cpu.abilist32=",
+            "ro.zygote=zygote64",
+            "ro.build.version.codename=REL",
+            "dalvik.vm.dex2oat64.enabled=true",
+            "ro.zygote.disable_gl_preload=1",
+        ]
+        .join("\n")
+            + "\n",
+    )?;
+    if !root.join("system/build.prop").is_file() {
+        return Err(io::Error::other("Guest /system/build.prop missing"));
+    }
+    let identity = |path: &Path| -> io::Result<[u64; 2]> {
+        let metadata = fs::metadata(path)?;
+        Ok([metadata.dev(), metadata.ino()])
+    };
+    let host_property_identity = identity(Path::new("/dev/__properties__"))?;
+    let host_socket_identity = identity(Path::new("/dev/socket"))?;
+    let host_data_identity = identity(Path::new("/data"))?;
+    let host_persistent_identity = identity(Path::new("/data/property"))?;
+    let mut config = serde_json::json!({
+        "host_mount_namespace": host_mount_namespace.display().to_string(),
+        "host_property_identity": host_property_identity,
+        "host_socket_identity": host_socket_identity,
+        "host_data_identity": host_data_identity,
+        "host_persistent_identity": host_persistent_identity,
+        "property_contexts": ["/run/ssal/guest_property_contexts"],
+        "build_props": ["/system/build.prop", "/run/ssal/guest_build.prop"],
+    });
+    let plan = ssal::guest_policy::runtime::load(root)?;
+    if let Some(plan) = &plan {
+        let mut paths = Vec::new();
+        for (path, text) in &plan.contexts {
+            if path.ends_with("property_contexts") {
+                let name = format!("mapped_{}", path.replace('/', "_"));
+                fs::write(runtime.join(&name), text)?;
+                paths.push(format!("/run/ssal/{name}"));
+            }
+        }
+        config["property_contexts"] = serde_json::to_value(paths)?;
+        config["selinux_types"] = serde_json::to_value(&plan.types)?;
+    }
+    fs::write(
+        runtime.join("property-service.json"),
+        serde_json::to_vec(&config).map_err(io::Error::other)?,
+    )?;
+
+    let property_dir = crate::guest::mount::directory(root, "data/property", 0o700)?;
+    let metadata = fs::metadata(&property_dir)?;
+    if metadata.uid() != 0 || metadata.mode() & 0o077 != 0 {
+        return Err(io::Error::other(
+            "Guest /data/property must be root-owned mode 0700",
+        ));
+    }
+    let area = crate::guest::mount::directory(root, "dev/__properties__", 0o755)?;
+    if fs::read_dir(&area)?.next().is_some() {
+        return Err(io::Error::other("Guest property area is not fresh"));
+    }
+    let executable = runtime.join("property-service");
+    File::create(&executable)?;
+    ssal::guest_policy::runtime::bind_file(
+        mounts,
+        root,
+        &bin.join("ssal-property-service"),
+        &executable,
+    )?;
+    let log = runtime.join("guest-property-service.log");
+    File::create(&log)?;
+    let mut command = crate::guest::launcher::command(
+        root,
+        "/system/bin/bootstrap/linker64",
+        0,
+        Some(PROPERTY_SERVICE_CONTEXT),
+    )?;
+    command
+        .args([
+            "/run/ssal/property-service",
+            "--config",
+            "/run/ssal/property-service.json",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    if plan.is_some() {
+        command.env("LD_PRELOAD", "/run/ssal/ssal-context-map.so");
+    }
+    let mut service = Service::from_child(command.spawn()?, log);
+    service.output.push(crate::diagnostics::zygote::Stream::new(
+        service.child.stdout.take().unwrap(),
+        File::options().append(true).open(&service.log)?,
+    )?);
+    service.output.push(crate::diagnostics::zygote::Stream::new(
+        service.child.stderr.take().unwrap(),
+        File::options().append(true).open(&service.log)?,
+    )?);
+    service.wait_text("guest_property_service_ready")?;
+    let process_context = fs::read_to_string(format!("/proc/{}/attr/current", service.child.id()))?;
+    let expected = plan
+        .as_ref()
+        .map(|p| p.context("init", true))
+        .transpose()?
+        .unwrap_or_else(|| "u:r:ssal_property:s0".into());
+    if process_context.trim_matches('\0').trim() != expected {
+        return Err(io::Error::other(format!(
+            "Guest property service SID mismatch: {process_context:?}"
+        )));
+    }
+    for (guest, host, name) in [
+        (identity(&area)?, host_property_identity, "property area"),
+        (
+            identity(&root.join("dev/socket"))?,
+            host_socket_identity,
+            "socket directory",
+        ),
+        (
+            identity(&root.join("data"))?,
+            host_data_identity,
+            "userdata",
+        ),
+        (
+            identity(&property_dir)?,
+            host_persistent_identity,
+            "persistent directory",
+        ),
+    ] {
+        if guest == host {
+            return Err(io::Error::other(format!("Host {name} selected")));
+        }
+    }
+    let guest_socket_path = root.join("dev/socket/property_service");
+    let guest_socket = identity(&guest_socket_path)?;
+    if !fs::symlink_metadata(&guest_socket_path)?
+        .file_type()
+        .is_socket()
+    {
+        return Err(io::Error::other(
+            "Guest property-service endpoint is not a Unix socket",
+        ));
+    }
+    println!("Guest property socket type=unix");
+    let socket_entries = fs::read_dir(root.join("dev/socket"))?
+        .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
+        .collect::<io::Result<Vec<_>>>()?;
+    if socket_entries.len() != 1 || socket_entries[0] != "property_service" {
+        return Err(io::Error::other(format!(
+            "unexpected Guest /dev/socket entries: {socket_entries:?}"
+        )));
+    }
+    println!("Guest property socket isolation=PASS");
+    if guest_socket == identity(Path::new("/dev/socket/property_service"))? {
+        return Err(io::Error::other("Host property socket selected"));
+    }
+    println!(
+        "PHASE7I_PROPERTY_SERVICE=PASS pid={} sid={expected} host_area={host_property_identity:?} guest_area={:?} host_data={host_data_identity:?} guest_data={:?}",
+        service.child.id(),
+        identity(&area)?,
+        identity(&root.join("data"))?
+    );
+    Ok(service)
+}
+
+pub(crate) fn managed(mode: &str) -> bool {
+    matches!(
+        mode,
+        "--shell-worker"
+            | "--guest-child-worker"
+            | "--guest-service-worker"
+            | "--guest-services-6a-worker"
+            | "--guest-services-6b-worker"
+            | "--guest-zygote-7a-worker"
+    )
+}
+
+fn lock_file(profile: &Path, name: &str, operation: i32) -> io::Result<File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(profile.join(name))?;
+    flock(&file, operation)?;
+    Ok(file)
+}
+
+fn flock(file: &File, operation: i32) -> io::Result<()> {
+    loop {
+        if unsafe { libc::flock(file.as_raw_fd(), operation) } == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+pub(crate) fn admission(profile: &Path) -> io::Result<File> {
+    lock_file(profile, "environment.lock", libc::LOCK_EX)
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Record {
+    pid: u32,
+    start: String,
+    boot: String,
+    root: PathBuf,
+    mount: PathBuf,
+    net: PathBuf,
+    device: u64,
+    inode: u64,
+}
+
+fn start_time(pid: u32) -> io::Result<String> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    stat.rsplit_once(") ")
+        .and_then(|(_, fields)| fields.split_whitespace().nth(19))
+        .map(str::to_owned)
+        .ok_or_else(|| io::Error::other("invalid process stat"))
+}
+
+pub(crate) struct Published {
+    profile: PathBuf,
+    leases: File,
+}
+
+impl Published {
+    pub(crate) fn new(profile: &Path, root: &Path, admission: Option<File>) -> io::Result<Self> {
+        let _admission =
+            admission.ok_or_else(|| io::Error::other("environment admission lock missing"))?;
+        let leases = lock_file(profile, "environment.leases", libc::LOCK_EX | libc::LOCK_NB)?;
+        // /proc is still the supervisor's Host proc mount, even in a child PID namespace.
+        let pid = fs::read_link("/proc/self")?
+            .to_string_lossy()
+            .parse::<u32>()
+            .map_err(io::Error::other)?;
+        let metadata = fs::metadata(root)?;
+        let record = Record {
+            pid,
+            start: start_time(pid)?,
+            boot: fs::read_to_string("/proc/sys/kernel/random/boot_id")?,
+            root: root.to_owned(),
+            mount: fs::read_link("/proc/self/ns/mnt")?,
+            net: fs::read_link("/proc/self/ns/net")?,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        };
+        let temp = profile.join("environment.json.tmp");
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&temp)?;
+        use std::io::Write;
+        file.write_all(&serde_json::to_vec(&record)?)?;
+        file.sync_all()?;
+        fs::rename(temp, profile.join("environment.json"))?;
+        // Readers acquire shared leases before entering the published namespaces.
+        flock(&leases, libc::LOCK_UN)?;
+        Ok(Self {
+            profile: profile.to_owned(),
+            leases,
+        })
+    }
+
+    pub(crate) fn finish(self) -> io::Result<File> {
+        let admission = admission(&self.profile)?;
+        fs::remove_file(self.profile.join("environment.json"))?;
+        // Stop new entrants, then retain mounts/properties until every Shell exits.
+        flock(&self.leases, libc::LOCK_EX)?;
+        Ok(admission)
+    }
+}
+
+pub(crate) struct Attached {
+    pub(crate) root: PathBuf,
+    _lease: File,
+    _owner: File,
+    mount: File,
+    net: File,
+}
+
+impl Attached {
+    pub(crate) fn enter(&self) -> io::Result<()> {
+        for (fd, flag) in [
+            (&self.net, libc::CLONE_NEWNET),
+            (&self.mount, libc::CLONE_NEWNS),
+        ] {
+            if unsafe { libc::setns(fd.as_raw_fd(), flag) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+}
+
+// Caller holds admission until a shared lease and all namespace FDs are pinned.
+pub(crate) fn attach(profile: &Path) -> io::Result<Option<Attached>> {
+    let record: Record = match fs::read(profile.join("environment.json")) {
+        Ok(bytes) => serde_json::from_slice(&bytes)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if record.boot != fs::read_to_string("/proc/sys/kernel/random/boot_id")? {
+        return Ok(None);
+    }
+    match start_time(record.pid) {
+        Ok(start) if start == record.start => (),
+        Ok(_) => return Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    }
+    let lease = lock_file(profile, "environment.leases", libc::LOCK_SH)?;
+    let proc = PathBuf::from(format!("/proc/{}", record.pid));
+    use std::os::fd::FromRawFd;
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, record.pid, 0) } as i32;
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let owner = unsafe { File::from_raw_fd(fd) };
+    let mount = File::open(proc.join("ns/mnt"))?;
+    let net = File::open(proc.join("ns/net"))?;
+    let metadata = fs::metadata(&record.root)?;
+    // root is not mounted in the caller's namespace: verify through the pinned owner.
+    let root = proc
+        .join("root")
+        .join(record.root.strip_prefix("/").map_err(io::Error::other)?);
+    let guest_metadata = fs::metadata(&root)?;
+    let host_namespace = fs::read_link("/proc/1/ns/mnt")?;
+    let mut owner_status = libc::pollfd {
+        fd: owner.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    if start_time(record.pid)? != record.start
+        || fs::read_link(proc.join("ns/mnt"))? != record.mount
+        || fs::read_link(proc.join("ns/net"))? != record.net
+        || record.mount == host_namespace
+        || (guest_metadata.dev(), guest_metadata.ino()) != (record.device, record.inode)
+        || !metadata.is_dir()
+        || unsafe { libc::poll(&mut owner_status, 1, 0) } != 0
+        || !record.root.starts_with(
+            profile
+                .parent()
+                .and_then(Path::parent)
+                .ok_or_else(|| io::Error::other("profile root missing"))?
+                .join("mnt"),
+        )
+    {
+        return Err(io::Error::other("Guest environment identity mismatch"));
+    }
+    Ok(Some(Attached {
+        root: record.root,
+        _lease: lease,
+        _owner: owner,
+        mount,
+        net,
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[test]
+    fn environment_lives_until_last_shell_and_cleanup_holds_admission() -> io::Result<()> {
+        let base = std::env::temp_dir().join(format!("ssal-environment-{}", std::process::id()));
+        let profile = base.join("guests/one");
+        let root = base.join("mnt/rootfs");
+        fs::create_dir_all(&profile)?;
+        fs::create_dir_all(&root)?;
+        let published = Published::new(&profile, &root, Some(admission(&profile)?))?;
+        let lease = lock_file(&profile, "environment.leases", libc::LOCK_SH)?;
+        let (sent, received) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let lock = published.finish().unwrap();
+            sent.send(()).unwrap();
+            lock
+        });
+        assert!(received.recv_timeout(Duration::from_millis(100)).is_err());
+        drop(lease);
+        received.recv_timeout(Duration::from_secs(2)).unwrap();
+        let cleanup_lock = waiter.join().unwrap();
+        assert!(!profile.join("environment.json").exists());
+        assert!(lock_file(&profile, "environment.lock", libc::LOCK_EX | libc::LOCK_NB).is_err());
+        drop(cleanup_lock);
+        assert!(attach(&profile)?.is_none());
+        fs::remove_dir_all(base)
+    }
+
+    #[test]
+    fn stale_pid_and_host_namespace_are_never_attached() -> io::Result<()> {
+        let base =
+            std::env::temp_dir().join(format!("ssal-stale-environment-{}", std::process::id()));
+        let profile = base.join("guests/one");
+        let root = base.join("mnt/rootfs");
+        fs::create_dir_all(&profile)?;
+        fs::create_dir_all(&root)?;
+        let published = Published::new(&profile, &root, Some(admission(&profile)?))?;
+        // A live process in the Host namespace must fail closed.
+        assert!(attach(&profile).is_err());
+        let path = profile.join("environment.json");
+        let mut record: Record = serde_json::from_slice(&fs::read(&path)?)?;
+        record.start = "reused-pid".into();
+        fs::write(&path, serde_json::to_vec(&record)?)?;
+        assert!(attach(&profile)?.is_none());
+        drop(published.finish()?);
+        fs::remove_dir_all(base)
+    }
+}

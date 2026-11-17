@@ -1,5 +1,7 @@
 #[cfg(unix)]
 mod cli;
+#[cfg(unix)]
+use ssal::shell_transport as shell_client;
 
 #[cfg(unix)]
 fn main() {
@@ -18,6 +20,10 @@ fn main() {
     };
     let result = (|| -> Result<(), Box<dyn std::error::Error>> {
         let output = match action {
+            cli::Action::Shell { profile, command } => {
+                let code = shell_client::run(profile.as_deref(), &command)?;
+                std::process::exit(code);
+            }
             cli::Action::Help(command) => cli::help(command.as_deref()),
             cli::Action::Version => format!("ssal {}", env!("CARGO_PKG_VERSION")),
             cli::Action::Probe => {

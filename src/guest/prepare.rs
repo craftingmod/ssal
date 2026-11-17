@@ -134,6 +134,26 @@ pub fn worker(
     mode: &str,
     force_regen: bool,
 ) -> io::Result<()> {
+    let admission = if crate::guest::environment::managed(mode) {
+        Some(crate::guest::environment::admission(
+            userdata
+                .parent()
+                .ok_or_else(|| io::Error::other("profile parent missing"))?,
+        )?)
+    } else {
+        None
+    };
+    worker_admitted(system, userdata, base, mode, force_regen, admission)
+}
+
+pub(crate) fn worker_admitted(
+    system: &Path,
+    userdata: &Path,
+    base: &Path,
+    mode: &str,
+    force_regen: bool,
+    mut admission: Option<File>,
+) -> io::Result<()> {
     if force_regen && mode != "--prepare-worker" {
         return Err(io::Error::other("--regen is only supported by prepare"));
     }
@@ -260,6 +280,7 @@ pub fn worker(
             mode,
             &host_mount_namespace,
             force_regen,
+            &mut admission,
         )?;
         Ok(())
     })();

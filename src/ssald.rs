@@ -13,6 +13,46 @@ mod service_contract;
 #[cfg(unix)]
 fn main() {
     let args: Vec<_> = std::env::args_os().collect();
+    if args.get(1).is_some_and(|arg| {
+        arg == "--shell-session" || arg == "--shell-enter" || arg == "--shell-fork"
+    }) {
+        // Daemon restart detection must not mistake independent Shell workers for ssald.
+        if unsafe { libc::prctl(libc::PR_SET_NAME, c"ssal-shell".as_ptr()) } != 0 {
+            eprintln!(
+                "cannot name Shell worker: {}",
+                std::io::Error::last_os_error()
+            );
+            std::process::exit(1);
+        }
+        if args.len() < 4 || args[3] != "--" {
+            eprintln!("invalid Shell worker invocation");
+            std::process::exit(2);
+        }
+        let words = args[4..]
+            .iter()
+            .map(|word| {
+                word.clone()
+                    .into_string()
+                    .map_err(|_| std::io::Error::other("command must be UTF-8"))
+            })
+            .collect::<std::io::Result<Vec<_>>>();
+        let result = words.and_then(|words| {
+            if args[1] == "--shell-session" {
+                guest::shell::session(args[2].to_str().unwrap_or("/"), &words)
+            } else if args[1] == "--shell-fork" {
+                guest::shell::fork(std::path::Path::new(&args[2]), &words)
+            } else {
+                guest::shell::enter(std::path::Path::new(&args[2]), &words)
+            }
+        });
+        match result {
+            Ok(code) => std::process::exit(code),
+            Err(error) => {
+                eprintln!("ssal shell: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
     if args
         .get(1)
         .is_some_and(|arg| arg == "--zygote-readiness-client" || arg == "--zygote-fork-client")

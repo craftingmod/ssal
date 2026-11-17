@@ -9,6 +9,9 @@ pub mod guest_properties;
 pub mod ipc;
 #[cfg(unix)]
 pub mod unix;
+#[cfg(unix)]
+#[path = "shell_client.rs"]
+pub mod shell_transport;
 
 #[cfg(unix)]
 #[path = "diagnostics/lock_namespace/mod.rs"]

@@ -2,6 +2,7 @@
 use crate::diagnostics::launcher::{
     fork_probe, system_server_preflight, system_server_runtime_sid,
 };
+use crate::guest::environment::start_property_service;
 use crate::guest::init::{wait_for_system_server, Service};
 use crate::guest::runtime::classpath::{
     derive_guest_classpath, guest_env_value, DERIVE_CLASSPATH_CONTEXT,
@@ -10,7 +11,7 @@ use ssal::namespace_mounts::Mounts;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -85,11 +86,18 @@ pub(crate) fn command(
     } else {
         exec_context.map(<[u8]>::to_vec)
     };
-    let pre_exec_cgroups: Vec<_> =
+    let property_service = exec_context
+        .as_deref()
+        .is_some_and(|context| context.ends_with(b"_init:s0\0"))
+        || exec_context.as_deref() == Some(PROPERTY_SERVICE_CONTEXT);
+    let pre_exec_cgroups: Vec<_> = if property_service {
+        Vec::new()
+    } else {
         crate::guest::cgroup::guest_cgroup_mounts(crate::guest::cgroup::backend()?)
             .into_iter()
             .map(|(_, target)| Path::new("/").join(target))
-            .collect();
+            .collect()
+    };
     command.env("LD_LIBRARY_PATH", "/run/ssal");
     if executable == "/system/bin/bootstrap/linker64" {
         command.env(
@@ -138,7 +146,9 @@ pub(crate) fn command(
             {
                 return Err(io::Error::last_os_error());
             }
-            crate::guest::cgroup::verify_guest_mount_membership(std::process::id())?;
+            if !property_service {
+                crate::guest::cgroup::verify_guest_mount_membership(std::process::id())?;
+            }
             Ok(())
         });
     }
@@ -551,170 +561,6 @@ pub(crate) fn memory_probe(root: &Path, hierarchy_test: bool) -> io::Result<()> 
     service.stop()?;
     Ok(())
 }
-fn start_property_service(
-    mounts: &mut Mounts,
-    root: &Path,
-    bin: &Path,
-    host_mount_namespace: &Path,
-) -> io::Result<Service> {
-    let runtime = crate::guest::mount::directory(root, "run/ssal", 0o755)?;
-    let contexts = runtime.join("guest_property_contexts");
-    fs::write(
-        &contexts,
-        "persist.ssal_probe u:object_r:ssal_guest_property_area:s0 exact uint\n",
-    )?;
-    let overrides = runtime.join("guest_build.prop");
-    fs::write(
-        &overrides,
-        [
-            "servicemanager.ready=false",
-            // This worker starts only app_process64; ZygoteInit otherwise waits 60s for a secondary.
-            "ro.product.cpu.abilist=arm64-v8a",
-            "ro.product.cpu.abilist64=arm64-v8a",
-            "ro.product.cpu.abilist32=",
-            "ro.zygote=zygote64",
-            "ro.build.version.codename=REL",
-            "dalvik.vm.dex2oat64.enabled=true",
-            "ro.zygote.disable_gl_preload=1",
-        ]
-        .join("\n")
-            + "\n",
-    )?;
-    if !root.join("system/build.prop").is_file() {
-        return Err(io::Error::other("Guest /system/build.prop missing"));
-    }
-    let identity = |path: &Path| -> io::Result<[u64; 2]> {
-        let metadata = fs::metadata(path)?;
-        Ok([metadata.dev(), metadata.ino()])
-    };
-    let host_property_identity = identity(Path::new("/dev/__properties__"))?;
-    let host_socket_identity = identity(Path::new("/dev/socket"))?;
-    let host_data_identity = identity(Path::new("/data"))?;
-    let host_persistent_identity = identity(Path::new("/data/property"))?;
-    let mut config = serde_json::json!({
-        "host_mount_namespace": host_mount_namespace.display().to_string(),
-        "host_property_identity": host_property_identity,
-        "host_socket_identity": host_socket_identity,
-        "host_data_identity": host_data_identity,
-        "host_persistent_identity": host_persistent_identity,
-        "property_contexts": ["/run/ssal/guest_property_contexts"],
-        "build_props": ["/system/build.prop", "/run/ssal/guest_build.prop"],
-    });
-    let plan = ssal::guest_policy::runtime::load(root)?;
-    if let Some(plan) = &plan {
-        let mut paths = Vec::new();
-        for (path, text) in &plan.contexts {
-            if path.ends_with("property_contexts") {
-                let name = format!("mapped_{}", path.replace('/', "_"));
-                fs::write(runtime.join(&name), text)?;
-                paths.push(format!("/run/ssal/{name}"));
-            }
-        }
-        config["property_contexts"] = serde_json::to_value(paths)?;
-        config["selinux_types"] = serde_json::to_value(&plan.types)?;
-    }
-    fs::write(
-        runtime.join("property-service.json"),
-        serde_json::to_vec(&config).map_err(io::Error::other)?,
-    )?;
-
-    let property_dir = crate::guest::mount::directory(root, "data/property", 0o700)?;
-    let metadata = fs::metadata(&property_dir)?;
-    if metadata.uid() != 0 || metadata.mode() & 0o077 != 0 {
-        return Err(io::Error::other(
-            "Guest /data/property must be root-owned mode 0700",
-        ));
-    }
-    let area = crate::guest::mount::directory(root, "dev/__properties__", 0o755)?;
-    if fs::read_dir(&area)?.next().is_some() {
-        return Err(io::Error::other("Guest property area is not fresh"));
-    }
-    let executable = runtime.join("property-service");
-    File::create(&executable)?;
-    ssal::guest_policy::runtime::bind_file(
-        mounts,
-        root,
-        &bin.join("ssal-property-service"),
-        &executable,
-    )?;
-    let mut service = Service::start(
-        root,
-        "/system/bin/bootstrap/linker64",
-        &[
-            "/run/ssal/property-service",
-            "--config",
-            "/run/ssal/property-service.json",
-        ],
-        "guest-property-service",
-        0,
-        Some(PROPERTY_SERVICE_CONTEXT),
-        &[],
-    )?;
-    service.wait_text("guest_property_service_ready")?;
-    let process_context = fs::read_to_string(format!("/proc/{}/attr/current", service.child.id()))?;
-    let expected = plan
-        .as_ref()
-        .map(|p| p.context("init", true))
-        .transpose()?
-        .unwrap_or_else(|| "u:r:ssal_property:s0".into());
-    if process_context.trim_matches('\0').trim() != expected {
-        return Err(io::Error::other(format!(
-            "Guest property service SID mismatch: {process_context:?}"
-        )));
-    }
-    for (guest, host, name) in [
-        (identity(&area)?, host_property_identity, "property area"),
-        (
-            identity(&root.join("dev/socket"))?,
-            host_socket_identity,
-            "socket directory",
-        ),
-        (
-            identity(&root.join("data"))?,
-            host_data_identity,
-            "userdata",
-        ),
-        (
-            identity(&property_dir)?,
-            host_persistent_identity,
-            "persistent directory",
-        ),
-    ] {
-        if guest == host {
-            return Err(io::Error::other(format!("Host {name} selected")));
-        }
-    }
-    let guest_socket_path = root.join("dev/socket/property_service");
-    let guest_socket = identity(&guest_socket_path)?;
-    if !fs::symlink_metadata(&guest_socket_path)?
-        .file_type()
-        .is_socket()
-    {
-        return Err(io::Error::other(
-            "Guest property-service endpoint is not a Unix socket",
-        ));
-    }
-    println!("Guest property socket type=unix");
-    let socket_entries = fs::read_dir(root.join("dev/socket"))?
-        .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
-        .collect::<io::Result<Vec<_>>>()?;
-    if socket_entries.len() != 1 || socket_entries[0] != "property_service" {
-        return Err(io::Error::other(format!(
-            "unexpected Guest /dev/socket entries: {socket_entries:?}"
-        )));
-    }
-    println!("Guest property socket isolation=PASS");
-    if guest_socket == identity(Path::new("/dev/socket/property_service"))? {
-        return Err(io::Error::other("Host property socket selected"));
-    }
-    println!(
-        "PHASE7I_PROPERTY_SERVICE=PASS pid={} sid={expected} host_area={host_property_identity:?} guest_area={:?} host_data={host_data_identity:?} guest_data={:?}",
-        service.child.id(),
-        identity(&area)?,
-        identity(&root.join("data"))?
-    );
-    Ok(service)
-}
 
 fn isolated(root: &Path, userdata: &Path) -> io::Result<()> {
     let identity = |path: &Path| -> io::Result<_> {
@@ -748,6 +594,7 @@ fn isolated(root: &Path, userdata: &Path) -> io::Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn verify(
     mounts: &mut Mounts,
     root: &Path,
@@ -756,6 +603,8 @@ pub(crate) fn verify(
     phase6b: bool,
     phase7a: bool,
     host_mount_namespace: &Path,
+    profile_dir: &Path,
+    admission: &mut Option<File>,
 ) -> io::Result<()> {
     let start_system_server = system_server_requested(
         std::env::var_os("SSAL_START_SYSTEM_SERVER").as_deref(),
@@ -888,35 +737,19 @@ pub(crate) fn verify(
         system_server_preflight::prepare(mounts, root, &bin)?;
     }
     let mut property_service = None;
+    let mut shell_environment = None;
     let result = (|| {
-        // Reuse the established servicemanager view: libselinux rejects an RO root.
-        // All control endpoints stay RO; only existing AV/context query files are RW.
-        mounts.bind(
-            Path::new("/sys/fs/selinux"),
-            &root.join("sys/fs/selinux"),
-            false,
-            false,
-        )?;
-        for entry in fs::read_dir("/sys/fs/selinux")? {
-            let entry = entry?;
-            if ["access", "context", "create", "relabel", "member", "user"]
-                .contains(&entry.file_name().to_str().unwrap_or(""))
-            {
-                continue;
-            }
-            mounts.bind(
-                &entry.path(),
-                &root.join("sys/fs/selinux").join(entry.file_name()),
-                true,
-                entry.file_type()?.is_dir(),
-            )?;
-        }
         {
             property_service = Some(start_property_service(
                 mounts,
                 root,
                 &bin,
                 host_mount_namespace,
+            )?);
+            shell_environment = Some(crate::guest::environment::Published::new(
+                profile_dir,
+                root,
+                admission.take(),
             )?);
             let property_script = if !phase7i_property_tests {
                 r#"set -eu
@@ -1557,6 +1390,9 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
         }
         server.stop()?;
         manager.stop()?;
+        if let Some(environment) = shell_environment.take() {
+            *admission = Some(environment.finish()?);
+        }
         if let Some(service) = &mut property_service {
             service.stop()?;
             fs::remove_file(root.join("dev/socket/property_service"))?;
@@ -1565,6 +1401,12 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
         Ok(())
     })();
     let mut cleanup_errors = Vec::new();
+    if let Some(environment) = shell_environment.take() {
+        match environment.finish() {
+            Ok(lock) => *admission = Some(lock),
+            Err(error) => cleanup_errors.push(error.to_string()),
+        }
+    }
     if let Some(service) = &mut property_service {
         if let Err(error) = service.stop() {
             cleanup_errors.push(error.to_string());
@@ -1615,7 +1457,7 @@ mod tests {
         assert!(setup.contains("property_service = Some(start_property_service("));
         assert!(!setup.contains("if phase7i_properties"));
         assert!(!setup.contains("--initialize-private-properties"));
-        assert!(source.contains("\"servicemanager.ready=false\""));
+        assert!(include_str!("../environment.rs").contains("\"servicemanager.ready=false\""));
         assert!(!source.contains(concat!("\"servicemanager.ready", "=true\"")));
         let property = verify
             .find("manager.wait_guest_servicemanager_property(")

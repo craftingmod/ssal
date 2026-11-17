@@ -32,7 +32,19 @@ pub(crate) fn isolate_process_group(zygote: bool) -> io::Result<()> {
 }
 
 pub(crate) fn root_command(root: &Path, executable: &str, pivot: bool) -> io::Result<Command> {
+    root_command_at(root, executable, pivot, ".ssal-old-root")
+}
+
+pub(crate) fn root_command_at(
+    root: &Path,
+    executable: &str,
+    pivot: bool,
+    scratch: &str,
+) -> io::Result<Command> {
     let root_c = cpath(root)?;
+    let scratch_c = CString::new(scratch).map_err(io::Error::other)?;
+    let old_root = format!("/{scratch}");
+    let old_root_c = CString::new(old_root.as_str()).map_err(io::Error::other)?;
     let zygote = executable == "/system/bin/app_process64";
     let inherited = ssal::unix::inherited_fds()?;
     let expected = fs::metadata(root)?;
@@ -52,7 +64,7 @@ pub(crate) fn root_command(root: &Path, executable: &str, pivot: bool) -> io::Re
         None
     };
     if pivot {
-        fs::create_dir(root.join(".ssal-old-root"))?;
+        fs::create_dir(root.join(scratch))?;
     }
     let mut command = Command::new(executable);
     command
@@ -80,12 +92,7 @@ pub(crate) fn root_command(root: &Path, executable: &str, pivot: bool) -> io::Re
                 if libc::chdir(root_c.as_ptr()) != 0 {
                     return Err(io::Error::last_os_error());
                 }
-                if libc::syscall(
-                    libc::SYS_pivot_root,
-                    c".".as_ptr(),
-                    c".ssal-old-root".as_ptr(),
-                ) != 0
-                {
+                if libc::syscall(libc::SYS_pivot_root, c".".as_ptr(), scratch_c.as_ptr()) != 0 {
                     return Err(io::Error::other(format!(
                         "Guest pivot_root: {}",
                         io::Error::last_os_error()
@@ -97,17 +104,17 @@ pub(crate) fn root_command(root: &Path, executable: &str, pivot: bool) -> io::Re
                 // Android may stack mounts at /; detach every old-root layer in this private child.
                 let layers = fs::read_to_string("/proc/self/mountinfo")?
                     .lines()
-                    .filter(|line| line.split_whitespace().nth(4) == Some("/.ssal-old-root"))
+                    .filter(|line| line.split_whitespace().nth(4) == Some(old_root.as_str()))
                     .count();
                 if layers == 0 {
                     return Err(io::Error::other("old-root mount missing after pivot"));
                 }
                 for _ in 0..layers {
-                    if libc::umount2(c"/.ssal-old-root".as_ptr(), libc::MNT_DETACH) != 0 {
+                    if libc::umount2(old_root_c.as_ptr(), libc::MNT_DETACH) != 0 {
                         return Err(io::Error::last_os_error());
                     }
                 }
-                if libc::rmdir(c"/.ssal-old-root".as_ptr()) != 0 {
+                if libc::rmdir(old_root_c.as_ptr()) != 0 {
                     return Err(io::Error::last_os_error());
                 }
                 if let Some(mut log) = pivot_log.as_ref() {

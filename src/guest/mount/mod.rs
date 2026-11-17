@@ -81,6 +81,7 @@ pub(super) fn same_directory(source: &Path, target: &Path) -> io::Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn verify(
     system: &Path,
     userdata: &Path,
@@ -90,6 +91,7 @@ pub fn verify(
     mode: &str,
     host_mount_namespace: &Path,
     force_regen: bool,
+    admission: &mut Option<File>,
 ) -> io::Result<()> {
     let profile = profile()?;
     let root = base.join("rootfs");
@@ -108,6 +110,7 @@ pub fn verify(
             | "--guest-zygote-7a-worker"
     );
     let policy = if mode == "--prepare-worker"
+        || mode == "--shell-worker"
         || (mapped_launch && profile_dir.join("selinux/plan.json").is_file())
     {
         Some(ssal::guest_policy::runtime::prepare_mounted(
@@ -424,6 +427,15 @@ pub fn verify(
                 ));
             }
         }
+        if mode == "--shell-worker" {
+            return crate::guest::shell::standalone(
+                &mut mounts,
+                &root,
+                profile_dir,
+                host_mount_namespace,
+                admission,
+            );
+        }
         if mode == "--guest-memory-worker" {
             let helper = std::env::var_os("SSAL_PHASE7D_FIX_HELPER");
             if let Some(path) = &helper {
@@ -450,6 +462,8 @@ pub fn verify(
                 mode == "--guest-services-6b-worker",
                 mode == "--guest-zygote-7a-worker",
                 host_mount_namespace,
+                profile_dir,
+                admission,
             );
         }
         {
@@ -495,7 +509,7 @@ pub fn verify(
     })();
     let result = result.and_then(|()| crate::guest::process::supervision::check_interrupted());
     let descendants = if cgroups.memory.is_some() {
-        crate::guest::process::supervision::cleanup_descendants()
+        crate::guest::process::supervision::cleanup_descendants(true)
     } else {
         Ok(())
     };

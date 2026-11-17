@@ -75,6 +75,17 @@ fn parse_av(reply: &str, requested: u32) -> io::Result<(bool, bool, u32)> {
     ))
 }
 
+pub(crate) fn require_enforcing_domain(context: &str) -> io::Result<()> {
+    if fs::read_to_string("/sys/fs/selinux/enforce")?.trim() != "1"
+        || query(context, context, "process", "fork")?.permissive_domain
+    {
+        return Err(io::Error::other(format!(
+            "Shell requires an enforcing Guest domain: {context}"
+        )));
+    }
+    Ok(())
+}
+
 fn query(source: &str, target: &str, class: &str, permission: &str) -> io::Result<Decision> {
     let base = format!("/sys/fs/selinux/class/{class}");
     let index: u32 = fs::read_to_string(format!("{base}/index"))?

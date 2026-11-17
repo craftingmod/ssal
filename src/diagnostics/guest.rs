@@ -14,7 +14,6 @@ mod tests {
     use crate::guest::process::command::{isolate_process_group, run_with_timeout};
     use std::os::unix::process::CommandExt;
     use std::process::Command;
-    use std::process::Command;
     use std::time::{Duration, Instant};
 
     #[test]
