@@ -127,6 +127,7 @@ pub(crate) fn standalone(
         .ok_or_else(|| io::Error::other("binary directory missing"))?
         .to_owned();
     let mut properties = environment::start_property_service(mounts, root, &bin, host_namespace)?;
+    crate::guest::mount::seal_system(root)?;
     let published = environment::Published::new(profile, root, admission.take())?;
     let result = isolated(root);
     *admission = Some(published.finish()?);

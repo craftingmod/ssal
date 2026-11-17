@@ -746,6 +746,7 @@ pub(crate) fn verify(
                 &bin,
                 host_mount_namespace,
             )?);
+            crate::guest::mount::seal_system(root)?;
             shell_environment = Some(crate::guest::environment::Published::new(
                 profile_dir,
                 root,

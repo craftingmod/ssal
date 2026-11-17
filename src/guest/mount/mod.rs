@@ -5,6 +5,11 @@ mod filesystem;
 pub(crate) mod loop_device;
 pub(crate) mod namespace;
 mod profile;
+mod readonly;
+
+pub(crate) fn seal_system(root: &Path) -> io::Result<()> {
+    readonly::seal(root)
+}
 
 #[cfg(test)]
 use devices::{GUEST_DEVICE_NODES, GUEST_DEV_ENTRIES};
@@ -427,6 +432,7 @@ pub fn verify(
                 ));
             }
         }
+        seal_system(&root)?;
         if mode == "--shell-worker" {
             return crate::guest::shell::standalone(
                 &mut mounts,
