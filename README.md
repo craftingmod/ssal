@@ -23,6 +23,22 @@ KernelSU 모듈과 Android arm64 CLI의 초기 구현입니다. `ssald`가 root 
 
 `ssal probe-binder PROFILE_NAME`은 별도 [독립 Binder 시험](docs/binder-probe.md)을 실행합니다. 새 binderfs 장치 생성·열기·최소 IPC·정리를 각각 기록하며 AOSP servicemanager나 HAL은 실행하지 않습니다. IPC 헬퍼는 게스트 플랫폼 라이브러리와 별도 빌드하고 이미지 일치 해시를 검사합니다. 일반 prepare와 Android 서비스 기동 차단은 유지합니다.
 
+## CLI 사용법
+
+`ssal --help` (`-h`)로 명령 목록을, `ssal COMMAND --help` 또는 `ssal help COMMAND`로 개별 사용법을 확인합니다. `ssal --version` (`-V`)은 버전을 출력합니다. 도움말과 버전 조회에는 root나 실행 중인 데몬이 필요하지 않습니다.
+
+```sh
+ssal prepare profile1 --regen --native
+ssal add lineage /data/local/tmp/system.img
+ssal add -- -image ./-system.img
+ssal status >status.txt
+ssal doctor profile1 2>error.txt
+```
+
+일반 명령의 옵션은 피연산자 앞뒤에서 사용할 수 있습니다. `--` 뒤의 값은 옵션으로 해석하지 않으므로 `-`로 시작하는 이름이나 경로에는 `--`를 사용하거나 경로에 `./`를 붙입니다. `probe`의 실행 옵션과 위험 확인 조건은 기존 전용 파서를 유지하며 `ssal probe --help`에서 확인합니다.
+
+정상 결과와 도움말은 stdout으로, 입력 오류·파일 오류·연결 실패·데몬이 거부한 결과는 `ssal:` 접두사와 함께 stderr로 출력합니다. 종료 코드는 성공 `0`, 실행 실패 `1`, 일반 명령의 사용법 오류 `2`입니다. 기존에 실패 결과를 stdout에서 읽던 스크립트는 stderr를 읽거나 `2>&1`로 합쳐야 합니다. 인자 없이 실행하면 사용법 오류로 종료하며, 백그라운드 이미지 등록의 성공 코드는 작업 접수만 의미합니다. 완료 여부는 `ssal status`로 확인합니다.
+
 ## 빌드
 
 WSLc, Bun과 네트워크가 필요합니다. PowerShell에서 실행합니다.

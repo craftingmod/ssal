@@ -1,7 +1,6 @@
 use super::{directory, guest_path};
 use ssal::namespace_mounts::{mount, Mounts};
 use std::fs;
-#[cfg(target_os = "android")]
 use std::fs::File;
 use std::io;
 use std::path::Path;
