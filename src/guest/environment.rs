@@ -72,6 +72,7 @@ pub(crate) fn start_property_service(
     let host_persistent_identity = identity(Path::new("/data/property"))?;
     let mut config = serde_json::json!({
         "host_mount_namespace": host_mount_namespace.display().to_string(),
+        "session_owner_pid": std::process::id() as i32,
         "host_property_identity": host_property_identity,
         "host_socket_identity": host_socket_identity,
         "host_data_identity": host_data_identity,
@@ -178,29 +179,58 @@ pub(crate) fn start_property_service(
             return Err(io::Error::other(format!("Host {name} selected")));
         }
     }
-    let guest_socket_path = root.join("dev/socket/property_service");
-    let guest_socket = identity(&guest_socket_path)?;
-    if !fs::symlink_metadata(&guest_socket_path)?
-        .file_type()
-        .is_socket()
-    {
-        return Err(io::Error::other(
-            "Guest property-service endpoint is not a Unix socket",
-        ));
+    let socket_paths = [
+        root.join("dev/socket/property_service"),
+        root.join("dev/socket/property_service_for_system"),
+    ];
+    for socket_path in &socket_paths {
+        if !fs::symlink_metadata(socket_path)?.file_type().is_socket() {
+            return Err(io::Error::other(format!(
+                "Guest property-service endpoint is not a Unix socket: {}",
+                socket_path.display()
+            )));
+        }
     }
-    println!("Guest property socket type=unix");
-    let socket_entries = fs::read_dir(root.join("dev/socket"))?
+    if identity(&socket_paths[0])? == identity(Path::new("/dev/socket/property_service"))? {
+        return Err(io::Error::other("Host property socket selected"));
+    }
+    match identity(Path::new("/dev/socket/property_service_for_system")) {
+        Ok(host_system_socket) if identity(&socket_paths[1])? == host_system_socket => {
+            return Err(io::Error::other("Host system property socket selected"));
+        }
+        Ok(_) => (),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+        Err(error) => return Err(error),
+    }
+    println!("Guest property sockets type=unix");
+    let mut socket_entries = fs::read_dir(root.join("dev/socket"))?
         .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
         .collect::<io::Result<Vec<_>>>()?;
-    if socket_entries.len() != 1 || socket_entries[0] != "property_service" {
+    socket_entries.sort();
+    if socket_entries != ["property_service", "property_service_for_system"] {
         return Err(io::Error::other(format!(
             "unexpected Guest /dev/socket entries: {socket_entries:?}"
         )));
     }
-    println!("Guest property socket isolation=PASS");
-    if guest_socket == identity(Path::new("/dev/socket/property_service"))? {
-        return Err(io::Error::other("Host property socket selected"));
+    for (name, mode, gid) in [
+        ("property_service", 0o666, 0),
+        ("property_service_for_system", 0o660, 1000),
+    ] {
+        let metadata = fs::symlink_metadata(root.join("dev/socket").join(name))?;
+        if !metadata.file_type().is_socket()
+            || metadata.uid() != 0
+            || metadata.gid() != gid
+            || metadata.mode() & 0o777 != mode
+        {
+            return Err(io::Error::other(format!(
+                "Guest {name} ownership/mode mismatch: uid={} gid={} mode={:o}",
+                metadata.uid(),
+                metadata.gid(),
+                metadata.mode() & 0o777
+            )));
+        }
     }
+    println!("Guest property socket isolation=PASS");
     println!(
         "PHASE7I_PROPERTY_SERVICE=PASS pid={} sid={expected} host_area={host_property_identity:?} guest_area={:?} host_data={host_data_identity:?} guest_data={:?}",
         service.child.id(),

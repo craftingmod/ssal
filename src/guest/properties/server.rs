@@ -1,4 +1,4 @@
-use super::{policy, Properties, SOCKET};
+use super::{policy, Properties, SOCKET, SYSTEM_SOCKET};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
@@ -27,7 +27,14 @@ impl Read for RequestReader<'_> {
     }
 }
 
-pub(super) fn peer(stream: &UnixStream) -> io::Result<(libc::ucred, String)> {
+#[derive(Clone, Copy, Debug)]
+pub(super) struct PeerCredentials {
+    pub pid: i32,
+    pub uid: u32,
+    pub gid: u32,
+}
+
+pub(super) fn peer(stream: &UnixStream) -> io::Result<(PeerCredentials, String)> {
     let mut credential: libc::ucred = unsafe { std::mem::zeroed() };
     let mut len = std::mem::size_of_val(&credential) as libc::socklen_t;
     if unsafe {
@@ -69,7 +76,14 @@ pub(super) fn peer(stream: &UnixStream) -> io::Result<(libc::ucred, String)> {
     if context.is_empty() {
         return Err(io::Error::other("empty property peer context"));
     }
-    Ok((credential, context.into()))
+    Ok((
+        PeerCredentials {
+            pid: credential.pid,
+            uid: credential.uid,
+            gid: credential.gid,
+        },
+        context.into(),
+    ))
 }
 
 fn read_u32(stream: &mut impl Read) -> io::Result<u32> {
@@ -88,37 +102,51 @@ fn string(stream: &mut impl Read, limit: usize) -> io::Result<String> {
     String::from_utf8(bytes).map_err(io::Error::other)
 }
 
-fn request(stream: &mut impl Read, command: u32) -> io::Result<(String, String)> {
+fn request(stream: &mut impl Read, command: u32) -> Result<(String, String), i32> {
     use rsproperties::wire::*;
     match command {
         PROP_MSG_SETPROP2 => Ok((
-            string(stream, MAX_WIRE_NAME_LEN)?,
-            string(stream, MAX_WIRE_VALUE_LEN)?,
+            string(stream, MAX_WIRE_NAME_LEN).map_err(|_| PROP_ERROR_READ_DATA)?,
+            string(stream, MAX_WIRE_VALUE_LEN).map_err(|_| PROP_ERROR_READ_DATA)?,
         )),
         PROP_MSG_SETPROP => {
             let mut name = [0; PROP_NAME_MAX];
             let mut value = [0; PROP_VALUE_MAX];
-            stream.read_exact(&mut name)?;
-            stream.read_exact(&mut value)?;
-            let field = |bytes: &[u8]| -> io::Result<String> {
+            stream
+                .read_exact(&mut name)
+                .map_err(|_| PROP_ERROR_READ_DATA)?;
+            stream
+                .read_exact(&mut value)
+                .map_err(|_| PROP_ERROR_READ_DATA)?;
+            let field = |bytes: &[u8]| -> Result<String, i32> {
                 let end = bytes
                     .iter()
                     .position(|b| *b == 0)
-                    .ok_or_else(|| io::Error::other("unterminated V1 field"))?;
-                Ok(std::str::from_utf8(&bytes[..end])
-                    .map_err(io::Error::other)?
-                    .into())
+                    .ok_or(PROP_ERROR_READ_DATA)?;
+                String::from_utf8(bytes[..end].to_vec()).map_err(|_| PROP_ERROR_READ_DATA)
             };
             Ok((field(&name)?, field(&value)?))
         }
-        _ => Err(io::Error::other("unknown property protocol command")),
+        _ => Err(PROP_ERROR_INVALID_CMD),
     }
 }
 
-fn response(stream: &mut UnixStream, command: u32, success: bool) {
-    if command == rsproperties::wire::PROP_MSG_SETPROP2 {
-        let status: u32 = if success { 0 } else { 0x0020 };
-        let _ = stream.write_all(&status.to_le_bytes());
+fn response(stream: &mut UnixStream, command: u32, status: i32) {
+    if command != rsproperties::wire::PROP_MSG_SETPROP {
+        let _ = stream.write_all(&(status as u32).to_le_bytes());
+    }
+}
+
+fn rejection_code(name: &str, error: &io::Error) -> i32 {
+    use rsproperties::wire::*;
+    match error.kind() {
+        io::ErrorKind::InvalidInput if validate_property_name(name).is_err() => {
+            PROP_ERROR_INVALID_NAME
+        }
+        io::ErrorKind::InvalidInput => PROP_ERROR_INVALID_VALUE,
+        io::ErrorKind::AlreadyExists => PROP_ERROR_READ_ONLY_PROPERTY,
+        io::ErrorKind::PermissionDenied => PROP_ERROR_PERMISSION_DENIED,
+        _ => PROP_ERROR_SET_FAILED,
     }
 }
 
@@ -126,32 +154,79 @@ fn response(stream: &mut UnixStream, command: u32, success: bool) {
 pub(super) fn handle(
     stream: &mut UnixStream,
     properties: &mut Properties,
-    authorize: impl FnOnce(&UnixStream, &str) -> io::Result<()>,
+    authorize: impl FnOnce(&UnixStream, &str) -> io::Result<PeerCredentials>,
+    control_handler: impl FnOnce(&str, &str, PeerCredentials) -> bool,
+    powerctl_handler: impl FnOnce(&str, PeerCredentials) -> bool,
 ) -> io::Result<()> {
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
     let mut reader = RequestReader {
         stream,
         deadline: Instant::now() + Duration::from_secs(2),
     };
-    let Ok(command) = read_u32(&mut reader) else {
-        return Ok(());
-    };
-    let (name, value) = match request(&mut reader, command) {
-        Ok(pair) => pair,
+    let command = match read_u32(&mut reader) {
+        Ok(command) => command,
         Err(_) => {
-            response(stream, command, false);
+            response(
+                stream,
+                rsproperties::wire::PROP_MSG_SETPROP2,
+                rsproperties::wire::PROP_ERROR_READ_CMD,
+            );
             return Ok(());
         }
     };
-    if properties
-        .check_write(&name, &value, |target| authorize(stream, target))
-        .is_err()
-    {
-        response(stream, command, false);
+    let (name, value) = match request(&mut reader, command) {
+        Ok(pair) => pair,
+        Err(status) => {
+            response(stream, command, status);
+            return Ok(());
+        }
+    };
+    let credentials =
+        match properties.check_write(&name, &value, |target| authorize(stream, target)) {
+            Ok(credentials) => credentials,
+            Err(error) => {
+                response(stream, command, rejection_code(&name, &error));
+                return Ok(());
+            }
+        };
+    if let Some(action) = name.strip_prefix("ctl.") {
+        let status = if control_handler(action, &value, credentials) {
+            rsproperties::wire::PROP_SUCCESS
+        } else {
+            rsproperties::wire::PROP_ERROR_HANDLE_CONTROL_MESSAGE
+        };
+        response(stream, command, status);
+        return Ok(());
+    }
+    if name == "sys.powerctl" {
+        if !super::control::valid_powerctl(&value) {
+            response(
+                stream,
+                command,
+                rsproperties::wire::PROP_ERROR_INVALID_VALUE,
+            );
+            return Ok(());
+        }
+        // A parent teardown delivers SIGKILL to this supervised child, so acknowledge first.
+        response(stream, command, rsproperties::wire::PROP_SUCCESS);
+        if !powerctl_handler(&value, credentials) {
+            eprintln!(
+                "Guest sys.powerctl request accepted but session teardown failed: pid={}",
+                credentials.pid
+            );
+        }
         return Ok(());
     }
     let result = properties.set(&name, &value);
-    response(stream, command, result.is_ok());
+    response(
+        stream,
+        command,
+        if result.is_ok() {
+            rsproperties::wire::PROP_SUCCESS
+        } else {
+            rsproperties::wire::PROP_ERROR_SET_FAILED
+        },
+    );
     result
 }
 
@@ -228,54 +303,129 @@ fn label_socket(path: &Path, context: &str) -> io::Result<()> {
     )
 }
 
-pub(super) fn serve(properties: &mut Properties) -> io::Result<()> {
+pub(super) fn serve(properties: &mut Properties, session_owner_pid: i32) -> io::Result<()> {
     let path = Path::new(SOCKET);
+    let system_path = Path::new(SYSTEM_SOCKET);
     // Fresh /dev/socket belongs to this session. Never replace a running/stale server's socket.
-    match fs::symlink_metadata(path) {
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        _ => {
-            return Err(io::Error::other(
-                "Guest property socket already exists or cannot be checked",
-            ))
+    for socket in [path, system_path] {
+        match fs::symlink_metadata(socket) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            _ => {
+                return Err(io::Error::other(format!(
+                    "Guest property socket already exists or cannot be checked: {}",
+                    socket.display()
+                )))
+            }
         }
     }
     unsafe {
         libc::umask(0o077);
     }
-    let listener = UnixListener::bind(path)?;
+    let listener = bind_socket(path, &properties.socket_context, 0o666, 0)?;
+    let system_listener = match bind_socket(system_path, &properties.socket_context, 0o660, 1000) {
+        Ok(listener) => listener,
+        Err(error) => {
+            drop(listener);
+            let _ = fs::remove_file(path);
+            return Err(error);
+        }
+    };
     let result: io::Result<()> = (|| {
-        label_socket(path, &properties.socket_context)?;
-        // Bionic clients of all UIDs connect; authorization is per property via SO_PEERSEC.
-        fs::set_permissions(path, fs::Permissions::from_mode(0o666))?;
-        println!("{{\"event\":\"guest_property_service_ready\",\"persistent_file\":\"/data/property/persistent_properties\"}}");
+        println!("{{\"event\":\"guest_property_service_ready\",\"persistent_file\":\"/data/property/persistent_properties\",\"sockets\":[\"property_service\",\"property_service_for_system\"]}}");
         loop {
+            let mut ready = [
+                libc::pollfd {
+                    fd: listener.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: system_listener.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            if unsafe { libc::poll(ready.as_mut_ptr(), ready.len() as _, -1) } < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+            let system_ready = ready[1].revents & libc::POLLIN != 0;
+            if ready
+                .iter()
+                .any(|fd| fd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0)
+            {
+                return Err(io::Error::other("Guest property socket listener failed"));
+            }
+            let listener = if system_ready {
+                &system_listener
+            } else {
+                &listener
+            };
             let (mut stream, _) = match listener.accept() {
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 result => result?,
             };
-            handle(&mut stream, properties, |stream, target| {
-                let (credentials, source) = peer(stream).map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "property peer identity unavailable",
-                    )
-                })?;
-                policy::check_access(&source, target).map_err(|e| {
-                    eprintln!(
-                        "Guest property denied: pid={} uid={} gid={} source={} target={}: {}",
-                        credentials.pid, credentials.uid, credentials.gid, source, target, e
-                    );
-                    io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "property authorization failed",
-                    )
-                })
-            })?;
+            handle(
+                &mut stream,
+                properties,
+                |stream, target| {
+                    let (credentials, source) = peer(stream).map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "property peer identity unavailable",
+                        )
+                    })?;
+                    policy::check_access(&source, target).map_err(|e| {
+                        eprintln!(
+                            "Guest property denied: pid={} uid={} gid={} source={} target={}: {}",
+                            credentials.pid, credentials.uid, credentials.gid, source, target, e
+                        );
+                        io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "property authorization failed",
+                        )
+                    })?;
+                    Ok(credentials)
+                },
+                super::control::service,
+                |command, peer| super::control::powerctl(command, peer, session_owner_pid),
+            )?;
         }
     })();
     drop(listener);
-    let cleanup = fs::remove_file(path);
-    result.and(cleanup)
+    drop(system_listener);
+    let cleanup = remove_socket(path);
+    let system_cleanup = remove_socket(system_path);
+    result.and(cleanup.and(system_cleanup))
+}
+
+fn bind_socket(path: &Path, context: &str, mode: u32, gid: u32) -> io::Result<UnixListener> {
+    let listener = UnixListener::bind(path)?;
+    let setup = label_socket(path, context).and_then(|()| {
+        let path_c =
+            std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(io::Error::other)?;
+        if unsafe { libc::chown(path_c.as_ptr(), 0, gid) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))
+    });
+    if let Err(error) = setup {
+        drop(listener);
+        let _ = fs::remove_file(path);
+        return Err(error);
+    }
+    Ok(listener)
+}
+
+fn remove_socket(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(test)]
@@ -345,10 +495,42 @@ mod tests {
             ("persist.x".into(), "ok".into())
         );
         bytes.pop();
-        assert!(request(&mut Cursor::new(bytes), 0x20001).is_err());
-        assert!(request(&mut Cursor::new(u32::MAX.to_le_bytes()), 0x20001).is_err());
-        assert!(request(&mut Cursor::new([1; 124]), 1).is_err());
-        assert!(request(&mut Cursor::new([]), 7).is_err());
+        assert_eq!(
+            request(&mut Cursor::new(bytes), 0x20001),
+            Err(rsproperties::wire::PROP_ERROR_READ_DATA)
+        );
+        assert_eq!(
+            request(&mut Cursor::new(u32::MAX.to_le_bytes()), 0x20001),
+            Err(rsproperties::wire::PROP_ERROR_READ_DATA)
+        );
+        assert_eq!(
+            request(&mut Cursor::new([1; 124]), 1),
+            Err(rsproperties::wire::PROP_ERROR_READ_DATA)
+        );
+        assert_eq!(
+            request(&mut Cursor::new([]), 7),
+            Err(rsproperties::wire::PROP_ERROR_INVALID_CMD)
+        );
+
+        let mut v1 =
+            vec![0u8; rsproperties::wire::PROP_NAME_MAX + rsproperties::wire::PROP_VALUE_MAX];
+        v1[..9].copy_from_slice(b"persist.x");
+        v1[rsproperties::wire::PROP_NAME_MAX..rsproperties::wire::PROP_NAME_MAX + 2]
+            .copy_from_slice(b"ok");
+        assert_eq!(
+            request(&mut Cursor::new(v1), rsproperties::wire::PROP_MSG_SETPROP).unwrap(),
+            ("persist.x".into(), "ok".into())
+        );
+        let (mut client, mut stream) = UnixStream::pair().unwrap();
+        response(
+            &mut stream,
+            rsproperties::wire::PROP_MSG_SETPROP,
+            rsproperties::wire::PROP_SUCCESS,
+        );
+        drop(stream);
+        let mut reply = Vec::new();
+        client.read_to_end(&mut reply).unwrap();
+        assert!(reply.is_empty(), "V1 clients receive no status word");
     }
 
     fn exchange(
@@ -367,13 +549,23 @@ mod tests {
         ] {
             client.write_all(&part).unwrap();
         }
-        let result = handle(&mut stream, properties, |_, _| {
-            if allowed {
-                Ok(())
-            } else {
-                Err(io::Error::new(io::ErrorKind::PermissionDenied, "denied"))
-            }
-        });
+        let result = handle(
+            &mut stream,
+            properties,
+            |_, _| {
+                if allowed {
+                    Ok(PeerCredentials {
+                        pid: 1,
+                        uid: 0,
+                        gid: 0,
+                    })
+                } else {
+                    Err(io::Error::new(io::ErrorKind::PermissionDenied, "denied"))
+                }
+            },
+            |_, _, _| false,
+            |_, _| true,
+        );
         (result, read_u32(&mut client).unwrap())
     }
 
@@ -384,32 +576,170 @@ mod tests {
         let (result, status) = exchange(&mut properties, "persist.number", "7", true);
         assert!(result.is_ok());
         assert_eq!(status, 0);
-        assert_eq!(
-            properties.area.get_with_result("persist.number").unwrap(),
-            "7"
-        );
+        assert_eq!(properties.area.get("persist.number").unwrap(), "7");
         assert_eq!(properties.store.values["persist.number"], "7");
-        for (name, value, allowed) in [
-            ("persist.number", "bad", true),
-            ("persist.number", "8", false),
-            ("ctl.start", "x", true),
-            ("sys.powerctl", "reboot", true),
-            ("ro.late", "x", true),
-            ("bad..name", "x", true),
+        for (name, value, allowed, expected) in [
+            (
+                "persist.number",
+                "bad",
+                true,
+                rsproperties::wire::PROP_ERROR_INVALID_VALUE,
+            ),
+            (
+                "persist.number",
+                "8",
+                false,
+                rsproperties::wire::PROP_ERROR_PERMISSION_DENIED,
+            ),
+            (
+                "ro.denied",
+                "x",
+                false,
+                rsproperties::wire::PROP_ERROR_PERMISSION_DENIED,
+            ),
+            (
+                "ctl.start",
+                "x",
+                true,
+                rsproperties::wire::PROP_ERROR_HANDLE_CONTROL_MESSAGE,
+            ),
+            (
+                "sys.powerctl",
+                "reboot",
+                true,
+                rsproperties::wire::PROP_SUCCESS,
+            ),
+            (
+                "sys.powerctl",
+                "reboot,userspace",
+                true,
+                rsproperties::wire::PROP_ERROR_INVALID_VALUE,
+            ),
+            (
+                "sys.powerctl",
+                "reboot,",
+                true,
+                rsproperties::wire::PROP_ERROR_INVALID_VALUE,
+            ),
+            ("ro.late", "x", true, rsproperties::wire::PROP_SUCCESS),
+            (
+                "ro.late",
+                "y",
+                true,
+                rsproperties::wire::PROP_ERROR_READ_ONLY_PROPERTY,
+            ),
+            (
+                "bad..name",
+                "x",
+                true,
+                rsproperties::wire::PROP_ERROR_INVALID_NAME,
+            ),
         ] {
             let (result, status) = exchange(&mut properties, name, value, allowed);
             assert!(result.is_ok(), "rejection must keep server alive");
-            assert_ne!(status, 0);
+            assert_eq!(status, expected as u32, "{name}={value}");
         }
+        assert!(properties.area.find("ctl.start").unwrap().is_none());
+        assert!(properties.area.find("sys.powerctl").unwrap().is_none());
+        assert_eq!(properties.area.get("ro.late").unwrap(), "x");
         fs::create_dir(root.join("property/persistent_properties.tmp")).unwrap();
         let (result, status) = exchange(&mut properties, "persist.number", "9", true);
         assert!(result.is_err(), "storage failure must stop server");
-        assert_ne!(status, 0);
-        assert_eq!(
-            properties.area.get_with_result("persist.number").unwrap(),
-            "7"
-        );
+        assert_eq!(status, rsproperties::wire::PROP_ERROR_SET_FAILED as u32);
+        assert_eq!(properties.area.get("persist.number").unwrap(), "7");
         assert_eq!(properties.store.values["persist.number"], "7");
+        drop(properties);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn v1_setprop_is_handled_without_an_acknowledgment() {
+        let root = super::super::tests::temp_dir("v1-wire");
+        let mut properties = super::super::tests::fixture(&root);
+        let (mut client, mut stream) = UnixStream::pair().unwrap();
+        client
+            .write_all(&rsproperties::wire::PROP_MSG_SETPROP.to_le_bytes())
+            .unwrap();
+        let mut name = [0; rsproperties::wire::PROP_NAME_MAX];
+        name[..9].copy_from_slice(b"debug.v1x");
+        let mut value = [0; rsproperties::wire::PROP_VALUE_MAX];
+        value[..5].copy_from_slice(b"value");
+        client.write_all(&name).unwrap();
+        client.write_all(&value).unwrap();
+        handle(
+            &mut stream,
+            &mut properties,
+            |_, _| {
+                Ok(PeerCredentials {
+                    pid: 1,
+                    uid: 0,
+                    gid: 0,
+                })
+            },
+            |_, _, _| false,
+            |_, _| false,
+        )
+        .unwrap();
+        drop(stream);
+        let mut reply = Vec::new();
+        client.read_to_end(&mut reply).unwrap();
+        assert!(reply.is_empty());
+        assert_eq!(properties.area.get("debug.v1x").unwrap(), "value");
+        drop(properties);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn control_requests_use_guest_handlers_without_writing_properties() {
+        let root = super::super::tests::temp_dir("control-wire");
+        let mut properties = super::super::tests::fixture(&root);
+        let peer = PeerCredentials {
+            pid: 42,
+            uid: 1000,
+            gid: 1000,
+        };
+        for (name, value) in [
+            ("ctl.start", "zygote"),
+            ("sys.powerctl", "shutdown,userrequested"),
+        ] {
+            let (mut client, mut stream) = UnixStream::pair().unwrap();
+            for part in [
+                rsproperties::wire::PROP_MSG_SETPROP2.to_le_bytes().to_vec(),
+                (name.len() as u32).to_le_bytes().to_vec(),
+                name.as_bytes().to_vec(),
+                (value.len() as u32).to_le_bytes().to_vec(),
+                value.as_bytes().to_vec(),
+            ] {
+                client.write_all(&part).unwrap();
+            }
+            let mut service_called = false;
+            let mut powerctl_called = false;
+            handle(
+                &mut stream,
+                &mut properties,
+                |_, _| Ok(peer),
+                |action, target, actual_peer| {
+                    assert_eq!(actual_peer.pid, peer.pid);
+                    assert_eq!((action, target), ("start", "zygote"));
+                    service_called = true;
+                    true
+                },
+                |command, actual_peer| {
+                    assert_eq!(actual_peer.pid, peer.pid);
+                    assert_eq!(command, "shutdown,userrequested");
+                    powerctl_called = true;
+                    true
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                read_u32(&mut client).unwrap(),
+                rsproperties::wire::PROP_SUCCESS as u32
+            );
+            assert_eq!(service_called, name == "ctl.start");
+            assert_eq!(powerctl_called, name == "sys.powerctl");
+            assert!(properties.area.find(name).unwrap().is_none());
+        }
         drop(properties);
         fs::remove_dir_all(root).unwrap();
     }

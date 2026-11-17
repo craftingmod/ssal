@@ -2,6 +2,7 @@
 name = "ssal"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.85"
 publish = false
 
 [features]
@@ -23,5 +24,5 @@ serde_json = "1.0.154"
 sha2 = "0.11.1"
 
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
-rsproperties = { version = "=0.6.0", features = ["builder", "strict-file-validation"] }
+rsproperties = { version = "=0.7.0", features = ["builder", "strict-file-validation"] }
 prost = "0.14"

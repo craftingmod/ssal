@@ -1414,6 +1414,7 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
         if let Some(service) = &mut property_service {
             service.stop()?;
             fs::remove_file(root.join("dev/socket/property_service"))?;
+            fs::remove_file(root.join("dev/socket/property_service_for_system"))?;
         }
         isolated(root, userdata)?;
         Ok(())
@@ -1430,6 +1431,11 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
             cleanup_errors.push(error.to_string());
         }
         match fs::remove_file(root.join("dev/socket/property_service")) {
+            Ok(()) => (),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+            Err(error) => cleanup_errors.push(error.to_string()),
+        }
+        match fs::remove_file(root.join("dev/socket/property_service_for_system")) {
             Ok(()) => (),
             Err(error) if error.kind() == io::ErrorKind::NotFound => (),
             Err(error) => cleanup_errors.push(error.to_string()),

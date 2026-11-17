@@ -1,10 +1,11 @@
+mod control;
 #[cfg(all(test, target_os = "android"))]
 mod device_test;
 mod persistent;
 mod policy;
 mod server;
 
-use rsproperties::{PropertyInfoEntry, SystemProperties};
+use rsproperties::{MatchKeyword, PropertyInfoEntry, SystemProperties};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -16,6 +17,7 @@ use std::path::{Path, PathBuf};
 
 const AREA: &str = "/dev/__properties__";
 const SOCKET: &str = "/dev/socket/property_service";
+const SYSTEM_SOCKET: &str = "/dev/socket/property_service_for_system";
 const PERSIST_DIRECTORY: &str = "/data/property";
 const DIRECTORY_CONTEXT: &str = "u:object_r:ssal_guest_property_dir:s0";
 const INFO_CONTEXT: &str = "u:object_r:ssal_guest_property_info:s0";
@@ -30,6 +32,7 @@ pub struct Config {
     pub host_data_identity: [u64; 2],
     pub host_persistent_identity: [u64; 2],
     pub host_socket_identity: [u64; 2],
+    pub session_owner_pid: i32,
     pub property_contexts: Vec<PathBuf>,
     pub build_props: Vec<PathBuf>,
     #[serde(default)]
@@ -70,17 +73,44 @@ impl Properties {
         &self,
         name: &str,
         value: &str,
-        authorize: impl FnOnce(&str) -> io::Result<()>,
-    ) -> io::Result<()> {
-        let context = self.policy.validate(name, value)?;
-        authorize(context)?;
-        if name.starts_with("ro.") {
+        authorize: impl FnOnce(&str) -> io::Result<server::PeerCredentials>,
+    ) -> io::Result<server::PeerCredentials> {
+        rsproperties::wire::validate_property_name(name)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        rsproperties::wire::validate_value_len(name, value)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let property_name = if let Some(actual) = name.strip_prefix("next_boot.") {
+            if !actual.starts_with("persist.") {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "only persistent properties may be staged",
+                ));
+            }
+            actual
+        } else {
+            name
+        };
+        if property_name == "selinux.restorecon_recursive" {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "Guest read-only properties sealed",
+                "Guest restorecon control is disabled",
             ));
         }
-        Ok(())
+        let (context, kind) = self.policy.resolve(property_name);
+        let peer = authorize(context)?;
+        if !name.starts_with("ctl.") && !policy::check_type(kind, value) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "property type mismatch",
+            ));
+        }
+        if name.starts_with("ro.") && self.area.find(name).map_err(io::Error::other)?.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "Guest read-only property already set",
+            ));
+        }
+        Ok(peer)
     }
 
     fn set(&mut self, name: &str, value: &str) -> io::Result<()> {
@@ -106,6 +136,8 @@ fn check_isolation(config: &Config) -> io::Result<()> {
         || config.host_data_identity.contains(&0)
         || config.host_persistent_identity.contains(&0)
         || config.host_socket_identity.contains(&0)
+        || config.session_owner_pid <= 1
+        || unsafe { libc::getppid() } != config.session_owner_pid
         || identity(Path::new(AREA))? == config.host_property_identity
         || identity(Path::new("/data"))? == config.host_data_identity
         || identity(Path::new(PERSIST_DIRECTORY))? == config.host_persistent_identity
@@ -353,8 +385,8 @@ fn load_policy(paths: &[PathBuf]) -> io::Result<policy::Policy> {
     let mut entries = Vec::new();
     for path in paths {
         guest_input(path)?;
-        let (mut parsed, errors) =
-            PropertyInfoEntry::parse_from_file(path, true).map_err(io::Error::other)?;
+        let (mut parsed, errors) = PropertyInfoEntry::parse_from_file(path, MatchKeyword::Checked)
+            .map_err(io::Error::other)?;
         if !errors.is_empty() {
             return Err(io::Error::other(format!(
                 "invalid property contexts: {}",
@@ -421,6 +453,11 @@ fn load_seeds(paths: &[PathBuf], policy: &policy::Policy) -> io::Result<BTreeMap
             }
             if let Some((name, value)) = line.split_once('=') {
                 let (name, value) = (name.trim(), value.trim());
+                if name.starts_with("ctl.") || name == "sys.powerctl" {
+                    return Err(io::Error::other(
+                        "service control properties are not build.prop values",
+                    ));
+                }
                 policy.validate(name, value)?;
                 seeds.insert(name.into(), value.into());
             } else {
@@ -461,7 +498,7 @@ pub fn serve(config: Config) -> io::Result<()> {
     let mut properties = initialize(policy, seeds, store, Path::new(AREA), mapped_label)
         .map_err(|e| io::Error::new(e.kind(), format!("property area initialization: {e}")))?;
     properties.socket_context = config.context("property_socket", SOCKET_CONTEXT, false)?;
-    server::serve(&mut properties)
+    server::serve(&mut properties, config.session_owner_pid)
         .map_err(|e| io::Error::new(e.kind(), format!("property socket server: {e}")))
 }
 
@@ -584,11 +621,10 @@ mod tests {
         fs::set_permissions(&data, fs::Permissions::from_mode(0o700)).unwrap();
         let policy = policy::Policy {
             default_context: "u:object_r:ssal_guest_property_area:s0".into(),
-            entries: vec![PropertyInfoEntry::new(
-                "persist.number".into(),
-                "u:object_r:ssal_guest_property_area:s0".into(),
+            entries: vec![PropertyInfoEntry::exact(
+                "persist.number",
+                "u:object_r:ssal_guest_property_area:s0",
                 "uint",
-                true,
             )
             .unwrap()],
         };
@@ -606,12 +642,21 @@ mod tests {
         .unwrap()
     }
 
+    fn test_peer() -> server::PeerCredentials {
+        server::PeerCredentials {
+            pid: 1,
+            uid: 0,
+            gid: 0,
+        }
+    }
+
     #[test]
     fn profile_contexts_do_not_fall_back_to_fixed_guest_types() {
         let mut config: Config = serde_json::from_value(serde_json::json!({
             "host_mount_namespace":"mnt:[1]", "host_property_identity":[1,1],
             "host_data_identity":[1,2], "host_persistent_identity":[1,3],
-            "host_socket_identity":[1,4], "property_contexts":[], "build_props":[],
+            "host_socket_identity":[1,4], "session_owner_pid":2,
+            "property_contexts":[], "build_props":[],
             "selinux_types":{"init":"ssal_p0001_init", "default_prop":"ssal_p0001_default_prop"}
         }))
         .unwrap();
@@ -641,6 +686,7 @@ mod tests {
             host_data_identity: [1, 2],
             host_persistent_identity: [1, 3],
             host_socket_identity: [1, 4],
+            session_owner_pid: unsafe { libc::getppid() },
             property_contexts: vec![],
             build_props: vec![],
             selinux_types: BTreeMap::new(),
@@ -652,31 +698,34 @@ mod tests {
     fn mmap_update_notification_restore_and_sealing() {
         let root = temp_dir("mmap");
         let mut properties = fixture(&root);
-        rsproperties::try_init(rsproperties::PropertyConfig::with_properties_dir(
-            root.join("area"),
-        ))
-        .unwrap();
+        rsproperties::init(rsproperties::PropertyConfig::new().properties_dir(root.join("area")))
+            .unwrap();
         assert_eq!(rsproperties::get::<String>("persist.number").unwrap(), "1");
-        let serial = rsproperties::system_properties().context_serial();
+        let properties_reader = rsproperties::system_properties().unwrap();
+        let index = properties_reader.find("persist.number").unwrap().unwrap();
+        let serial = properties_reader.serial(index).unwrap();
         let waiter = std::thread::spawn(move || {
-            rsproperties::system_properties().wait(
-                None,
-                Some(serial),
-                Some(&rsproperties::Timespec {
-                    tv_sec: 2,
-                    tv_nsec: 0,
-                }),
+            rsproperties::system_properties().unwrap().wait_timeout(
+                index,
+                serial,
+                std::time::Duration::from_secs(2),
             )
         });
         properties
-            .check_write("persist.number", "2", |_| Ok(()))
+            .check_write("persist.number", "2", |_| Ok(test_peer()))
             .unwrap();
         properties.set("persist.number", "2").unwrap();
-        assert!(waiter.join().unwrap().is_some());
+        assert!(waiter.join().unwrap().unwrap().is_some());
         assert_eq!(rsproperties::get::<String>("persist.number").unwrap(), "2");
-        assert!(properties.check_write("ro.late", "x", |_| Ok(())).is_err());
+        properties
+            .check_write("ro.late", "x", |_| Ok(test_peer()))
+            .unwrap();
+        properties.set("ro.late", "x").unwrap();
         assert!(properties
-            .check_write("persist.number", "bad", |_| Ok(()))
+            .check_write("ro.late", "y", |_| Ok(test_peer()))
+            .is_err());
+        assert!(properties
+            .check_write("persist.number", "bad", |_| Ok(test_peer()))
             .is_err());
         assert!(properties
             .check_write("persist.number", "3", |_| Err(io::Error::new(
@@ -692,10 +741,7 @@ mod tests {
         drop(properties);
         fs::remove_dir_all(root.join("area")).unwrap();
         let restored = fixture(&root);
-        assert_eq!(
-            restored.area.get_with_result("persist.number").unwrap(),
-            "4"
-        );
+        assert_eq!(restored.area.get("persist.number").unwrap(), "4");
         assert_eq!(restored.store.values["persist.number"], "4");
         assert!(!restored
             .store

@@ -86,12 +86,10 @@ impl Policy {
             }
             return self.validate(actual, value);
         }
-        if name.starts_with("ctl.")
-            || matches!(name, "sys.powerctl" | "selinux.restorecon_recursive")
-        {
+        if name == "selinux.restorecon_recursive" {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "Guest control property disabled",
+                "Guest restorecon control is disabled",
             ));
         }
         let (context, kind) = self.resolve(name);
@@ -148,36 +146,28 @@ pub(super) fn check_access(source: &str, target: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn integer(value: &str, signed: bool) -> bool {
-    let value = value.trim_start_matches(|c: char| c.is_ascii_whitespace());
-    let (negative, digits) = if let Some(s) = value.strip_prefix('-') {
-        if !signed {
-            return false;
-        }
-        (true, s)
-    } else {
-        (false, value.strip_prefix('+').unwrap_or(value))
-    };
-    let (radix, digits) = if let Some(s) = digits
-        .strip_prefix("0x")
-        .or_else(|| digits.strip_prefix("0X"))
-    {
-        (16, s)
-    } else {
-        (10, digits)
-    };
-    let Ok(number) = u64::from_str_radix(digits, radix) else {
+fn double(value: &str) -> bool {
+    let value = value.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']);
+    let Ok(parsed) = value.parse::<f64>() else {
         return false;
     };
-    !signed
-        || if negative {
-            number <= (i64::MAX as u64) + 1
-        } else {
-            number <= i64::MAX as u64
+    if parsed.is_infinite() || parsed.is_subnormal() {
+        return false;
+    }
+    if parsed == 0.0 {
+        let mantissa = value
+            .trim_start_matches(['+', '-'])
+            .split(['e', 'E'])
+            .next()
+            .unwrap_or("");
+        if mantissa.bytes().any(|b| (b'1'..=b'9').contains(&b)) {
+            return false;
         }
+    }
+    true
 }
 
-fn check_type(kind: &str, value: &str) -> bool {
+pub(super) fn check_type(kind: &str, value: &str) -> bool {
     if value.is_empty() {
         return true;
     }
@@ -185,12 +175,9 @@ fn check_type(kind: &str, value: &str) -> bool {
     match parts.next() {
         Some("string") => true,
         Some("bool") => matches!(value, "true" | "false" | "1" | "0"),
-        Some("int") => integer(value, true),
-        Some("uint") => integer(value, false),
-        Some("double") => value
-            .trim_start()
-            .parse::<f64>()
-            .is_ok_and(|v| v.is_finite()),
+        Some("int") => rsproperties::parse::parse_int::<i64>(value).is_some(),
+        Some("uint") => rsproperties::parse::parse_int::<u64>(value).is_some(),
+        Some("double") => double(value),
         Some("size") => value
             .strip_suffix(['k', 'm', 'g'])
             .is_some_and(|s| !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit())),
@@ -203,7 +190,11 @@ fn check_type(kind: &str, value: &str) -> bool {
 mod tests {
     use super::*;
     fn entry(name: &str, context: &str, kind: &str, exact: bool) -> PropertyInfoEntry {
-        PropertyInfoEntry::new(name.into(), context.into(), kind, exact).unwrap()
+        if exact {
+            PropertyInfoEntry::exact(name, context, kind).unwrap()
+        } else {
+            PropertyInfoEntry::prefix(name, context, kind).unwrap()
+        }
     }
     #[test]
     fn exact_prefix_and_inherited_type() {
@@ -223,8 +214,8 @@ mod tests {
         assert_eq!(policy.resolve("persist.test.any"), ("child", "uint"));
         assert_eq!(policy.resolve("persist.test.exact"), ("exact", "enum a b"));
         assert_eq!(policy.resolve("persist.shorter"), ("long", "bool"));
-        assert!(policy.validate("ctl.start", "x").is_err());
-        assert!(policy.validate("sys.powerctl", "reboot").is_err());
+        assert!(policy.validate("ctl.start", "x").is_ok());
+        assert!(policy.validate("sys.powerctl", "reboot").is_ok());
         assert!(policy.validate("persist.test.any", "bad").is_err());
         assert!(policy.validate("persist.test.any", "").is_ok());
         assert_eq!(
@@ -240,14 +231,24 @@ mod tests {
     fn aosp_value_types() {
         for (kind, good, bad) in [
             ("bool", "1", "yes"),
-            ("int", "-0x10", "9223372036854775808"),
+            ("int", "0x10", "9223372036854775808"),
             ("uint", "0xffffffffffffffff", "-1"),
-            ("double", "1.25", "NaN"),
+            ("double", "NaN", "inf"),
             ("size", "128m", "128M"),
             ("enum a b", "b", "c"),
         ] {
             assert!(check_type(kind, good), "{kind}");
             assert!(!check_type(kind, bad), "{kind}");
         }
+    }
+
+    #[test]
+    fn double_matches_aosp_range_and_underflow_rules() {
+        assert!(check_type("double", "1.25"));
+        assert!(check_type("double", "NaN"));
+        assert!(!check_type("double", "inf"));
+        assert!(!check_type("double", "1e-999"));
+        assert!(!check_type("double", "1e-310"));
+        assert!(!check_type("int", "-0x10"));
     }
 }

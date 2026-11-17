@@ -29,11 +29,10 @@ fn mount(
 fn initialize_area() -> Properties {
     let policy = policy::Policy {
         default_context: "u:object_r:build_prop:s0".into(),
-        entries: vec![PropertyInfoEntry::new(
-            "persist.ssal_probe".into(),
-            "u:object_r:build_prop:s0".into(),
+        entries: vec![PropertyInfoEntry::exact(
+            "persist.ssal_probe",
+            "u:object_r:build_prop:s0",
             "uint",
-            true,
         )
         .unwrap()],
     };
@@ -125,7 +124,6 @@ fn bionic_set_get_persist_restart() {
         ("persist.ssal_probe", "8", false, false),
         ("ro.ssal_late", "blocked", true, false),
         ("ctl.start", "ssal_nonexistent_probe", true, false),
-        ("sys.powerctl", "ssal_invalid_probe", true, false),
     ] {
         eprintln!("Bionic request: {name}");
         let mut client = Command::new("/system/bin/setprop")
@@ -138,19 +136,25 @@ fn bionic_set_get_persist_restart() {
         let status = loop {
             match listener.accept() {
                 Ok((mut stream, _)) => {
-                    server::handle(&mut stream, &mut properties, |stream, _| {
-                        let (_, context) = server::peer(stream)?;
-                        assert!(!context.is_empty());
-                        // shortcut: ABI test uses its real KSU peer but synthetic allow/deny; validate Guest MAC separately.
-                        if allowed {
-                            Ok(())
-                        } else {
-                            Err(io::Error::new(
-                                io::ErrorKind::PermissionDenied,
-                                "test denial",
-                            ))
-                        }
-                    })
+                    server::handle(
+                        &mut stream,
+                        &mut properties,
+                        |stream, _target| {
+                            let (credentials, context) = server::peer(stream)?;
+                            assert!(!context.is_empty());
+                            // shortcut: ABI test uses its real KSU peer but synthetic allow/deny; validate Guest MAC separately.
+                            if allowed {
+                                Ok(credentials)
+                            } else {
+                                Err(io::Error::new(
+                                    io::ErrorKind::PermissionDenied,
+                                    "test denial",
+                                ))
+                            }
+                        },
+                        control::service,
+                        |_, _| false,
+                    )
                     .unwrap();
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}

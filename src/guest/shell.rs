@@ -133,6 +133,7 @@ pub(crate) fn standalone(
     *admission = Some(published.finish()?);
     properties.stop()?;
     fs::remove_file(root.join("dev/socket/property_service"))?;
+    fs::remove_file(root.join("dev/socket/property_service_for_system"))?;
     EXIT.store(result?, Ordering::SeqCst);
     Ok(())
 }
