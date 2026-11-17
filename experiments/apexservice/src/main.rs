@@ -18,8 +18,8 @@ impl IApexService for ApexService {
         eprintln!(
             "guest_apex_call=getActivePackages count={} pid={} uid={}",
             self.0.len(),
-            rsbinder::thread_state::get_calling_pid(),
-            rsbinder::thread_state::get_calling_uid()
+            rsbinder::get_calling_pid(),
+            rsbinder::get_calling_uid()
         );
         Ok(self.0.iter().filter(|p| p.isActive).cloned().collect())
     }
@@ -27,8 +27,8 @@ impl IApexService for ApexService {
         eprintln!(
             "guest_apex_call=getAllPackages count={} pid={} uid={}",
             self.0.len(),
-            rsbinder::thread_state::get_calling_pid(),
-            rsbinder::thread_state::get_calling_uid()
+            rsbinder::get_calling_pid(),
+            rsbinder::get_calling_uid()
         );
         Ok(self.0.clone())
     }

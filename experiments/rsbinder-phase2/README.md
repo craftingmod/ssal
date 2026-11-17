@@ -1,6 +1,6 @@
 # rsbinder Phase 2 probes
 
-This standalone crate tests the pinned rsbinder 0.12.0 kernel-Binder path. It does not connect the Host and Guest processes, register a service, or call a service method. Both programs require an explicit absolute Binder path and issue only a ServiceManager lookup followed by INTERFACE_TRANSACTION.
+This standalone crate tests the pinned rsbinder 0.13.0 kernel-Binder path. It does not connect the Host and Guest processes, register a service, or call a service method. Both programs require an explicit absolute Binder path and issue only a ServiceManager lookup followed by INTERFACE_TRANSACTION.
 
 host_probe accepts only /dev/binder. Run it in a fresh process:
 
@@ -14,7 +14,7 @@ Do not run that Guest command in the ordinary Host namespace. The same /dev/bind
 
 The C++ Test B service is `Echo : BBinder`. The Guest `INTERFACE_TRANSACTION` returned `BBinder`; the earlier empty-string expectation was incorrect.
 
-The android_16_plus feature is the narrowest feature covering the plan's Android 16 target and the connected Android 17 device. rsbinder 0.12.0 selects its Android 16 ServiceManager variant for SDK 37. The probe does not need generated AIDL, so rsbinder-aidl is not a direct dependency.
+The android_16_plus feature is the narrowest feature covering the plan's Android 16 target and the connected Android 17 device. rsbinder 0.13.0 selects its Android 16 ServiceManager variant for SDK 37. The probe does not need generated AIDL, so rsbinder-aidl is not a direct dependency.
 
 ## Build
 

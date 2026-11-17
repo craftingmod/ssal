@@ -235,7 +235,7 @@ pub(super) fn run(kind: ProbeKind, args: Args) {
         "android_release": property("ro.build.version.release"),
         "build_fingerprint_redacted": property("ro.build.fingerprint").map(redact_fingerprint),
         "probe_version": env!("CARGO_PKG_VERSION"),
-        "rsbinder_version": "0.12.0",
+        "rsbinder_version": "0.13.0",
         "abi": std::env::consts::ARCH,
         "pid": pid,
         "uid": unsafe { libc::getuid() },
@@ -345,7 +345,7 @@ fn probe(kind: ProbeKind, args: &Args, record: &mut Value) -> Result<(), Failure
             "binder_version",
             "protocol_mismatch",
             format!(
-                "observed {}, rsbinder 0.12.0 expects {}",
+                "observed {}, rsbinder 0.13.0 expects {}",
                 version.protocol_version, EXPECTED_BINDER_PROTOCOL
             ),
         ));

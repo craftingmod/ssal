@@ -6,4 +6,4 @@ publish = false
 
 [dependencies]
 libc = "=0.2.191"
-rsbinder = { version = "=0.12.0", default-features = false, features = ["android_16_plus"] }
+rsbinder = { version = "=0.13.0", default-features = false, features = ["android_16_plus"] }

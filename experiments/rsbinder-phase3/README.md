@@ -1,6 +1,6 @@
 # rsbinder Phase 3
 
-`rsbinder 0.12.0`과 `rsbinder-aidl 0.12.0`으로 만든 Android 전용 진단용 AIDL 서비스/클라이언트입니다. `IPhase3Service`는 `add`, `echo`, 동기 `callCallback`을 제공하고 `IPhase3Callback`은 콜백 문자열을 돌려줍니다. `phase3-ipc`의 모드는 `server`, `client`, `death-client`, `check-absent`입니다.
+`rsbinder 0.13.0`과 `rsbinder-aidl 0.13.0`으로 만든 Android 전용 진단용 AIDL 서비스/클라이언트입니다. `IPhase3Service`는 `add`, `echo`, 동기 `callCallback`을 제공하고 `IPhase3Callback`은 콜백 문자열을 돌려줍니다. `phase3-ipc`의 모드는 `server`, `client`, `death-client`, `check-absent`입니다.
 
 이 코드는 기본 SSAL 실행 경로나 전환 경로에서 호출되지 않습니다. 루트의 `phase3-diagnostic` feature와 전용 `ssald --phase3-rsbinder-runner` 진단 진입점으로만 실행합니다. 실행기는 먼저 기존 C++ Test B와 Phase 2C를 검사한 뒤, 같은 Guest 서비스 이름을 재사용해 Rust 시험을 수행합니다. 실행기 자체는 Host Binder 서비스나 SELinux 정책을 수정하지 않습니다.
 
