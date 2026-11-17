@@ -38,6 +38,7 @@ fn mapped_exec_domain(executable: &str, exec_context: Option<&[u8]>) -> &'static
         match executable {
             "/system/bin/app_process64" => "zygote",
             "/system/bin/servicemanager" => "servicemanager",
+            "/run/ssal/ssal-apexservice" => crate::guest::init::binder_service::APEX.domain,
             "/apex/com.android.sdkext/bin/derive_classpath" => "derive_classpath",
             "/apex/com.android.runtime/bin/linkerconfig" | "/system/bin/linkerconfig" => {
                 "linkerconfig"
@@ -611,6 +612,7 @@ pub(crate) fn verify(
         phase7a,
         ssal::guest_policy::runtime::load(root)?.is_some(),
     )?;
+    let apex_check_only = std::env::var_os("SSAL_GUEST_APEX_CHECK_ONLY").is_some();
     if start_system_server && std::env::var_os("SSAL_PHASE7FB_FORK").is_some() {
         return Err(io::Error::other(
             "SystemServer bring-up cannot use the app fork diagnostic",
@@ -673,6 +675,9 @@ pub(crate) fn verify(
     }
     let runtime = crate::guest::mount::directory(root, "run/ssal", 0o755)?;
     let bin = std::env::current_exe()?.parent().unwrap().to_owned();
+    if start_system_server || apex_check_only {
+        crate::guest::init::binder_service::APEX.install(mounts, root, &bin)?;
+    }
     let mut runtime_bins = vec![
         "guest_probe",
         "phase3-ipc",
@@ -950,6 +955,12 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
         }
         println!("GUEST_SERVICEMANAGER_READINESS=PASS property=servicemanager.ready:true context_manager=Guest_handle_0 service_lookup=aidl_lazy_test_1 private_binder={major}:{minor}");
         println!("PHASE5B=PASS shell=PASS private_aidl=PASS properties=PASS host_control_socket=ABSENT private_binder={major}:{minor}");
+        let mut apexservice = if start_system_server || apex_check_only {
+            Some(crate::guest::init::binder_service::APEX.start(root, guest_binder)?)
+        } else { None };
+        if apexservice.is_some() {
+            crate::guest::init::binder_service::APEX.check(root, guest_binder, "guest_apex_aidl=PASS")?;
+        }
         if phase7a {
             let controlled_fork = std::env::var_os("SSAL_PHASE7FB_FORK").is_some();
             let app_trace = std::env::var_os("SSAL_PHASE8B3D_TRACE").is_some();
@@ -1217,6 +1228,12 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
             let deadline = Instant::now() + Duration::from_secs(observation_seconds);
             while Instant::now() < deadline {
                 crate::guest::process::supervision::check_interrupted()?;
+                if let Some(service) = &mut apexservice {
+                    service.drain_output()?;
+                    if service.exited()? {
+                        return Err(io::Error::other("Guest apexservice exited during SystemServer residence"));
+                    }
+                }
                 if let Some(diagnostics) = &mut zygote.diagnostics {
                     diagnostics.tick()?;
                 }
@@ -1389,6 +1406,7 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
                 ));
             }
         }
+        if let Some(service) = &mut apexservice { service.stop()?; }
         server.stop()?;
         manager.stop()?;
         if let Some(environment) = shell_environment.take() {
@@ -1560,6 +1578,7 @@ mod tests {
         for (executable, domain) in [
             ("/system/bin/app_process64", "zygote"),
             ("/system/bin/servicemanager", "servicemanager"),
+            ("/run/ssal/ssal-apexservice", "apexd"),
             ("/system/bin/sh", "shell"),
         ] {
             assert_eq!(

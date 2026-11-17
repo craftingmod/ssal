@@ -65,9 +65,10 @@ fn varint(bytes: &mut &[u8]) -> io::Result<u64> {
 }
 
 // AOSP ApexManifest: name = field 1, version = field 2. Other fields are skipped.
-fn apex_identity(mut bytes: &[u8]) -> io::Result<(String, u64)> {
+fn apex_identity(mut bytes: &[u8]) -> io::Result<(String, u64, Option<String>)> {
     let mut name = None;
-    let mut version = 0;
+    let mut version_name = None;
+    let mut version = None;
     while !bytes.is_empty() {
         let key = varint(&mut bytes)?;
         if key >> 3 == 0 {
@@ -77,7 +78,7 @@ fn apex_identity(mut bytes: &[u8]) -> io::Result<(String, u64)> {
             0 => {
                 let value = varint(&mut bytes)?;
                 if key >> 3 == 2 {
-                    version = value;
+                    version = Some(value);
                 }
             }
             1 | 5 => {
@@ -98,12 +99,16 @@ fn apex_identity(mut bytes: &[u8]) -> io::Result<(String, u64)> {
                             .to_owned(),
                     );
                 }
+                if key >> 3 == 5 {
+                    version_name = Some(std::str::from_utf8(value).map_err(io::Error::other)?.to_owned());
+                }
                 bytes = &bytes[size..];
             }
             _ => return Err(io::Error::other("unsupported protobuf wire type")),
         }
     }
     let name = name.ok_or_else(|| io::Error::other("APEX module name missing"))?;
+    let version = version.ok_or_else(|| io::Error::other("APEX version missing"))?;
     if name.is_empty()
         || matches!(name.as_str(), "." | "..")
         || !name
@@ -113,7 +118,7 @@ fn apex_identity(mut bytes: &[u8]) -> io::Result<(String, u64)> {
     {
         return Err(io::Error::other("invalid APEX module identity"));
     }
-    Ok((name, version))
+    Ok((name, version, version_name))
 }
 
 pub(super) fn prepare(
@@ -131,12 +136,12 @@ pub(super) fn prepare(
         )?;
     }
     let mut packages = Vec::new();
-    for source in [
+    for (partition, source) in [
         "system/apex",
         "system_ext/apex",
         "product/apex",
         "vendor/apex",
-    ] {
+    ].into_iter().enumerate() {
         let path = match guest_path(root, source) {
             Ok(path) => path,
             Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
@@ -152,7 +157,7 @@ pub(super) fn prepare(
                 path.extension().and_then(|x| x.to_str()),
                 Some("apex" | "capex")
             ) {
-                packages.push(path);
+                packages.push((path, partition as i8));
             }
         }
     }
@@ -163,7 +168,8 @@ pub(super) fn prepare(
     let mut metadata =
         String::from("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<apex-info-list>\n");
     let package_dir = directory(root, "apex/.packages", 0o755)?;
-    for (index, package) in packages.iter().enumerate() {
+    let mut registry = Vec::new();
+    for (index, (package, partition)) in packages.iter().enumerate() {
         println!(
             "preparing APEX {}/{}: {}",
             index + 1,
@@ -181,7 +187,7 @@ pub(super) fn prepare(
         };
         let manifest_file = cache.join(format!("{index}.pb"));
         unzip(&original, "apex_manifest.pb", &manifest_file)?;
-        let (name, version) = apex_identity(&fs::read(&manifest_file)?)?;
+        let (name, version, version_name) = apex_identity(&fs::read(&manifest_file)?)?;
         fs::remove_file(manifest_file)?;
         let destination = root.join("apex").join(&name);
         if destination.exists() {
@@ -202,7 +208,7 @@ pub(super) fn prepare(
         let payload_manifest = versioned.join("apex_manifest.pb");
         let payload_identity = apex_identity(&fs::read(&payload_manifest)
             .map_err(|e| io::Error::new(e.kind(), format!("read payload manifest {}: {e}", payload_manifest.display())))?)?;
-        if payload_identity != (name.clone(), version) {
+        if payload_identity != (name.clone(), version, version_name.clone()) {
             return Err(io::Error::other("APEX outer/payload manifest mismatch"));
         }
         if let Some(plan) = policy {
@@ -214,6 +220,12 @@ pub(super) fn prepare(
         let package_target = package_dir.join(format!("{index}.apex"));
         File::create(&package_target)?;
         mounts.bind(&original, &package_target, true, false)?;
+        let source_path = format!("/{}", package.strip_prefix(root).map_err(io::Error::other)?.to_str().ok_or_else(|| io::Error::other("non UTF-8 APEX path"))?);
+        registry.push(ssal::apex_registry::Package {
+            module_name: name.clone(), version_code: version as i64, version_name,
+            source_path, module_path: format!("/apex/.packages/{index}.apex"),
+            mount_path: format!("/apex/{name}@{version}"), partition: *partition, is_active: true,
+        });
         metadata.push_str(&format!("  <apex-info moduleName=\"{name}\" modulePath=\"/apex/.packages/{index}.apex\" preinstalledModulePath=\"/apex/.packages/{index}.apex\" versionCode=\"{version}\" versionName=\"\" isFactory=\"true\" isActive=\"true\" lastUpdateMillis=\"0\"/>\n"));
         if original != *package {
             fs::remove_file(original)?;
@@ -225,9 +237,15 @@ pub(super) fn prepare(
     }
     metadata.push_str("</apex-info-list>\n");
     fs::write(root.join("apex/apex-info-list.xml"), metadata)?;
+    ssal::apex_registry::validate(&registry).map_err(io::Error::other)?;
+    fs::write(root.join(ssal::apex_registry::PATH.trim_start_matches('/')), serde_json::to_vec(&registry)?)?;
     if let Some(plan) = policy {
         ssal::guest_policy::runtime::set_label(
             &root.join("apex/apex-info-list.xml"),
+            &plan.context("apex_info_file", false)?,
+        )?;
+        ssal::guest_policy::runtime::set_label(
+            &root.join(ssal::apex_registry::PATH.trim_start_matches('/')),
             &plan.context("apex_info_file", false)?,
         )?;
     }
@@ -250,7 +268,7 @@ mod tests {
         let mut manifest = vec![0x0a, 15];
         manifest.extend_from_slice(b"com.android.art");
         manifest.extend_from_slice(&[0x10, 0xac, 0x02, 0x2a, 1, b'v']);
-        assert_eq!(apex_identity(&manifest)?, ("com.android.art".into(), 300));
+        assert_eq!(apex_identity(&manifest)?, ("com.android.art".into(), 300, Some("v".into())));
         assert!(apex_identity(&[0x0a, 20, b'x']).is_err());
         assert!(apex_identity(&[0x10, 1]).is_err());
         assert!(apex_identity(&[0x0a, 2, b'.', b'.']).is_err());

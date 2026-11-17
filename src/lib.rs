@@ -20,3 +20,5 @@ pub mod lock_namespace_probe;
 pub mod platform;
 #[cfg(unix)]
 pub use platform::mount as namespace_mounts;
+#[path = "guest/apex_registry.rs"]
+pub mod apex_registry;

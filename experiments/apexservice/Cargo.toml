@@ -1,0 +1,15 @@
+[package]
+name = "ssal-apexservice"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+ssal-binder-service = { path = "../binder-service" }
+libc = "=0.2.191"
+rsbinder = { version = "=0.12.0", default-features = false, features = ["android_16_plus"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "=1.0.154"
+
+[build-dependencies]
+rsbinder-aidl = "=0.12.0"

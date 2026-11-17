@@ -4,6 +4,8 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$repo_root/target}"
 bash scripts/build-android.sh
+cargo build --locked --release --manifest-path experiments/apexservice/Cargo.toml --target aarch64-linux-android
+install -m 755 "$CARGO_TARGET_DIR/aarch64-linux-android/release/ssal-apexservice" out/bin/ssal-apexservice
 cargo build --locked --release --manifest-path experiments/rsbinder-phase2/Cargo.toml --target aarch64-linux-android --bin guest_probe
 cargo build --locked --release --manifest-path experiments/rsbinder-phase3/Cargo.toml --target aarch64-linux-android
 for name in guest_probe phase3-ipc; do

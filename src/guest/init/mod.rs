@@ -1,4 +1,5 @@
 pub(crate) mod contract;
+pub(crate) mod binder_service;
 mod readiness;
 mod service;
 
