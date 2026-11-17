@@ -947,6 +947,74 @@ fn wait_for_system_server(root: &Path, zygote: &mut Service) -> io::Result<u32> 
     }
 }
 
+fn capture_stalled_system_server_dump(
+    root: &Path,
+    zygote: &mut Service,
+    pid: u32,
+) -> io::Result<()> {
+    let phase = root.parent().unwrap().join("phase7b");
+    let stderr_path = phase.join("stderr.log");
+    let stderr = fs::read_to_string(&stderr_path)?;
+    if let Some(marker) = ["startCoreServices", "startOtherServices", "SystemReady"]
+        .iter()
+        .find(|marker| stderr.contains(**marker))
+    {
+        println!("SYSTEMSERVER_PROGRESS marker={marker}");
+        return Ok(());
+    }
+
+    let process = Path::new("/proc").join(pid.to_string());
+    let status = fs::read_to_string(process.join("status"))?;
+    let parent = status
+        .lines()
+        .find_map(|line| line.strip_prefix("PPid:"))
+        .and_then(|parent| parent.trim().parse::<u32>().ok());
+    let cmdline_bytes = fs::read(process.join("cmdline"))?;
+    let cmdline = String::from_utf8_lossy(&cmdline_bytes);
+    let guest_root = fs::metadata(root)?;
+    let process_root = fs::metadata(process.join("root"))?;
+    if parent != Some(zygote.child.id())
+        || !cmdline.contains("system_server")
+        || (guest_root.dev(), guest_root.ino()) != (process_root.dev(), process_root.ino())
+    {
+        println!("SYSTEMSERVER_THREAD_DUMP=SKIPPED pid={pid} reason=identity_changed");
+        return Ok(());
+    }
+
+    if unsafe { libc::kill(pid as i32, libc::SIGQUIT) } != 0 {
+        println!(
+            "SYSTEMSERVER_THREAD_DUMP=SIGQUIT_FAILED pid={pid} error={}",
+            io::Error::last_os_error()
+        );
+        return Ok(());
+    }
+    println!("SYSTEMSERVER_THREAD_DUMP_REQUESTED pid={pid} signal=SIGQUIT");
+    let start_marker = format!("----- pid {pid} at ");
+    let end_marker = format!("----- end {pid} -----");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if let Some(diagnostics) = &mut zygote.diagnostics {
+            diagnostics.tick()?;
+        }
+        let stderr = fs::read_to_string(&stderr_path)?;
+        if let Some(start) = stderr.find(&start_marker) {
+            if let Some(end) = stderr[start..].find(&end_marker) {
+                let end = start + end + end_marker.len();
+                let dump = &stderr[start..end];
+                fs::write(phase.join("system-server-thread-dump.txt"), dump)?;
+                println!(
+                    "SYSTEMSERVER_THREAD_DUMP=PASS pid={pid} bytes={}",
+                    dump.len()
+                );
+                return Ok(());
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    println!("SYSTEMSERVER_THREAD_DUMP=MISSING pid={pid}");
+    Ok(())
+}
+
 pub(crate) fn memory_probe(root: &Path, hierarchy_test: bool) -> io::Result<()> {
     let oom_test = hierarchy_test && std::env::var_os("SSAL_PHASE7D_FIX_OOM").is_some();
     let backend = crate::memory_cgroup::backend()?;
@@ -2117,7 +2185,8 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
             {
                 println!("Guest Zygote env={}", String::from_utf8_lossy(entry));
             }
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let observation_seconds = 30;
+            let deadline = Instant::now() + Duration::from_secs(observation_seconds);
             while Instant::now() < deadline {
                 crate::memory_cgroup::check_interrupted()?;
                 if let Some(diagnostics) = &mut zygote.diagnostics {
@@ -2154,12 +2223,13 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
                 }
             }
             crate::memory_cgroup::verify_guest_membership(pid)?;
-            println!("Guest Zygote residence pid={pid} starttime={starttime} seconds=5 membership=verified");
+            println!("Guest Zygote residence pid={pid} starttime={starttime} seconds={observation_seconds} membership=verified");
             if let Some(expected) = system_server_pid {
+                capture_stalled_system_server_dump(root, &mut zygote, expected)?;
                 if wait_for_system_server(root, &mut zygote)? != expected {
                     return Err(io::Error::other("Guest SystemServer identity changed"));
                 }
-                println!("PHASE7A_SYSTEM_SERVER=PASS framework_entry=true residence_seconds=5");
+                println!("PHASE7A_SYSTEM_SERVER=PASS framework_entry=true residence_seconds={observation_seconds}");
             }
             if controlled_fork {
                 fork_probe::run(root, &mut zygote, true)?;
