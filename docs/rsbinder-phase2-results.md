@@ -3,7 +3,7 @@
 - 상태: **Android 17: 2A BUILD-PASS, 2B DEVICE-PASS, 2C DEVICE-PASS. Overall Phase 2 remains PARTIAL until Android 16 handset validation.**
 - 갱신: 2026-11-03 (Asia/Seoul)
 - 계획: [rsbinder-ipc-phase2-plan.md](rsbinder-ipc-phase2-plan.md)
-- 구현: [experiments/rsbinder-phase2](../experiments/rsbinder-phase2/README.md)
+- 구현 소스와 빌드 정의는 2026-11-18 정리 과정에서 제거했다. 아래 명령과 결과는 당시 기록이다.
 
 ## 2A — 환경 및 재현 빌드
 

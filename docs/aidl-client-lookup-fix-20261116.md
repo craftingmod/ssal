@@ -43,8 +43,8 @@ attempt52의 applied-before/after 비교는 위 두 statement 추가뿐이었다
 ```sh
 cargo fmt --all -- --check
 cargo test --locked -- --test-threads=1
-cargo test --locked --manifest-path experiments/rsbinder-phase3/Cargo.toml
-cargo build --locked --release --manifest-path experiments/rsbinder-phase3/Cargo.toml --target aarch64-linux-android
+cargo test --locked --manifest-path tools/rsbinder/Cargo.toml
+cargo build --locked --release --manifest-path tools/rsbinder/Cargo.toml --target aarch64-linux-android
 bash scripts/build-android.sh
 ```
 

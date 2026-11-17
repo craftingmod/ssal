@@ -45,7 +45,7 @@ Enforcing AVC가 없는 EACCES를 근거로 새 allow 규칙을 추측해 넣지
 
 ## 두 P1 수정
 
-1. `experiments/rsbinder-phase3/src/android.rs`의 Context Manager probe 및 미등록 서비스 검사에서
+1. `tools/rsbinder/src/android.rs`의 Context Manager probe 및 미등록 서비스 검사에서
    `check_interface`의 `NameNotFound` 성공 판정을 제거했다. `try_get_service`의 `Ok(None)`만
    정상 부재로 인정한다. `Ok(Some(_))`와 모든 transaction 오류는 실패다. 서비스 사망 후
    부재 검사도 transaction 오류를 전파한다. 실제 서비스의 `check_interface` 오류는 여전히 실패로 처리한다.
@@ -70,9 +70,9 @@ Enforcing AVC가 없는 EACCES를 근거로 새 allow 규칙을 추측해 넣지
 
 ```sh
 cargo fmt --all -- --check
-cargo fmt --manifest-path experiments/rsbinder-phase3/Cargo.toml -- --check
+cargo fmt --manifest-path tools/rsbinder/Cargo.toml -- --check
 cargo test --locked -- --test-threads=1
-cargo test --locked --manifest-path experiments/rsbinder-phase3/Cargo.toml
+cargo test --locked --manifest-path tools/rsbinder/Cargo.toml
 bash scripts/build-guest-launcher.sh
 ```
 

@@ -679,7 +679,6 @@ pub(crate) fn verify(
         crate::guest::init::binder_service::APEX.install(mounts, root, &bin)?;
     }
     let mut runtime_bins = vec![
-        "guest_probe",
         "phase3-ipc",
         "ssal-phase2-log.so",
         "ssal-zygote-diag.so",

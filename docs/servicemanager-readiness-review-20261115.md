@@ -6,7 +6,7 @@
 ## 검토 판정: 수정 필요
 
 1. **[P1] Context Manager probe가 조회 오류를 성공으로 처리한다.**
-   `experiments/rsbinder-phase3/src/android.rs:245`는 존재하지 않는 이름에 대한 `check_interface`의 `NameNotFound`를 성공으로 인정한다. 설치된 rsbinder 0.12.0의 `src/hub/mod.rs:944`는 `check_service`가 반환한 None을 NameNotFound로 바꾼다. Android16 `src/hub/servicemanager_16.rs:147–152`는 checkService2 transaction 오류도 None으로 바꾼다. 따라서 서비스가 없는 정상 응답과 transaction 오류를 구분하지 못한다.
+   `tools/rsbinder/src/android.rs:245`는 존재하지 않는 이름에 대한 `check_interface`의 `NameNotFound`를 성공으로 인정한다. 설치된 rsbinder 0.12.0의 `src/hub/mod.rs:944`는 `check_service`가 반환한 None을 NameNotFound로 바꾼다. Android16 `src/hub/servicemanager_16.rs:147–152`는 checkService2 transaction 오류도 None으로 바꾼다. 따라서 서비스가 없는 정상 응답과 transaction 오류를 구분하지 못한다.
    최소 수정은 오류를 보존하는 `try_get_service`의 `Ok(None)`만 정상 응답으로 인정하는 것이다. 최종 AIDL 실제 호출 검사는 별도이므로 이 문제만으로 최종 readiness 전체가 거짓 PASS한다고 단정하지 않는다.
 
 2. **[P1] 이전 worker가 property readiness를 충족할 수 없다.**
