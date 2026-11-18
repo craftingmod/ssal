@@ -4,7 +4,7 @@ use crate::diagnostics::launcher::{
 };
 use crate::guest::environment::start_property_service;
 use crate::guest::init::{wait_for_system_server, Service};
-use ssal::guest_initrc as initrc;
+use ssal::guest_initrc::{self as initrc, BootService};
 use crate::guest::runtime::classpath::{
     derive_guest_classpath, guest_env_value, DERIVE_CLASSPATH_CONTEXT,
 };
@@ -15,7 +15,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -46,6 +46,7 @@ fn mapped_exec_domain(executable: &str, exec_context: Option<&[u8]>) -> &'static
             "/system/bin/app_process64" => "zygote",
             "/system/bin/servicemanager" => "servicemanager",
             "/run/ssal/ssal-apexservice" => crate::guest::init::binder_service::APEX.domain,
+            "/run/ssal/ssal-system-suspend" => crate::guest::init::binder_service::SUSPEND.domain,
             "/apex/com.android.sdkext/bin/derive_classpath" => "derive_classpath",
             "/apex/com.android.runtime/bin/linkerconfig" | "/system/bin/linkerconfig" => {
                 "linkerconfig"
@@ -65,9 +66,10 @@ pub(crate) fn command(
 ) -> io::Result<Command> {
     crate::guest::process::supervision::check_interrupted()?;
     // A real Guest mount root also gives Zygote's FD allowlist Guest-relative proc paths.
-    let pivot = executable == "/system/bin/app_process64"
+    let suspend = executable == crate::guest::init::binder_service::SUSPEND.executable;
+    let pivot = suspend || (executable == "/system/bin/app_process64"
         && (std::env::var_os("SSAL_PHASE7FB_FORK").is_some()
-            || std::env::var_os("SSAL_START_SYSTEM_SERVER").is_some());
+            || std::env::var_os("SSAL_START_SYSTEM_SERVER").is_some()));
     let derive_classpath_linker = executable == "/system/bin/bootstrap/linker64"
         && exec_context == Some(DERIVE_CLASSPATH_CONTEXT);
     let mut command = crate::guest::process::command::root_command(root, executable, pivot)?;
@@ -137,6 +139,18 @@ pub(crate) fn command(
             }
             // The root transition already ran; only this child joins Guest cgroups.
             join_cgroups(&pre_exec_cgroups)?;
+            if suspend && Path::new("/sys/power").try_exists()? {
+                if libc::mount(
+                    c"tmpfs".as_ptr(),
+                    c"/sys/power".as_ptr(),
+                    c"tmpfs".as_ptr(),
+                    libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+                    std::ptr::null(),
+                ) != 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+            }
             if let Some(context) = &exec_context {
                 fs::write("/proc/thread-self/attr/exec", context)?;
             }
@@ -767,8 +781,9 @@ pub(crate) fn verify(
         ssal::guest_policy::runtime::load(root)?.is_some(),
     )?;
     let apex_check_only = std::env::var_os("SSAL_GUEST_APEX_CHECK_ONLY").is_some();
+    let suspend_enabled = std::env::var("SSAL_GUEST_SYSTEM_SUSPEND").as_deref() != Ok("0");
     let installd_probe = phase7a && installd_probe_requested();
-    if installd_probe && (start_system_server || apex_check_only) {
+    if installd_probe && (start_system_server || apex_check_only || suspend_enabled) {
         return Err(io::Error::other("Guest installd probe requires an isolated service run"));
     }
     if start_system_server && std::env::var_os("SSAL_PHASE7FB_FORK").is_some() {
@@ -842,6 +857,9 @@ pub(crate) fn verify(
     let bin = std::env::current_exe()?.parent().unwrap().to_owned();
     if start_system_server || apex_check_only {
         crate::guest::init::binder_service::APEX.install(mounts, root, &bin)?;
+    }
+    if suspend_enabled {
+        crate::guest::init::binder_service::SUSPEND.install(mounts, root, &bin)?;
     }
     let mut runtime_bins = vec![
         "phase3-ipc",
@@ -1072,22 +1090,22 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
             return Err(io::Error::other("shell evidence missing"));
         }
         drop(sentinel);
-        let mut init_plan = None;
-        let mut manager_exe = "/system/bin/servicemanager";
-        if use_initrc {
-            let properties = read_initrc_properties(root)?;
-            let plan = init_plan.insert(initrc::Plan::load(root, &properties)?);
-            manager_exe = plan.start(
-                &[Some("early-init"), Some("init")],
-                &properties,
-                "servicemanager",
-                manager_exe,
-                &[],
-            )?;
+        let apex_enabled = start_system_server || apex_check_only;
+        let init_plan = use_initrc
+            .then(|| initrc::Plan::load(root, &read_initrc_properties(root)?))
+            .transpose()?;
+        let mut boot = init_plan.as_ref().map(|plan| plan.boot(apex_enabled));
+        if let Some(queue) = &mut boot {
+            let next = queue.next_start(&read_initrc_properties(root)?)?;
+            if next != Some(BootService::Servicemanager) {
+                return Err(io::Error::other(format!(
+                    "Guest initrc requires servicemanager before other boot services, got {next:?}"
+                )));
+            }
         }
         let mut manager = Service::start(
             root,
-            manager_exe,
+            BootService::Servicemanager.executable(),
             &[],
             "servicemanager",
             1000,
@@ -1137,15 +1155,58 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
         }
         println!("GUEST_SERVICEMANAGER_READINESS=PASS property=servicemanager.ready:true context_manager=Guest_handle_0 service_lookup=aidl_lazy_test_1 private_binder={major}:{minor}");
         println!("PHASE5B=PASS shell=PASS private_aidl=PASS properties=PASS host_control_socket=ABSENT private_binder={major}:{minor}");
-        let mut apexservice = if start_system_server || apex_check_only {
-            Some(crate::guest::init::binder_service::APEX.start(root, guest_binder)?)
+        let mut apexservice = if apex_enabled {
+            let apex = &crate::guest::init::binder_service::APEX;
+            if let Some(queue) = &mut boot {
+                let next = queue.next_start(&read_initrc_properties(root)?)?;
+                if next != Some(BootService::Apexd) {
+                    return Err(io::Error::other(format!(
+                        "Guest initrc requires apexd before Zygote, got {next:?}"
+                    )));
+                }
+                println!("Guest initrc map apexd -> {}", apex.executable);
+            }
+            let service = apex.start(root, guest_binder)?;
+            apex.check(root, guest_binder, use_initrc)?;
+            Some(service)
         } else { None };
-        if apexservice.is_some() {
-            crate::guest::init::binder_service::APEX.check(root, guest_binder, "guest_apex_aidl=PASS")?;
+        if suspend_enabled {
+            let pid = manager.pid();
+            let proc = PathBuf::from(format!("/proc/{pid}"));
+            let sid = fs::read_to_string(proc.join("attr/current"))?;
+            let namespace = fs::read_link(proc.join("ns/mnt"))?;
+            let path = "apex/apex-info-list.xml";
+            let list = fs::metadata(proc.join("root").join(path))?;
+            let guest = fs::metadata(root.join(path))?;
+            if namespace == host_mount_namespace || (list.dev(), list.ino()) != (guest.dev(), guest.ino()) {
+                return Err(io::Error::other("Guest servicemanager APEX mount identity mismatch"));
+            }
+            println!(
+                "Guest VINTF reader pid={pid} sid={} mount_namespace={} apex_info_dev={} apex_info_ino={}",
+                sid.trim_end_matches(['\0', '\n']), namespace.display(), list.dev(), list.ino()
+            );
         }
+        let mut suspend = suspend_enabled
+            .then(|| crate::guest::init::binder_service::start_suspend(root, &bin, guest_binder))
+            .transpose()?;
         if installd_probe {
             probe_installd(root, userdata, host_mount_namespace, guest_binder)?;
         } else if phase7a {
+            if let Some(queue) = &mut boot {
+                let mut properties = read_initrc_properties(root)?;
+                if apexservice.is_some() {
+                    // The APEX check confirmed the write, which the shell may not be allowed to read.
+                    properties
+                        .entry("apexd.status".into())
+                        .or_insert_with(|| "activated".into());
+                }
+                let next = queue.next_start(&properties)?;
+                if next != Some(BootService::Zygote) {
+                    return Err(io::Error::other(format!(
+                        "Guest initrc did not request Zygote, got {next:?}"
+                    )));
+                }
+            }
             let controlled_fork = std::env::var_os("SSAL_PHASE7FB_FORK").is_some();
             let app_trace = std::env::var_os("SSAL_PHASE8B3D_TRACE").is_some();
             if controlled_fork && app_trace {
@@ -1259,19 +1320,9 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
                 "Guest Zygote launch socket=/dev/socket/zygote start_system_server={start_system_server} private_binder={major}:{minor}"
             );
             let args = zygote_args(controlled_fork, start_system_server);
-            let mut zygote_exe = "/system/bin/app_process64";
-            if let Some(plan) = &init_plan {
-                zygote_exe = plan.start(
-                    &[Some("late-init"), None],
-                    &read_initrc_properties(root)?,
-                    "zygote",
-                    zygote_exe,
-                    &zygote_args(false, true),
-                )?;
-            }
             let mut zygote = Service::start(
                 root,
-                zygote_exe,
+                BootService::Zygote.executable(),
                 &args,
                 "guest-zygote",
                 0,
@@ -1418,7 +1469,7 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
             {
                 println!("Guest Zygote env={}", String::from_utf8_lossy(entry));
             }
-            let observation_seconds = 30;
+            let observation_seconds = 180;
             let deadline = Instant::now() + Duration::from_secs(observation_seconds);
             while Instant::now() < deadline {
                 crate::guest::process::supervision::check_interrupted()?;
@@ -1434,6 +1485,12 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
                     service.drain_output()?;
                     if service.exited()? {
                         return Err(io::Error::other("Guest apexservice exited during SystemServer residence"));
+                    }
+                }
+                if let Some((service, broker)) = &mut suspend {
+                    service.drain_output()?;
+                    if service.exited()? || broker.exited()? {
+                        return Err(io::Error::other("Guest SystemSuspend or Host Power Broker exited"));
                     }
                 }
                 if let Some(diagnostics) = &mut zygote.diagnostics {
@@ -1605,6 +1662,10 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
             }
         }
         if let Some(service) = &mut apexservice { service.stop()?; }
+        if let Some((service, broker)) = &mut suspend {
+            service.stop()?;
+            broker.stop()?;
+        }
         server.stop()?;
         manager.stop()?;
         if let Some(environment) = shell_environment.take() {

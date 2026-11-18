@@ -30,6 +30,7 @@ const entries: { name: string; path: string; mode: number }[] = [
     "ssal-enforcing-binder",
     "ssal-property-service",
     "ssal-apexservice",
+    "ssal-system-suspend",
     "ssal-context-map.so",
     "phase3-ipc",
     "ssal-phase2-log.so",

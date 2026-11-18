@@ -5,6 +5,82 @@ use std::fs::File;
 use std::io;
 use std::path::Path;
 use std::process::{Command, Stdio};
+
+const INFO_LIST: &str = "apex/apex-info-list.xml";
+const REQUIRED: &[&str] = &[
+    "com.android.art",
+    "com.android.i18n",
+    "com.android.runtime",
+    "com.android.sdkext",
+    "com.android.tzdata",
+];
+
+fn info_list(packages: &[ssal::apex_registry::Package]) -> String {
+    fn escape(value: &str) -> String {
+        value.replace('&', "&amp;").replace('<', "&lt;").replace('"', "&quot;")
+    }
+
+    let mut xml = String::from("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<apex-info-list>\n");
+    for p in packages {
+        let partition = ["SYSTEM", "SYSTEM_EXT", "PRODUCT", "VENDOR"][p.partition as usize];
+        let source = escape(&p.source_path);
+        let version_name = escape(p.version_name.as_deref().unwrap_or_default());
+        xml.push_str(&format!(
+            "  <apex-info moduleName=\"{}\" modulePath=\"{}\" preinstalledModulePath=\"{source}\" versionCode=\"{}\" versionName=\"{version_name}\" isFactory=\"true\" isActive=\"{}\" lastUpdateMillis=\"0\" partition=\"{partition}\"/>\n",
+            p.module_name, escape(&p.module_path), p.version_code, p.is_active
+        ));
+    }
+    xml.push_str("</apex-info-list>\n");
+    xml
+}
+
+pub(crate) fn verify_ready(mounts: &Mounts, root: &Path) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let registry_path = root.join(ssal::apex_registry::PATH.trim_start_matches('/'));
+    let packages: Vec<ssal::apex_registry::Package> = serde_json::from_slice(&fs::read(registry_path)?)?;
+    ssal::apex_registry::validate(&packages).map_err(io::Error::other)?;
+    for name in REQUIRED {
+        if !packages.iter().any(|p| p.module_name == *name && p.is_active) {
+            return Err(io::Error::other(format!("required Guest APEX {name} is missing")));
+        }
+    }
+
+    let read_only_mount = |path: &Path| -> io::Result<()> {
+        let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())?;
+        let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        if unsafe { libc::statvfs(name.as_ptr(), stats.as_mut_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if !mounts.paths.iter().any(|mounted| mounted == path)
+            || unsafe { stats.assume_init() }.f_flag & libc::ST_RDONLY == 0
+        {
+            return Err(io::Error::other(format!("not a read-only Guest APEX mount: {}", path.display())));
+        }
+        Ok(())
+    };
+    read_only_mount(&root.join("apex"))?;
+    let list = root.join(INFO_LIST);
+    if !fs::symlink_metadata(&list)?.is_file()
+        || fs::metadata(&list)?.dev() != fs::metadata(root.join("apex"))?.dev()
+        || fs::read_to_string(&list)? != info_list(&packages)
+    {
+        return Err(io::Error::other("Guest apex-info-list.xml does not match mounted APEX registry"));
+    }
+    for p in &packages {
+        let active = root.join("apex").join(&p.module_name);
+        let versioned = root.join(p.mount_path.trim_start_matches('/'));
+        read_only_mount(&active)?;
+        read_only_mount(&versioned)?;
+        read_only_mount(&root.join(p.module_path.trim_start_matches('/')))?;
+        let (a, v) = (fs::metadata(&active)?, fs::metadata(&versioned)?);
+        if !p.is_active || (a.dev(), a.ino()) != (v.dev(), v.ino()) {
+            return Err(io::Error::other(format!("Guest APEX active mount mismatch: {}", p.module_name)));
+        }
+    }
+    println!("GUEST_APEX_READY_INPUT=PASS xml=/{} packages={} mounts=ro", INFO_LIST, packages.len());
+    Ok(())
+}
 fn unzip(archive: &Path, member: &str, output: &Path) -> io::Result<()> {
     let mut command = if Path::new("/system/bin/unzip").is_file() {
         Command::new("/system/bin/unzip")
@@ -165,8 +241,6 @@ pub(super) fn prepare(
     if packages.is_empty() {
         return Err(io::Error::other("no guest APEX packages found"));
     }
-    let mut metadata =
-        String::from("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<apex-info-list>\n");
     let package_dir = directory(root, "apex/.packages", 0o755)?;
     let mut registry = Vec::new();
     for (index, (package, partition)) in packages.iter().enumerate() {
@@ -232,7 +306,6 @@ pub(super) fn prepare(
             source_path, module_path: format!("/apex/.packages/{index}.apex"),
             mount_path: format!("/apex/{name}@{version}"), partition: *partition, is_active: true,
         });
-        metadata.push_str(&format!("  <apex-info moduleName=\"{name}\" modulePath=\"/apex/.packages/{index}.apex\" preinstalledModulePath=\"/apex/.packages/{index}.apex\" versionCode=\"{version}\" versionName=\"\" isFactory=\"true\" isActive=\"true\" lastUpdateMillis=\"0\"/>\n"));
         if original != *package {
             fs::remove_file(original)?;
         }
@@ -241,13 +314,12 @@ pub(super) fn prepare(
         Ok(())
         })().map_err(|e| io::Error::new(e.kind(), format!("APEX package {}: {e}", package.display())))?;
     }
-    metadata.push_str("</apex-info-list>\n");
-    fs::write(root.join("apex/apex-info-list.xml"), metadata)?;
     ssal::apex_registry::validate(&registry).map_err(io::Error::other)?;
+    fs::write(root.join(INFO_LIST), info_list(&registry))?;
     fs::write(root.join(ssal::apex_registry::PATH.trim_start_matches('/')), serde_json::to_vec(&registry)?)?;
     if let Some(plan) = policy {
         ssal::guest_policy::runtime::set_label(
-            &root.join("apex/apex-info-list.xml"),
+            &root.join(INFO_LIST),
             &plan.context("apex_info_file", false)?,
         )?;
         ssal::guest_policy::runtime::set_label(
@@ -269,6 +341,23 @@ pub(super) fn prepare(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn info_list_includes_framework_partition_and_escapes_attributes() {
+        let xml = info_list(&[ssal::apex_registry::Package {
+            module_name: "com.android.art".into(),
+            version_code: 42,
+            version_name: Some("A&\"<".into()),
+            source_path: "/system/apex/art.capex".into(),
+            module_path: "/apex/.packages/0.apex".into(),
+            mount_path: "/apex/com.android.art@42".into(),
+            partition: 0,
+            is_active: true,
+        }]);
+        assert!(xml.contains("partition=\"SYSTEM\""));
+        assert!(xml.contains("versionName=\"A&amp;&quot;&lt;\""));
+        assert!(xml.contains("preinstalledModulePath=\"/system/apex/art.capex\""));
+    }
+
     #[test]
     fn apex_identity_uses_manifest_and_rejects_corruption() -> io::Result<()> {
         let mut manifest = vec![0x0a, 15];

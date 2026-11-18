@@ -11,7 +11,7 @@ pub mod native;
 pub mod runtime;
 mod symbols;
 
-const VERSION: u32 = 33;
+const VERSION: u32 = 34;
 
 type Names = BTreeMap<String, String>;
 
@@ -1149,6 +1149,7 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
         "servicemanager",
         "aidl_lazy_test_server",
         "apexd",
+        "system_suspend",
         "zygote",
         "system_server_startup",
         "system_server",
@@ -1293,6 +1294,20 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
         if plan.rules.insert(rule.clone()) {
             native::record(&mut native_rules, rule, 1, 1, &[apexd, apexd, "binder", "call"]);
         }
+    }
+    // Only the launcher supplies the connected broker socket to this Guest domain.
+    if let Some(domain) = plan.types.get("system_suspend") {
+        let rule = format!("allow {domain} ksu unix_stream_socket {{ read write shutdown }}");
+        for permission in ["read", "write", "shutdown"] {
+            native::record(
+                &mut native_rules,
+                rule.clone(),
+                1,
+                1,
+                &[domain, "ksu", "unix_stream_socket", permission],
+            );
+        }
+        plan.rules.insert(rule);
     }
     // Property files are created under the directory type, then receive their final Guest label.
     if let (Some(init), Some(directory)) =

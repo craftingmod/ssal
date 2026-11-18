@@ -83,6 +83,46 @@ pub struct Plan {
     loaded: BTreeSet<std::path::PathBuf>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum BootService {
+    Servicemanager,
+    Apexd,
+    Zygote,
+}
+
+impl BootService {
+    fn named(name: &str) -> Option<Self> {
+        match name {
+            "servicemanager" => Some(Self::Servicemanager),
+            "apexd" => Some(Self::Apexd),
+            "zygote" => Some(Self::Zygote),
+            _ => None,
+        }
+    }
+
+    pub fn executable(self) -> &'static str {
+        match self {
+            Self::Servicemanager => "/system/bin/servicemanager",
+            Self::Apexd => "/system/bin/apexd",
+            Self::Zygote => "/system/bin/app_process64",
+        }
+    }
+}
+
+enum BootItem<'a> {
+    Event(Option<String>),
+    Command(&'a Line),
+    Start(&'a str, &'a Line),
+}
+
+pub struct BootQueue<'a> {
+    plan: &'a Plan,
+    pending: VecDeque<BootItem<'a>>,
+    events: BTreeSet<Option<String>>,
+    started: BTreeSet<BootService>,
+    apex_enabled: bool,
+}
+
 impl Plan {
     pub fn load(root: &Path, properties: &Properties) -> io::Result<Self> {
         let mut plan = Self::default();
@@ -262,72 +302,17 @@ impl Plan {
         self.services.insert(name.clone(), service);
     }
 
-    pub fn start(
-        &self,
-        events: &[Option<&str>],
-        properties: &Properties,
-        name: &str,
-        executable: &str,
-        args: &[&str],
-    ) -> io::Result<&str> {
-        let mut queue: VecDeque<_> = events
-            .iter()
-            .map(|event| event.map(str::to_owned))
-            .collect();
-        let mut visited = BTreeSet::new();
-        let mut start_source = None;
-        // shortcut: a boot event runs once per phase, general repeated triggers need an action queue
-        while let Some(event) = queue.pop_front() {
-            if !visited.insert(event.clone()) {
-                continue;
-            }
-            for action in self
-                .actions
-                .iter()
-                .filter(|action| action.matches(event.as_deref(), None, properties))
-            {
-                for line in &action.commands {
-                    match line.words.as_slice() {
-                        [command, event] if command == "trigger" => {
-                            queue.push_back(Some(event.clone()))
-                        }
-                        [command, target] if command == "start" && target == name => {
-                            start_source.get_or_insert(&line.source);
-                        }
-                        [command, class] if command == "class_start" => {
-                            for target in self.class_members(class) {
-                                if target == name {
-                                    start_source.get_or_insert(&line.source);
-                                } else {
-                                    println!("Guest initrc skip {} class_start {class} service={target}: outside this Guest boot phase", line.source);
-                                }
-                            }
-                        }
-                        [command, _] if command == "start" => {
-                            line.skip("outside this Guest boot phase")
-                        }
-                        _ => line.skip("unsupported Guest init command"),
-                    }
-                }
-            }
+    pub fn boot(&self, apex_enabled: bool) -> BootQueue<'_> {
+        BootQueue {
+            plan: self,
+            pending: [Some("early-init"), Some("init"), Some("late-init"), None]
+                .into_iter()
+                .map(|event| BootItem::Event(event.map(str::to_owned)))
+                .collect(),
+            events: BTreeSet::new(),
+            started: BTreeSet::new(),
+            apex_enabled,
         }
-        let source = start_source
-            .ok_or_else(|| io::Error::other(format!("Guest initrc did not start {name}")))?;
-        let service = self.services.get(name).ok_or_else(|| {
-            io::Error::other(format!("{source}: missing Guest initrc service {name}"))
-        })?;
-        let declaration = &service.declaration;
-        if declaration.words[2] != executable || declaration.words[3..] != *args {
-            return Err(io::Error::other(format!(
-                "{}: {name} executable or arguments differ from the Guest launcher contract",
-                declaration.source
-            )));
-        }
-        println!(
-            "Guest initrc start {name} trigger={source} declaration={}",
-            declaration.source
-        );
-        Ok(&declaration.words[2])
     }
 
     fn class_members<'a>(&'a self, class: &'a str) -> impl Iterator<Item = &'a String> {
@@ -347,6 +332,85 @@ impl Plan {
         let words = &service.declaration.words;
         (words[2] == executable && words[3..] == *args)
             .then_some((service.oneshot, service.restart_period))
+    }
+}
+
+impl BootQueue<'_> {
+    pub fn next_start(&mut self, properties: &Properties) -> io::Result<Option<BootService>> {
+        while let Some(item) = self.pending.pop_front() {
+            match item {
+                BootItem::Event(event) => {
+                    // shortcut: cold boot visits each event once, repeated events use live triggers
+                    if self.events.insert(event.clone()) {
+                        for action in self.plan.actions.iter().rev() {
+                            if action.matches(event.as_deref(), None, properties) {
+                                for line in action.commands.iter().rev() {
+                                    self.pending.push_front(BootItem::Command(line));
+                                }
+                            }
+                        }
+                    }
+                }
+                BootItem::Command(line) => match line.words.as_slice() {
+                    [command, event] if command == "trigger" => {
+                        self.pending.push_back(BootItem::Event(Some(event.clone())));
+                    }
+                    [command, name] if command == "start" || (command == "restart" && name == "apexd") => {
+                        self.pending.push_front(BootItem::Start(name, line));
+                    }
+                    [command, class] if command == "class_start" => {
+                        let members: Vec<_> = self.plan.class_members(class).collect();
+                        for name in members.into_iter().rev() {
+                            self.pending.push_front(BootItem::Start(name, line));
+                        }
+                    }
+                    [command, name, value]
+                        if command == "wait_for_prop" && name == "apexd.status" && value == "activated" =>
+                    {
+                        if self.apex_enabled && properties.get(name) != Some(value) {
+                            return Err(io::Error::other(format!(
+                                "{}: Guest APEX activation has not completed",
+                                line.source
+                            )));
+                        }
+                    }
+                    _ => line.skip("unsupported Guest init command"),
+                },
+                BootItem::Start(name, line) => {
+                    let Some(service) = BootService::named(name) else {
+                        line.skip("service has no Guest boot handler");
+                        continue;
+                    };
+                    if (service == BootService::Apexd && !self.apex_enabled)
+                        || self.started.contains(&service)
+                    {
+                        continue;
+                    }
+                    let declaration = &self.plan.services.get(name).ok_or_else(|| {
+                        io::Error::other(format!("{}: missing Guest initrc service {name}", line.source))
+                    })?.declaration;
+                    let args: &[&str] = match service {
+                        BootService::Zygote => &[
+                            "-Xzygote", "/system/bin", "--zygote", "--start-system-server", "--socket-name=zygote",
+                        ],
+                        _ => &[],
+                    };
+                    if declaration.words[2] != service.executable() || declaration.words[3..] != *args {
+                        return Err(io::Error::other(format!(
+                            "{}: {name} executable or arguments differ from the Guest launcher contract",
+                            declaration.source
+                        )));
+                    }
+                    println!(
+                        "Guest initrc start {name} trigger={} declaration={}",
+                        line.source, declaration.source
+                    );
+                    self.started.insert(service);
+                    return Ok(Some(service));
+                }
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -544,36 +608,41 @@ on property:servicemanager.ready=true
         assert_eq!(import, "/system/etc/init/hw/init.zygote64.rc");
         plan.parse(
             &import,
-            "service zygote /system/bin/app_process64 \"-Xzygote\" /system/bin --zygote\n",
+            "service zygote /system/bin/app_process64 \"-Xzygote\" /system/bin --zygote --start-system-server --socket-name=zygote\n",
         )?;
-        let manager = "/system/bin/servicemanager";
-        let zygote = "/system/bin/app_process64";
-        let args = ["-Xzygote", "/system/bin", "--zygote"];
-        assert!(plan
-            .start(
-                &[Some("early-init")],
-                &props,
-                "servicemanager",
-                manager,
-                &[]
-            )
-            .is_err());
-        assert_eq!(
-            plan.start(&[Some("init")], &props, "servicemanager", manager, &[])?,
-            manager
-        );
-        assert!(plan
-            .start(&[Some("late-init")], &props, "zygote", zygote, &args)
-            .is_err());
+        let mut boot = plan.boot(false);
+        assert_eq!(boot.next_start(&props)?, Some(BootService::Servicemanager));
+        assert_eq!(boot.next_start(&props)?, None);
         let mut ready = props;
         ready.insert("servicemanager.ready".into(), "true".into());
-        assert_eq!(
-            plan.start(&[Some("late-init"), None], &ready, "zygote", zygote, &args)?,
-            zygote
-        );
-        assert!(plan
-            .start(&[Some("late-init")], &ready, "zygote", zygote, &[])
-            .is_err());
+        let mut boot = plan.boot(false);
+        assert_eq!(boot.next_start(&Properties::new())?, Some(BootService::Servicemanager));
+        assert_eq!(boot.next_start(&ready)?, Some(BootService::Zygote));
+        assert_eq!(boot.next_start(&ready)?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn apexd_mapping_requires_a_reachable_start_and_stock_declaration() -> io::Result<()> {
+        for command in ["start", "restart"] {
+            let mut plan = Plan::default();
+            plan.parse(
+                PRIMARY,
+                &format!(
+                    "service apexd /system/bin/apexd\n    disabled\n\
+                     on late-init\n    trigger post-fs-data\n\
+                     on post-fs-data && property:servicemanager.ready=true\n    {command} apexd\n"
+                ),
+            )?;
+            assert_eq!(plan.boot(true).next_start(&Properties::new())?, None);
+            let ready = Properties::from([("servicemanager.ready".into(), "true".into())]);
+            assert_eq!(plan.boot(true).next_start(&ready)?, Some(BootService::Apexd));
+            plan.parse(
+                "/system/etc/init/apexd.rc",
+                "service apexd /system/bin/apexd --bootstrap\n    override\n",
+            )?;
+            assert!(plan.boot(true).next_start(&ready).is_err());
+        }
         Ok(())
     }
 
@@ -581,31 +650,18 @@ on property:servicemanager.ready=true
     #[ignore = "requires the read-only extracted LineageOS GSI init files"]
     fn boot_plan_for_extracted_gsi() -> io::Result<()> {
         let root = std::env::var_os("SSAL_INITRC_FIXTURE").expect("set SSAL_INITRC_FIXTURE");
-        let props = Properties::from([
-            ("ro.zygote".into(), "zygote64".into()),
-            ("servicemanager.ready".into(), "true".into()),
-        ]);
+        let mut props = Properties::from([("ro.zygote".into(), "zygote64".into())]);
         let plan = Plan::load(Path::new(&root), &props)?;
-        plan.start(
-            &[Some("early-init"), Some("init")],
-            &props,
-            "servicemanager",
-            "/system/bin/servicemanager",
-            &[],
-        )?;
-        plan.start(
-            &[Some("late-init"), None],
-            &props,
-            "zygote",
-            "/system/bin/app_process64",
-            &[
-                "-Xzygote",
-                "/system/bin",
-                "--zygote",
-                "--start-system-server",
-                "--socket-name=zygote",
-            ],
-        )?;
+        let mut boot = plan.boot(true);
+        assert_eq!(boot.next_start(&props)?, Some(BootService::Servicemanager));
+        props.insert("servicemanager.ready".into(), "true".into());
+        assert_eq!(boot.next_start(&props)?, Some(BootService::Apexd));
+        let mut blocked = plan.boot(true);
+        assert_eq!(blocked.next_start(&props)?, Some(BootService::Servicemanager));
+        assert_eq!(blocked.next_start(&props)?, Some(BootService::Apexd));
+        assert!(blocked.next_start(&props).is_err());
+        props.insert("apexd.status".into(), "activated".into());
+        assert_eq!(boot.next_start(&props)?, Some(BootService::Zygote));
         Ok(())
     }
 }

@@ -40,6 +40,8 @@ pub struct Config {
     pub property_contexts: Vec<PathBuf>,
     pub build_props: Vec<PathBuf>,
     #[serde(default)]
+    pub apex_ready: bool,
+    #[serde(default)]
     pub selinux_types: BTreeMap<String, String>,
     #[serde(default)]
     pub services: Vec<ServiceDefinition>,
@@ -88,6 +90,9 @@ impl Properties {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         rsproperties::wire::validate_value_len(name, value)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        if name == "apex.all.ready" {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "Guest APEX readiness is set during mount preparation"));
+        }
         if let Some(action) = name.strip_prefix("ctl.") {
             services::validate_control(action, value)?;
             if matches!(action, "start" | "stop" | "restart") {
@@ -487,6 +492,9 @@ fn load_seeds(paths: &[PathBuf], policy: &policy::Policy) -> io::Result<BTreeMap
                         "service control properties are not build.prop values",
                     ));
                 }
+                if name == "apex.all.ready" {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "Guest APEX readiness cannot come from build.prop"));
+                }
                 policy.validate(name, value)?;
                 seeds.insert(name.into(), value.into());
             } else {
@@ -505,8 +513,12 @@ pub fn serve(config: Config) -> io::Result<()> {
     let mut policy = load_policy(&config.property_contexts)
         .map_err(|e| io::Error::new(e.kind(), format!("property contexts: {e}")))?;
     policy.default_context = config.context("default_prop", &policy.default_context, false)?;
-    let seeds = load_seeds(&config.build_props, &policy)
+    let mut seeds = load_seeds(&config.build_props, &policy)
         .map_err(|e| io::Error::new(e.kind(), format!("property seeds: {e}")))?;
+    if config.apex_ready {
+        policy.validate("apex.all.ready", "true")?;
+        seeds.insert("apex.all.ready".into(), "true".into());
+    }
     let persistent_context = config.context("property_data_file", DIRECTORY_CONTEXT, false)?;
     let store = persistent::Store::open(Path::new(PERSIST_DIRECTORY), Some(&persistent_context))
         .map_err(|e| io::Error::new(e.kind(), format!("property persistent store: {e}")))?;
@@ -827,6 +839,7 @@ mod tests {
             session_owner_pid: unsafe { libc::getppid() },
             property_contexts: vec![],
             build_props: vec![],
+            apex_ready: false,
             selinux_types: BTreeMap::new(),
             services: vec![],
             initrc: false,

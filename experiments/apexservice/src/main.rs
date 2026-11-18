@@ -135,12 +135,12 @@ fn load() -> ssal_binder_service::Result<ApexService> {
 
 fn run() -> ssal_binder_service::Result<()> {
     let args: Vec<_> = std::env::args().collect();
-    if args.len() != 4 || !matches!(args[1].as_str(), "serve" | "check") {
-        return Err("usage: ssal-apexservice serve|check GUEST_BINDER_RDEV GUEST_CONTEXT".into());
+    if args.len() != 4 || !matches!(args[1].as_str(), "serve" | "check" | "check-and-activate") {
+        return Err("usage: ssal-apexservice serve|check|check-and-activate GUEST_BINDER_RDEV GUEST_CONTEXT".into());
     }
     let service = load()?;
     ssal_binder_service::init(args[2].parse()?, &args[3])?;
-    if args[1] == "check" {
+    if args[1] != "serve" {
         let remote: rsbinder::Strong<dyn IApexService> =
             rsbinder::hub::check_interface("apexservice")?;
         let all = remote.getAllPackages()?;
@@ -153,6 +153,16 @@ fn run() -> ssal_binder_service::Result<()> {
             Err(error) if error.exception_code() == ExceptionCode::UnsupportedOperation
         ) {
             return Err("APEX mutation was not explicitly rejected".into());
+        }
+        if args[1] == "check-and-activate" {
+            #[cfg(target_os = "android")]
+            if unsafe { libc::__system_property_set(c"apexd.status".as_ptr(), c"activated".as_ptr()) }
+                != 0
+            {
+                return Err("Guest property apexd.status=activated was rejected".into());
+            }
+            #[cfg(not(target_os = "android"))]
+            return Err("APEX activation requires Android properties".into());
         }
         println!(
             "guest_apex_aidl=PASS packages={} active={}",

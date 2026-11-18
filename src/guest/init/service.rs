@@ -58,14 +58,31 @@ impl Service {
         exec_context: Option<&[u8]>,
         env: &[(&str, &str)],
     ) -> io::Result<Self> {
+        Self::start_with_input(root, exe, args, name, uid, exec_context, env, Stdio::null())
+    }
+
+    pub(crate) fn start_with_input(
+        root: &Path,
+        exe: &str,
+        args: &[&str],
+        name: &str,
+        uid: u32,
+        exec_context: Option<&[u8]>,
+        env: &[(&str, &str)],
+        input: Stdio,
+    ) -> io::Result<Self> {
         let log = root.join(format!("run/ssal/{name}.log"));
         File::create(&log)?;
         let mut command = crate::guest::launcher::command(root, exe, uid, exec_context)?;
         // The Rust APEX service uses the mapped exec SID and writes its own diagnostics.
-        let rust_apex = exe == super::binder_service::APEX.executable;
+        let rust_service = [
+            super::binder_service::APEX.executable,
+            super::binder_service::SUSPEND.executable,
+        ]
+        .contains(&exe);
         let installd_probe = name == "installd" && crate::guest::launcher::installd_probe_requested();
-        command.stdin(Stdio::null());
-        if !rust_apex && name != "memory-probe" {
+        command.stdin(input);
+        if !rust_service && name != "memory-probe" {
             command.env("LD_PRELOAD", "/run/ssal/ssal-phase2-log.so");
         }
         for (key, value) in env {
@@ -146,7 +163,7 @@ impl Service {
         } else {
             Vec::new()
         };
-        if !rust_apex && ssal::guest_policy::runtime::load(root)?.is_some() {
+        if !rust_service && ssal::guest_policy::runtime::load(root)?.is_some() {
             let preload = command
                 .get_envs()
                 .find_map(|(key, value)| {

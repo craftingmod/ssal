@@ -1,5 +1,5 @@
 //! Initial mount layout; service execution requires an explicit disposable probe mode.
-mod apex;
+pub(crate) mod apex;
 mod devices;
 mod filesystem;
 pub(crate) mod loop_device;

@@ -15,6 +15,7 @@ pub(crate) fn start_property_service(
     host_mount_namespace: &Path,
     initrc: bool,
 ) -> io::Result<Service> {
+    crate::guest::mount::apex::verify_ready(mounts, root)?;
     // Reuse the established servicemanager view: libselinux rejects an RO root.
     // All control endpoints stay RO; only existing AV/context query files are RW.
     mounts.bind(
@@ -80,6 +81,7 @@ pub(crate) fn start_property_service(
         "host_persistent_identity": host_persistent_identity,
         "property_contexts": ["/run/ssal/guest_property_contexts"],
         "build_props": ["/system/build.prop", "/run/ssal/guest_build.prop"],
+        "apex_ready": true,
     });
     if initrc {
         config["initrc"] = true.into();

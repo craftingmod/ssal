@@ -14,6 +14,7 @@ cargo build --locked --release --target aarch64-linux-android
 cargo build --locked --release --manifest-path experiments/apexservice/Cargo.toml --target aarch64-linux-android
 mkdir -p out/bin
 install -m 755 "$CARGO_TARGET_DIR/aarch64-linux-android/release/ssal-apexservice" out/bin/ssal-apexservice
+install -m 755 "$CARGO_TARGET_DIR/aarch64-linux-android/release/ssal-system-suspend" out/bin/ssal-system-suspend
 install -m 755 "$CARGO_TARGET_DIR/aarch64-linux-android/release/ssal" out/bin/ssal
 install -m 755 "$CARGO_TARGET_DIR/aarch64-linux-android/release/ssald" out/bin/ssald
 install -m 755 "$CARGO_TARGET_DIR/aarch64-linux-android/release/ssal-sepolicy" out/bin/ssal-sepolicy
