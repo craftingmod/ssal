@@ -24,6 +24,12 @@ pub(crate) use crate::diagnostics::launcher::fork_probe::client as fork_client;
 pub(crate) const GUEST_PROBE_CONTEXT: &[u8] = b"u:r:ssal_guest_probe:s0\0";
 const PROPERTY_SERVICE_CONTEXT: &[u8] = b"u:r:ssal_property:s0\0";
 const AIDL_SERVER_CONTEXT: &[u8] = b"u:r:aidl_lazy_test_server:s0\0";
+const INSTALLD: &str = "/system/bin/installd";
+const INSTALLD_CAPS: u32 = 0xff;
+
+pub(crate) fn installd_probe_requested() -> bool {
+    std::env::var_os("SSAL_GUEST_INSTALLD_PROBE").as_deref() == Some(std::ffi::OsStr::new("1"))
+}
 
 pub(in crate::guest) use crate::guest::runtime::zygote::{
     system_server_requested, zygote_args, zygote_sockets,
@@ -66,7 +72,11 @@ pub(crate) fn command(
         && exec_context == Some(DERIVE_CLASSPATH_CONTEXT);
     let mut command = crate::guest::process::command::root_command(root, executable, pivot)?;
     let exec_context = if let Some(plan) = ssal::guest_policy::runtime::load(root)? {
-        let original = mapped_exec_domain(executable, exec_context);
+        let original = if executable == INSTALLD && installd_probe_requested() {
+            "installd"
+        } else {
+            mapped_exec_domain(executable, exec_context)
+        };
         let mut context = plan.context(original, true)?.into_bytes();
         context.push(0);
         Some(context)
@@ -116,6 +126,9 @@ pub(crate) fn command(
         );
     }
     let parent = std::process::id() as libc::pid_t;
+    let installd_namespace = (executable == INSTALLD && installd_probe_requested())
+        .then(|| fs::read_link("/proc/self/ns/mnt"))
+        .transpose()?;
     unsafe {
         command.pre_exec(move || {
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 || libc::getppid() != parent
@@ -136,10 +149,62 @@ pub(crate) fn command(
             if !property_service {
                 crate::guest::cgroup::verify_guest_mount_membership(std::process::id())?;
             }
+            if let Some(expected) = &installd_namespace {
+                let namespace = fs::read_link("/proc/self/ns/mnt")?;
+                if &namespace != expected {
+                    return Err(io::Error::other("Guest installd pre-exec namespace mismatch"));
+                }
+                let evidence = format!(
+                    "Guest installd pre-exec pid={} mount_namespace={}\n",
+                    libc::getpid(),
+                    namespace.display()
+                );
+                libc::write(libc::STDERR_FILENO, evidence.as_ptr().cast(), evidence.len());
+                limit_installd_capabilities()?;
+                // The parent opened stdin before chroot, under its management SID.
+                if libc::close(libc::STDIN_FILENO) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
             Ok(())
         });
     }
     Ok(command)
+}
+
+fn limit_installd_capabilities() -> io::Result<()> {
+    // Retain at most the DAC and identity capabilities used by the Phase 2 daemon.
+    let header = [0x20080522u32, 0];
+    let mut caps = [[0u32; 3]; 2]; // effective, permitted, inheritable
+    unsafe {
+        if libc::syscall(libc::SYS_capget, header.as_ptr(), caps.as_mut_ptr()) != 0
+            || libc::prctl(libc::PR_CAP_AMBIENT, libc::PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0) != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let permitted = caps[0][1] & INSTALLD_CAPS;
+        for bit in 0..64 {
+            let present = libc::prctl(libc::PR_CAPBSET_READ, bit, 0, 0, 0);
+            if present < 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::EINVAL) && bit >= 32 {
+                    break;
+                }
+                return Err(error);
+            }
+            if present != 0
+                && (bit >= 32 || permitted & (1 << bit) == 0)
+                && libc::prctl(libc::PR_CAPBSET_DROP, bit, 0, 0, 0) != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        caps = [[caps[0][0] & permitted, permitted, 0], [0; 3]];
+        if libc::syscall(libc::SYS_capset, header.as_ptr(), caps.as_ptr()) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn run(root: &Path, exe: &str, args: &[&str], uid: u32) -> io::Result<String> {
@@ -592,6 +657,98 @@ fn isolated(root: &Path, userdata: &Path) -> io::Result<()> {
     Ok(())
 }
 
+fn start_data_service(root: &Path, exe: &str, name: &str) -> io::Result<Service> {
+    if exe == INSTALLD {
+        for path in ["data/misc/user", "data/misc/installd"] {
+            crate::guest::mount::directory(root, path, 0o755)?;
+        }
+    }
+    Service::start(root, exe, &[], name, 0, Some(GUEST_PROBE_CONTEXT), &[])
+}
+
+fn probe_installd(root: &Path, userdata: &Path, host_ns: &Path, binder: u64) -> io::Result<()> {
+    let plan = ssal::guest_policy::runtime::load(root)?
+        .ok_or_else(|| io::Error::other("Guest installd requires the mapped policy"))?;
+    let exe = File::open(root.join("system/bin/installd"))?;
+    let upper = File::open(userdata.join(format!(
+        ".ssal-overlay-{}/system/upper/bin/installd",
+        std::process::id()
+    )))?;
+    let expected_label = plan.context("installd_exec", false)?;
+    let host = fs::metadata(INSTALLD)?;
+    let private = upper.metadata()?;
+    let guest = exe.metadata()?;
+    let block = root.join("dev/block");
+    if !block.symlink_metadata()?.is_dir()
+        || fs::read_dir(&block)?.next().is_some()
+        || binder == fs::metadata("/dev/binder")?.rdev()
+    {
+        return Err(io::Error::other("Guest installd device isolation failed"));
+    }
+    if !private.is_file()
+        || private.dev() != fs::metadata(userdata)?.dev()
+        || private.dev() == host.dev()
+        || private.len() != guest.len()
+        || (guest.dev(), guest.ino()) == (host.dev(), host.ino())
+        || ssal::unix::image_context(&upper)? != expected_label
+        || ssal::unix::image_context(&exe)? != expected_label
+    {
+        return Err(io::Error::other("Guest installd executable backing verification failed"));
+    }
+    println!(
+        "Guest installd backing: overlay={}:{} upper={}:{} host={}:{} label={expected_label}",
+        guest.dev(), guest.ino(), private.dev(), private.ino(), host.dev(), host.ino()
+    );
+    let mut service = start_data_service(root, INSTALLD, "installd")?;
+    let pid = service.pid();
+    let result = (|| {
+        let proc = Path::new("/proc").join(pid.to_string());
+        let sid = fs::read_to_string(proc.join("attr/current"))?;
+        let sid = sid.trim_matches(['\0', '\n']);
+        let ns = fs::read_link(proc.join("ns/mnt"))?;
+        let actual = fs::metadata(proc.join("exe"))?;
+        let status = fs::read_to_string(proc.join("status"))?;
+        let mask = |field: &str| {
+            status.lines().find_map(|line| line.strip_prefix(field))
+                .and_then(|bits| u64::from_str_radix(bits.trim(), 16).ok())
+                .ok_or_else(|| io::Error::other(format!("Guest installd {field} missing")))
+        };
+        let effective = mask("CapEff:")?;
+        let bounding = mask("CapBnd:")?;
+        println!(
+            "Guest installd identity pid={pid} sid={sid} CapEff={effective:016x} CapBnd={bounding:016x} mount_namespace={}",
+            ns.display()
+        );
+        if sid != plan.context("installd", true)?
+            || ns == host_ns
+            || ns != fs::read_link("/proc/self/ns/mnt")?
+            || (actual.dev(), actual.ino()) != (guest.dev(), guest.ino())
+            || (effective | bounding) & !u64::from(INSTALLD_CAPS) != 0
+        {
+            return Err(io::Error::other("Guest installd runtime identity mismatch"));
+        }
+        std::thread::sleep(Duration::from_millis(500));
+        if service.exited()? {
+            return Err(io::Error::other("Guest installd exited before Binder lookup"));
+        }
+        let reply = run(
+            root,
+            "/system/bin/bootstrap/linker64",
+            &["/run/ssal/phase3-ipc", "inspect-data-service", "installd"],
+            1000,
+        )?;
+        if !reply.contains("\"descriptor\":\"android.os.IInstalld\"") {
+            return Err(io::Error::other("Guest installd Binder descriptor missing"));
+        }
+        println!("GUEST_INSTALLD_PROBE=PASS private_binder={binder} descriptor=android.os.IInstalld");
+        Ok(())
+    })();
+    service.drain_output()?;
+    println!("Guest installd log:\n{}", fs::read_to_string(&service.log)?);
+    service.stop()?;
+    result
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn verify(
     mounts: &mut Mounts,
@@ -610,6 +767,10 @@ pub(crate) fn verify(
         ssal::guest_policy::runtime::load(root)?.is_some(),
     )?;
     let apex_check_only = std::env::var_os("SSAL_GUEST_APEX_CHECK_ONLY").is_some();
+    let installd_probe = phase7a && installd_probe_requested();
+    if installd_probe && (start_system_server || apex_check_only) {
+        return Err(io::Error::other("Guest installd probe requires an isolated service run"));
+    }
     if start_system_server && std::env::var_os("SSAL_PHASE7FB_FORK").is_some() {
         return Err(io::Error::other(
             "SystemServer bring-up cannot use the app fork diagnostic",
@@ -763,9 +924,13 @@ pub(crate) fn verify(
             )?);
             let property_script = if !phase7i_property_tests {
                 r#"set -eu
-test "$(getprop ro.build.version.sdk)" = 36
-test "$(getprop ro.product.cpu.abilist64)" = arm64-v8a
-test "$(getprop servicemanager.ready)" = false
+sdk=$(getprop ro.build.version.sdk)
+abi=$(getprop ro.product.cpu.abilist64)
+ready=$(getprop servicemanager.ready)
+echo "Guest private properties sdk=$sdk abi64=$abi servicemanager.ready=$ready"
+test "$sdk" = 36
+test "$abi" = arm64-v8a
+test "$ready" = false
 echo SSAL_GUEST_PRIVATE_PROPERTIES=PASS
 "#
             } else if std::env::var_os("SSAL_PHASE7I_VERIFY_PERSIST").is_some() {
@@ -978,7 +1143,9 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
         if apexservice.is_some() {
             crate::guest::init::binder_service::APEX.check(root, guest_binder, "guest_apex_aidl=PASS")?;
         }
-        if phase7a {
+        if installd_probe {
+            probe_installd(root, userdata, host_mount_namespace, guest_binder)?;
+        } else if phase7a {
             let controlled_fork = std::env::var_os("SSAL_PHASE7FB_FORK").is_some();
             let app_trace = std::env::var_os("SSAL_PHASE8B3D_TRACE").is_some();
             if controlled_fork && app_trace {
@@ -1328,18 +1495,14 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
         }
         if phase6a {
             println!("PHASE6A=START installd/artd through common launcher");
-            for path in ["data/misc/user", "data/misc/installd"] {
-                crate::guest::mount::directory(root, path, 0o755)?;
-            }
             if phase6b {
                 crate::guest::mount::directory(root, "data/misc/profiles/cur/0", 0o771)?;
             }
             for (exe, name) in [
-                ("/system/bin/installd", "installd"),
+                (INSTALLD, "installd"),
                 ("/apex/com.android.art/bin/artd", "artd"),
             ] {
-                let mut service =
-                    Service::start(root, exe, &[], name, 0, Some(GUEST_PROBE_CONTEXT), &[])?;
+                let mut service = start_data_service(root, exe, name)?;
                 std::thread::sleep(Duration::from_millis(500));
                 if service.exited()? {
                     return Err(io::Error::other(format!(

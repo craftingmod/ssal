@@ -4,8 +4,6 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$repo_root/target}"
 bash scripts/build-android.sh
-cargo build --locked --release --manifest-path experiments/apexservice/Cargo.toml --target aarch64-linux-android
-install -m 755 "$CARGO_TARGET_DIR/aarch64-linux-android/release/ssal-apexservice" out/bin/ssal-apexservice
 cargo build --locked --release --manifest-path tools/rsbinder/Cargo.toml --target aarch64-linux-android
 install -m 755 "$CARGO_TARGET_DIR/aarch64-linux-android/release/phase3-ipc" out/bin/phase3-ipc
 # The established Guest-only logger is built by build-binder-probe.sh.

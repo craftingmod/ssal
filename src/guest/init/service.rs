@@ -61,11 +61,12 @@ impl Service {
         let log = root.join(format!("run/ssal/{name}.log"));
         File::create(&log)?;
         let mut command = crate::guest::launcher::command(root, exe, uid, exec_context)?;
-        command
-            .stdin(Stdio::null())
-            .env("LD_PRELOAD", "/run/ssal/ssal-phase2-log.so");
-        if name == "memory-probe" {
-            command.env_remove("LD_PRELOAD");
+        // The Rust APEX service uses the mapped exec SID and writes its own diagnostics.
+        let rust_apex = exe == super::binder_service::APEX.executable;
+        let installd_probe = name == "installd" && crate::guest::launcher::installd_probe_requested();
+        command.stdin(Stdio::null());
+        if !rust_apex && name != "memory-probe" {
+            command.env("LD_PRELOAD", "/run/ssal/ssal-phase2-log.so");
         }
         for (key, value) in env {
             command.env(key, value);
@@ -145,7 +146,7 @@ impl Service {
         } else {
             Vec::new()
         };
-        if ssal::guest_policy::runtime::load(root)?.is_some() {
+        if !rust_apex && ssal::guest_policy::runtime::load(root)?.is_some() {
             let preload = command
                 .get_envs()
                 .find_map(|(key, value)| {
@@ -164,6 +165,22 @@ impl Service {
         let started = Instant::now();
         let child = command.args(args).spawn()?;
         drop(sockets);
+        if installd_probe {
+            let proc = Path::new("/proc").join(child.id().to_string());
+            let namespace = fs::read_link(proc.join("ns/mnt"))
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|error| format!("unavailable: {error}"));
+            let caps = fs::read_to_string(proc.join("status"))
+                .map(|status| {
+                    status
+                        .lines()
+                        .filter(|line| line.starts_with("CapEff:") || line.starts_with("CapBnd:"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .unwrap_or_else(|error| format!("unavailable: {error}"));
+            println!("Guest installd post-exec pid={} mount_namespace={namespace} {caps}", child.id());
+        }
         let context = fs::read_to_string(format!("/proc/{}/attr/current", child.id()))
             .map(|context| context.trim_matches('\0').trim().to_owned())
             .unwrap_or_else(|error| format!("unavailable: {error}"));

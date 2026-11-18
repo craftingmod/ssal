@@ -114,7 +114,11 @@ pub fn verify(
             | "--guest-services-6b-worker"
             | "--guest-zygote-7a-worker"
     );
-    let policy = if mode == "--prepare-worker"
+    let installd_probe =
+        mode == "--guest-zygote-7a-worker" && crate::guest::launcher::installd_probe_requested();
+    let policy = if installd_probe {
+        Some(ssal::guest_policy::runtime::load_applied_for_probe(system, profile_dir)?)
+    } else if mode == "--prepare-worker"
         || mode == "--shell-worker"
         || (mapped_launch && profile_dir.join("selinux/plan.json").is_file())
     {
@@ -145,6 +149,16 @@ pub fn verify(
         }
         mounts.tmpfs(&root, 0o755)?;
         filesystem::compose_system(&mut mounts, system, &root)?;
+        if installd_probe {
+            let lower = fs::symlink_metadata(guest_path(&root, "system/bin/installd")?)?;
+            let host = fs::metadata("/system/bin/installd")?;
+            if !lower.is_file()
+                || lower.dev() != fs::metadata(system)?.dev()
+                || (lower.dev(), lower.ino()) == (host.dev(), host.ino())
+            {
+                return Err(io::Error::other("Guest installd lower backing is not the system image"));
+            }
+        }
         if let Some(plan) = &policy {
             fs::create_dir(&overlay_backing)?;
             overlay_created = true;

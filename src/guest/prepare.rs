@@ -157,6 +157,10 @@ pub(crate) fn worker_admitted(
     if force_regen && mode != "--prepare-worker" {
         return Err(io::Error::other("--regen is only supported by prepare"));
     }
+    let installd_probe = crate::guest::launcher::installd_probe_requested();
+    if installd_probe && mode != "--guest-zygote-7a-worker" {
+        return Err(io::Error::other("Guest installd probe requires the 7A worker"));
+    }
     crate::diagnostics::selinux::servicemanager::check_recovery()?;
     let host_mount_namespace = crate::guest::mount::namespace::enter()?;
     let system_target = base.join("system");
@@ -167,6 +171,16 @@ pub(crate) fn worker_admitted(
         .parent()
         .ok_or_else(|| io::Error::other("profile parent missing"))?;
     let data_file = crate::guest::userdata::open(userdata)?;
+    if installd_probe {
+        let original = fs::metadata(profile_dir.join("userdata.img"))?;
+        let copy = data_file.metadata()?;
+        if !userdata.file_name().and_then(|name| name.to_str()).is_some_and(|name| {
+            name.starts_with(".userdata-") && name.ends_with(".img")
+        }) || (copy.dev(), copy.ino()) == (original.dev(), original.ino())
+        {
+            return Err(io::Error::other("Guest installd probe requires temporary userdata"));
+        }
+    }
     crate::guest::userdata::lock(&data_file)?;
     crate::guest::userdata::check_filesystem(userdata)?;
     let mut data_mounted = false;

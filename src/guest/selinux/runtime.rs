@@ -606,6 +606,39 @@ fn invalid_cstring(e: std::ffi::NulError) -> io::Error {
     invalid(e.to_string())
 }
 
+pub fn load_applied_for_probe(system: &Path, profile: &Path) -> io::Result<Plan> {
+    enforcing()?;
+    let dir = profile.join("selinux");
+    let desired = fs::read(dir.join("plan.json"))?;
+    let compatible = fs::read(dir.join("compatible-plan.json"))?;
+    let evidence: serde_json::Value =
+        serde_json::from_slice(&fs::read(dir.join("compatibility.json"))?)?;
+    let applied: Applied = serde_json::from_slice(&fs::read(dir.join("applied.json"))?)?;
+    let plan: Plan = serde_json::from_slice(&desired)?;
+    let compatible_plan: Plan = serde_json::from_slice(&compatible)?;
+    let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
+    let hashes: Vec<_> = inputs(system)?
+        .iter()
+        .map(|(path, text)| Input {
+            path: path.clone(),
+            sha256: digest(text.as_bytes()),
+        })
+        .collect();
+    if plan.version != VERSION
+        || plan.input_hash != digest(&serde_json::to_vec(&hashes)?)
+        || evidence["desired_plan_sha256"] != digest(&desired)
+        || evidence["compatible_plan_sha256"] != digest(&compatible)
+        || evidence["boot_id"] != boot
+        || applied.boot_id != boot
+        || applied.pending
+        || !delta(&compatible_plan, &applied)?.is_empty()
+    {
+        return Err(invalid("Guest probe requires an already applied plan for this image and boot"));
+    }
+    plan.usable()?;
+    Ok(plan)
+}
+
 pub fn prepare_mounted(system: &Path, profile: &Path, force_regen: bool) -> io::Result<Plan> {
     fs::create_dir_all(profile.join("selinux"))?;
     let prepare_lock = File::create(profile.join("selinux/prepare.lock"))?;

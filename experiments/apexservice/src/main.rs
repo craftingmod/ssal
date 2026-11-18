@@ -16,13 +16,14 @@ fn denied<T>() -> BinderResult<T> {
 }
 impl IApexService for ApexService {
     fn getActivePackages(&self) -> BinderResult<Vec<ApexInfo>> {
+        let active: Vec<_> = self.0.iter().filter(|p| p.isActive).cloned().collect();
         eprintln!(
             "guest_apex_call=getActivePackages count={} pid={} uid={}",
-            self.0.len(),
+            active.len(),
             rsbinder::get_calling_pid(),
             rsbinder::get_calling_uid()
         );
-        Ok(self.0.iter().filter(|p| p.isActive).cloned().collect())
+        Ok(active)
     }
     fn getAllPackages(&self) -> BinderResult<Vec<ApexInfo>> {
         eprintln!(
@@ -143,18 +144,21 @@ fn run() -> ssal_binder_service::Result<()> {
         let remote: rsbinder::Strong<dyn IApexService> =
             rsbinder::hub::check_interface("apexservice")?;
         let all = remote.getAllPackages()?;
-        if all != service.0 || remote.getActivePackages()? != service.getActivePackages()? {
+        let active = remote.getActivePackages()?;
+        if all != service.0 || active.is_empty() || active != service.getActivePackages()? {
             return Err("Guest APEX AIDL results differ from mount registry".into());
         }
-        if remote
-            .installAndActivatePackage("/no-install", false)
-            .unwrap_err()
-            .exception_code()
-            != ExceptionCode::UnsupportedOperation
-        {
+        if !matches!(
+            remote.installAndActivatePackage("/no-install", false),
+            Err(error) if error.exception_code() == ExceptionCode::UnsupportedOperation
+        ) {
             return Err("APEX mutation was not explicitly rejected".into());
         }
-        println!("guest_apex_aidl=PASS packages={}", all.len());
+        println!(
+            "guest_apex_aidl=PASS packages={} active={}",
+            all.len(),
+            active.len()
+        );
         return Ok(());
     }
     ssal_binder_service::register("apexservice", BnApexService::new_binder(service))?;
@@ -284,8 +288,14 @@ mod tests {
         let mut roundtrip = ApexInfo::default();
         roundtrip.read_from_parcel(&mut p)?;
         assert_eq!(roundtrip, info);
-        let service = ApexService(vec![info]);
-        assert_eq!(service.getAllPackages()?, service.getActivePackages()?);
+        let inactive = ApexInfo {
+            moduleName: "com.android.inactive".into(),
+            isActive: false,
+            ..info.clone()
+        };
+        let service = ApexService(vec![info.clone(), inactive.clone()]);
+        assert_eq!(service.getAllPackages()?, vec![info.clone(), inactive]);
+        assert_eq!(service.getActivePackages()?, vec![info]);
         assert!(service.getSessions()?.is_empty());
         assert!(service.getStagedSessionInfo(42)?.isUnknown);
         assert_eq!(
