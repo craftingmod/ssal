@@ -5,6 +5,7 @@ mod persistent;
 mod policy;
 mod server;
 mod services;
+mod triggers;
 
 pub use services::ServiceDefinition;
 
@@ -42,6 +43,8 @@ pub struct Config {
     pub selinux_types: BTreeMap<String, String>,
     #[serde(default)]
     pub services: Vec<ServiceDefinition>,
+    #[serde(default)]
+    pub initrc: bool,
 }
 
 impl Config {
@@ -71,6 +74,7 @@ struct Properties {
     store: persistent::Store,
     policy: policy::Policy,
     socket_context: String,
+    initrc: Option<crate::guest_initrc::PropertyTriggers>,
 }
 
 impl Properties {
@@ -139,7 +143,11 @@ impl Properties {
         if name.starts_with("persist.") || name.starts_with("next_boot.persist.") {
             self.store.commit(name, value)?;
         }
-        self.area.set(name, value).map_err(io::Error::other)
+        self.area.set(name, value).map_err(io::Error::other)?;
+        if let Some(initrc) = &mut self.initrc {
+            initrc.changed(name, value);
+        }
+        Ok(())
     }
 }
 
@@ -519,9 +527,21 @@ pub fn serve(config: Config) -> io::Result<()> {
     let mut properties = initialize(policy, seeds, store, Path::new(AREA), mapped_label)
         .map_err(|e| io::Error::new(e.kind(), format!("property area initialization: {e}")))?;
     properties.socket_context = config.context("property_socket", SOCKET_CONTEXT, false)?;
+    let init_context = config.initrc
+        .then(|| config.context("init", "u:r:ssal_property:s0", true))
+        .transpose()?;
     let mut services = services::Registry::new(config.services, &config.selinux_types)?;
     services.publish(&mut properties)?;
-    server::serve(&mut properties, config.session_owner_pid, &mut services)
+    if init_context.is_some() {
+        let mut values = crate::guest_initrc::Properties::new();
+        properties.area.list(|name, value| {
+            values.insert(name.to_owned(), value.to_owned());
+        }).map_err(io::Error::other)?;
+        let plan = crate::guest_initrc::Plan::load(Path::new("/"), &values)?;
+        services.apply_restart_options(&plan);
+        properties.initrc = Some(crate::guest_initrc::PropertyTriggers::new(plan, values));
+    }
+    server::serve(&mut properties, config.session_owner_pid, &mut services, init_context.as_deref())
         .map_err(|e| io::Error::new(e.kind(), format!("property socket server: {e}")))
 }
 
@@ -590,6 +610,7 @@ fn initialize(
         store,
         policy,
         socket_context: SOCKET_CONTEXT.into(),
+        initrc: None,
     })
 }
 
@@ -808,6 +829,7 @@ mod tests {
             build_props: vec![],
             selinux_types: BTreeMap::new(),
             services: vec![],
+            initrc: false,
         };
         assert!(check_isolation(&config).is_err());
     }

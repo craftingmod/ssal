@@ -181,6 +181,12 @@ pub(super) fn prepare(
         let original = if package.extension().is_some_and(|x| x == "capex") {
             let original = cache.join(format!("{index}.apex"));
             unzip(package, "original_apex", &original)?;
+            if let Some(plan) = policy {
+                ssal::guest_policy::runtime::set_label(
+                    &original,
+                    &plan.context("apex_data_file", false)?,
+                )?;
+            }
             original
         } else {
             package.clone()

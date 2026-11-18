@@ -312,6 +312,7 @@ pub(super) fn serve(
     properties: &mut Properties,
     session_owner_pid: i32,
     services: &mut super::services::Registry,
+    init_context: Option<&str>,
 ) -> io::Result<()> {
     let guest_sources = services.guest_sources();
     let path = Path::new(SOCKET);
@@ -344,6 +345,9 @@ pub(super) fn serve(
         println!("{{\"event\":\"guest_property_service_ready\",\"persistent_file\":\"/data/property/persistent_properties\",\"sockets\":[\"property_service\",\"property_service_for_system\"]}}");
         loop {
             services.tick(properties)?;
+            if let Some(source) = init_context {
+                properties.run_initrc(services, |target| policy::check_access(source, target))?;
+            }
             let mut ready = [
                 libc::pollfd {
                     fd: listener.as_raw_fd(),
@@ -412,7 +416,7 @@ pub(super) fn serve(
                     Ok(credentials)
                 },
                 |action, target, peer, properties| {
-                    services.dispatch(action, target, peer, properties)
+                    services.dispatch(action, target, Some(peer), properties)
                 },
                 |command, peer| super::control::powerctl(command, peer, session_owner_pid),
             )?;

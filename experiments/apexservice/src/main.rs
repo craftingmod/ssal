@@ -7,6 +7,7 @@ use android::apex::{
     IApexService::*,
 };
 use rsbinder::{BinderResult, ExceptionCode, Interface, Status};
+use std::path::Path;
 
 struct ApexService(Vec<ApexInfo>);
 impl Interface for ApexService {}
@@ -106,12 +107,14 @@ fn load() -> ssal_binder_service::Result<ApexService> {
     registry::validate(&packages)?;
     let mut infos = Vec::new();
     for p in packages {
-        if !std::path::Path::new(&p.module_path).is_file()
-            || !std::path::Path::new(&p.mount_path)
-                .join("apex_manifest.pb")
-                .is_file()
-        {
-            return Err(format!("APEX registry backing/mount missing: {}", p.module_name).into());
+        let manifest = Path::new(&p.mount_path).join("apex_manifest.pb");
+        for path in [Path::new(&p.module_path), manifest.as_path()] {
+            let metadata = path
+                .metadata()
+                .map_err(|e| format!("APEX {} at {}: {e}", p.module_name, path.display()))?;
+            if !metadata.is_file() {
+                return Err(format!("APEX {} at {} is not a file", p.module_name, path.display()).into());
+            }
         }
         infos.push(ApexInfo {
             moduleName: p.module_name,

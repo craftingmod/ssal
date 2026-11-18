@@ -7,7 +7,10 @@ use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
+
+const DEFAULT_RESTART_PERIOD: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -24,6 +27,23 @@ pub struct ServiceDefinition {
     pub gid: u32,
     /// Original Guest policy domain, translated using this session's SELinux type map.
     pub domain: String,
+    #[serde(default)]
+    pub oneshot: Option<bool>,
+    /// Seconds from the previous start. Crashes use a minimum of five seconds.
+    #[serde(default)]
+    pub restart_period: Option<u32>,
+}
+
+impl ServiceDefinition {
+    fn restart_delay(&self, rc: Option<(bool, Option<u32>)>) -> Option<Duration> {
+        let (oneshot, period) = rc.unwrap_or((self.restart_period.is_none(), None));
+        (!self.oneshot.unwrap_or(oneshot)).then(|| {
+            self.restart_period
+                .or(period)
+                .map(|seconds| Duration::from_secs(seconds.into()))
+                .unwrap_or(DEFAULT_RESTART_PERIOD)
+        })
+    }
 }
 
 fn valid_name(name: &str) -> bool {
@@ -102,13 +122,23 @@ struct Service {
     context: String,
     child: Option<Child>,
     state: &'static str,
-    restart: bool,
+    started_at: Instant,
+    restart_delay: Option<Duration>,
+    restart: Option<Restart>,
     spawn: fn(&ServiceDefinition, &str) -> io::Result<Child>,
+}
+
+#[derive(Clone, Copy)]
+enum Restart {
+    Manual,
+    Automatic { since: Instant, delay: Duration },
 }
 
 impl Service {
     fn start(&mut self) -> io::Result<()> {
+        let started_at = Instant::now();
         self.child = Some((self.spawn)(&self.definition, &self.context)?);
+        self.started_at = started_at;
         self.state = "running";
         Ok(())
     }
@@ -213,14 +243,12 @@ impl Service {
         Ok(())
     }
 
-    fn reap(&mut self) -> io::Result<()> {
+    fn reap(&mut self) -> io::Result<Option<ExitStatus>> {
         self.kill_group()?;
-        if let Some(child) = &mut self.child {
-            child.wait()?;
-        }
+        let status = self.child.as_mut().map(Child::wait).transpose()?;
         self.child = None;
         self.state = "stopped";
-        Ok(())
+        Ok(status)
     }
 }
 
@@ -281,12 +309,15 @@ impl Registry {
                     ));
                 }
             }
+            let restart_delay = definition.restart_delay(None);
             let service = Service {
                 definition,
                 context: format!("u:r:{target}:s0"),
                 child: None,
                 state: "stopped",
-                restart: false,
+                started_at: Instant::now(),
+                restart_delay,
+                restart: None,
                 spawn: Service::spawn,
             };
             if services.insert(name, service).is_some() {
@@ -313,6 +344,14 @@ impl Registry {
         self.1.clone()
     }
 
+    pub fn apply_restart_options(&mut self, plan: &crate::guest_initrc::Plan) {
+        for (name, service) in &mut self.0 {
+            let definition = &service.definition;
+            let options = plan.restart_options(name, &definition.executable, &definition.args);
+            service.restart_delay = definition.restart_delay(options);
+        }
+    }
+
     pub fn publish(&self, properties: &mut Properties) -> io::Result<()> {
         for (name, service) in &self.0 {
             properties.set(&format!("init.svc.{name}"), service.state)?;
@@ -324,7 +363,7 @@ impl Registry {
         &mut self,
         action: &str,
         name: &str,
-        peer: PeerCredentials,
+        peer: Option<PeerCredentials>,
         properties: &mut Properties,
     ) -> io::Result<bool> {
         if validate_control(action, name).is_err() {
@@ -341,33 +380,47 @@ impl Registry {
         let Some(service) = self.0.get_mut(name) else {
             return Ok(false);
         };
+        if peer.is_none()
+            && (matches!(name, "servicemanager" | "zygote" | "zygote_secondary")
+                || service.definition.executable.starts_with("/vendor/")
+                || service.definition.executable.starts_with("/odm/"))
+        {
+            return Ok(false);
+        }
         let result = match action {
-            "start" if service.child.is_none() => service.start(),
+            "start" if service.child.is_none() && service.restart.is_none() => service.start(),
             "start" => Ok(()),
             "stop" | "restart" => {
                 if service.child.is_some() {
                     service.kill_group().map(|()| {
-                        service.restart = action == "restart";
-                        service.state = if service.restart {
+                        service.restart = (action == "restart").then_some(Restart::Manual);
+                        service.state = if service.restart.is_some() {
                             "restarting"
                         } else {
                             "stopping"
                         }
                     })
-                } else if action == "restart" {
-                    service.restart = false;
-                    service.start()
                 } else {
-                    Ok(())
+                    service.restart = None;
+                    service.state = "stopped";
+                    if action == "restart" {
+                        service.start()
+                    } else {
+                        Ok(())
+                    }
                 }
             }
             _ => unreachable!(),
         };
         if let Err(error) = result {
-            eprintln!(
-                "Guest ctl.{action} service={name} caller_pid={} uid={} gid={} failed: {error}",
-                peer.pid, peer.uid, peer.gid
-            );
+            if let Some(peer) = peer {
+                eprintln!(
+                    "Guest ctl.{action} service={name} caller_pid={} uid={} gid={} failed: {error}",
+                    peer.pid, peer.uid, peer.gid
+                );
+            } else {
+                eprintln!("Guest initrc {action} service={name} failed: {error}");
+            }
             properties.set(&format!("init.svc.{name}"), service.state)?;
             return Ok(false);
         }
@@ -378,11 +431,41 @@ impl Registry {
     pub fn tick(&mut self, properties: &mut Properties) -> io::Result<()> {
         for (name, service) in &mut self.0 {
             if service.exited()? {
-                service.reap()?;
-                if std::mem::take(&mut service.restart) {
-                    if let Err(error) = service.start() {
-                        eprintln!("Guest service={name} restart failed: {error}");
+                let delay = service.restart_delay.filter(|_| service.state == "running");
+                if let (Some(delay), Some(status)) = (delay, service.reap()?) {
+                    service.restart = Some(Restart::Automatic {
+                        since: service.started_at,
+                        delay: if status.success() {
+                            delay
+                        } else {
+                            delay.max(DEFAULT_RESTART_PERIOD)
+                        },
+                    });
+                }
+                service.state = if service.restart.is_some() {
+                    "restarting"
+                } else {
+                    "stopped"
+                };
+                properties.set(&format!("init.svc.{name}"), service.state)?;
+            }
+            if let Some(restart) = service.restart.filter(|_| service.child.is_none()) {
+                if let Restart::Automatic { since, delay } = restart {
+                    if since.elapsed() < delay {
+                        continue;
                     }
+                }
+                service.restart = None;
+                if let Err(error) = service.start() {
+                    eprintln!("Guest service={name} restart failed: {error}");
+                    if let Restart::Automatic { delay, .. } = restart {
+                        service.restart = Some(Restart::Automatic {
+                            since: Instant::now(),
+                            delay: delay.max(DEFAULT_RESTART_PERIOD),
+                        });
+                        continue;
+                    }
+                    service.state = "stopped";
                 }
                 properties.set(&format!("init.svc.{name}"), service.state)?;
             }
@@ -417,6 +500,8 @@ mod tests {
             uid: 1000,
             gid: 1000,
             domain: "shell".into(),
+            oneshot: None,
+            restart_period: None,
         }
     }
 
@@ -584,7 +669,9 @@ mod tests {
                     ))
                 }
             },
-            |action, target, peer, properties| registry.dispatch(action, target, peer, properties),
+            |action, target, peer, properties| {
+                registry.dispatch(action, target, Some(peer), properties)
+            },
             |_, _| panic!("Host/power routing"),
         )
         .unwrap();
@@ -608,6 +695,150 @@ mod tests {
             assert!(Instant::now() < deadline, "state timeout: {state}");
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn automatic_restart_reaps_before_retry_and_explicit_controls_win() {
+        let root = super::super::tests::temp_dir("automatic-restart");
+        let mut properties = super::super::tests::fixture(&root);
+        let mut registry = registry();
+        registry.0.get_mut("mock").unwrap().restart_delay = Some(Duration::ZERO);
+        let success = rsproperties::wire::PROP_SUCCESS as u32;
+        assert_eq!(
+            request(&mut registry, &mut properties, "start", "mock", true),
+            success
+        );
+        let crash = |registry: &mut Registry| {
+            let child = registry.0.get_mut("mock").unwrap().child.as_mut().unwrap();
+            child.kill().unwrap();
+            child.id()
+        };
+        let first = crash(&mut registry);
+        until(&mut registry, &mut properties, "restarting");
+        let service = registry.0.get_mut("mock").unwrap();
+        assert!(service.child.is_none());
+        assert!(
+            matches!(service.restart, Some(Restart::Automatic { since, delay })
+            if since == service.started_at && delay == DEFAULT_RESTART_PERIOD)
+        );
+        assert_eq!(
+            request(&mut registry, &mut properties, "start", "mock", true),
+            success
+        );
+        registry.tick(&mut properties).unwrap();
+        assert!(
+            registry.0["mock"].child.is_none(),
+            "start must respect pending crash delay"
+        );
+
+        let service = registry.0.get_mut("mock").unwrap();
+        service.restart = Some(Restart::Automatic {
+            since: service.started_at,
+            delay: Duration::ZERO,
+        });
+        registry.tick(&mut properties).unwrap();
+        assert_eq!(properties.area.get("init.svc.mock").unwrap(), "running");
+        assert_ne!(registry.0["mock"].child.as_ref().unwrap().id(), first);
+
+        let second = crash(&mut registry);
+        until(&mut registry, &mut properties, "restarting");
+        let service = registry.0.get_mut("mock").unwrap();
+        service.restart = Some(Restart::Automatic {
+            since: service.started_at,
+            delay: Duration::ZERO,
+        });
+        service.spawn = |_, _| Err(io::Error::other("simulated exec failure"));
+        registry.tick(&mut properties).unwrap();
+        let service = &registry.0["mock"];
+        assert!(
+            matches!(service.restart, Some(Restart::Automatic { delay, .. })
+            if delay == DEFAULT_RESTART_PERIOD)
+        );
+        assert_eq!(properties.area.get("init.svc.mock").unwrap(), "restarting");
+        registry.0.get_mut("mock").unwrap().spawn = mock_spawn;
+        assert_eq!(
+            request(&mut registry, &mut properties, "restart", "mock", true),
+            success
+        );
+        assert_eq!(properties.area.get("init.svc.mock").unwrap(), "running");
+        assert_ne!(registry.0["mock"].child.as_ref().unwrap().id(), second);
+
+        crash(&mut registry);
+        until(&mut registry, &mut properties, "restarting");
+        assert_eq!(
+            request(&mut registry, &mut properties, "stop", "mock", true),
+            success
+        );
+        registry.tick(&mut properties).unwrap();
+        assert_eq!(properties.area.get("init.svc.mock").unwrap(), "stopped");
+        assert!(registry.0["mock"].restart.is_none());
+        assert!(registry.0["mock"].child.is_none());
+        assert_eq!(
+            request(&mut registry, &mut properties, "start", "mock", true),
+            success
+        );
+        assert_eq!(
+            request(&mut registry, &mut properties, "stop", "mock", true),
+            success
+        );
+        until(&mut registry, &mut properties, "stopped");
+        assert!(registry.0["mock"].restart.is_none());
+        drop(registry);
+        drop(properties);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rc_restart_options_bind_to_declared_command_and_clean_exit_uses_period() {
+        let root = super::super::tests::temp_dir("rc-restart-options");
+        let rc = root.join("system/etc/init/hw");
+        fs::create_dir_all(&rc).unwrap();
+        fs::write(
+            rc.join("init.rc"),
+            "
+service mock /bin/sleep 60
+    restart_period 2
+service single /bin/sleep 60
+    oneshot
+    restart_period 0
+",
+        )
+        .unwrap();
+        let plan = crate::guest_initrc::Plan::load(&root, &Default::default()).unwrap();
+        let mut registry = registry();
+        let mut properties = super::super::tests::fixture(&root);
+        assert_eq!(registry.0["mock"].restart_delay, None);
+        registry.apply_restart_options(&plan);
+        assert_eq!(
+            registry.0["mock"].restart_delay,
+            Some(Duration::from_secs(2))
+        );
+        let mut single = definition("single");
+        let rc = plan.restart_options("single", &single.executable, &single.args);
+        assert_eq!(single.restart_delay(rc), None);
+        single.oneshot = Some(false);
+        assert_eq!(single.restart_delay(rc), Some(Duration::ZERO));
+        single.restart_period = Some(3);
+        assert_eq!(single.restart_delay(rc), Some(Duration::from_secs(3)));
+        assert!(plan
+            .restart_options("single", &single.executable, &[])
+            .is_none());
+
+        registry.0.get_mut("mock").unwrap().spawn =
+            |_, _| Command::new("/bin/true").process_group(0).spawn();
+        let success = rsproperties::wire::PROP_SUCCESS as u32;
+        assert_eq!(
+            request(&mut registry, &mut properties, "start", "mock", true),
+            success
+        );
+        until(&mut registry, &mut properties, "restarting");
+        assert!(
+            matches!(registry.0["mock"].restart, Some(Restart::Automatic { delay, .. })
+            if delay == Duration::from_secs(2))
+        );
+        drop(registry);
+        drop(properties);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

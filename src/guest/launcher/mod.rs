@@ -4,6 +4,7 @@ use crate::diagnostics::launcher::{
 };
 use crate::guest::environment::start_property_service;
 use crate::guest::init::{wait_for_system_server, Service};
+use ssal::guest_initrc as initrc;
 use crate::guest::runtime::classpath::{
     derive_guest_classpath, guest_env_value, DERIVE_CLASSPATH_CONTEXT,
 };
@@ -253,6 +254,17 @@ pub(in crate::guest) fn guest_servicemanager_property(root: &Path) -> io::Result
     )?
     .trim()
     .to_owned())
+}
+
+fn read_initrc_properties(root: &Path) -> io::Result<initrc::Properties> {
+    let output = run(root, "/system/bin/sh", &["-c", "getprop"], 1000)?;
+    Ok(output
+        .lines()
+        .filter_map(|line| {
+            let (key, value) = line.strip_prefix('[')?.strip_suffix(']')?.split_once("]: [")?;
+            Some((key.to_owned(), value.to_owned()))
+        })
+        .collect())
 }
 
 pub(in crate::guest) fn probe_guest_context_manager(root: &Path) -> io::Result<String> {
@@ -620,6 +632,13 @@ pub(crate) fn verify(
     }
     let system_server_preflight = system_server_preflight::enabled()?;
     let runtime_sid = system_server_runtime_sid::enabled(phase7a)?;
+    let use_initrc = match std::env::var_os("SSAL_GUEST_INITRC").as_deref() {
+        None => false,
+        Some(value) if value == "1" && phase7a && !runtime_sid => true,
+        _ => return Err(io::Error::other(
+            "SSAL_GUEST_INITRC=1 requires the Guest Zygote worker with its normal launch path",
+        )),
+    };
     if system_server_preflight
         && (!phase7a
             || [
@@ -734,6 +753,7 @@ pub(crate) fn verify(
                 root,
                 &bin,
                 host_mount_namespace,
+                use_initrc,
             )?);
             crate::guest::mount::seal_system(root)?;
             shell_environment = Some(crate::guest::environment::Published::new(
@@ -887,9 +907,22 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
             return Err(io::Error::other("shell evidence missing"));
         }
         drop(sentinel);
+        let mut init_plan = None;
+        let mut manager_exe = "/system/bin/servicemanager";
+        if use_initrc {
+            let properties = read_initrc_properties(root)?;
+            let plan = init_plan.insert(initrc::Plan::load(root, &properties)?);
+            manager_exe = plan.start(
+                &[Some("early-init"), Some("init")],
+                &properties,
+                "servicemanager",
+                manager_exe,
+                &[],
+            )?;
+        }
         let mut manager = Service::start(
             root,
-            "/system/bin/servicemanager",
+            manager_exe,
             &[],
             "servicemanager",
             1000,
@@ -1059,9 +1092,19 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
                 "Guest Zygote launch socket=/dev/socket/zygote start_system_server={start_system_server} private_binder={major}:{minor}"
             );
             let args = zygote_args(controlled_fork, start_system_server);
+            let mut zygote_exe = "/system/bin/app_process64";
+            if let Some(plan) = &init_plan {
+                zygote_exe = plan.start(
+                    &[Some("late-init"), None],
+                    &read_initrc_properties(root)?,
+                    "zygote",
+                    zygote_exe,
+                    &zygote_args(false, true),
+                )?;
+            }
             let mut zygote = Service::start(
                 root,
-                "/system/bin/app_process64",
+                zygote_exe,
                 &args,
                 "guest-zygote",
                 0,
@@ -1212,6 +1255,14 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
             let deadline = Instant::now() + Duration::from_secs(observation_seconds);
             while Instant::now() < deadline {
                 crate::guest::process::supervision::check_interrupted()?;
+                if use_initrc {
+                    if let Some(service) = &mut property_service {
+                        service.drain_output()?;
+                        if service.exited()? {
+                            return Err(io::Error::other("Guest property service exited during Zygote residence"));
+                        }
+                    }
+                }
                 if let Some(service) = &mut apexservice {
                     service.drain_output()?;
                     if service.exited()? {

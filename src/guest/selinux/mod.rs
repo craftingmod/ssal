@@ -11,7 +11,7 @@ pub mod native;
 pub mod runtime;
 mod symbols;
 
-const VERSION: u32 = 31;
+const VERSION: u32 = 33;
 
 type Names = BTreeMap<String, String>;
 
@@ -1148,6 +1148,7 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
         "linkerconfig",
         "servicemanager",
         "aidl_lazy_test_server",
+        "apexd",
         "zygote",
         "system_server_startup",
         "system_server",
@@ -1284,6 +1285,13 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
                 );
             }
             plan.rules.insert(rule);
+        }
+    }
+    // The APEX readiness client runs in the same Guest domain as the service.
+    if let Some(apexd) = plan.types.get("apexd") {
+        let rule = format!("allow {apexd} {apexd} binder {{ call }}");
+        if plan.rules.insert(rule.clone()) {
+            native::record(&mut native_rules, rule, 1, 1, &[apexd, apexd, "binder", "call"]);
         }
     }
     // Property files are created under the directory type, then receive their final Guest label.
@@ -1549,8 +1557,11 @@ mod tests {
         inputs
             .get_mut("system/etc/selinux/plat_sepolicy.cil")
             .unwrap()
-            .push_str(" (type shell) (type aidl_lazy_test_server)");
+            .push_str(" (type shell) (type aidl_lazy_test_server) (type apexd)");
         let plan = generate("p0001", &inputs)?;
+        let apex_call = "allow ssal_p0001_apexd ssal_p0001_apexd binder { call }";
+        assert!(plan.rules.contains(apex_call));
+        assert_eq!(plan.native_rules[apex_call].len(), 1);
         for (source, target) in [
             ("shell", "aidl_lazy_test_server"),
             ("aidl_lazy_test_server", "shell"),
@@ -1567,7 +1578,9 @@ mod tests {
             );
         }
         assert!(!plan.rules.iter().any(
-            |r| r.starts_with("allow shell ") || r.starts_with("allow aidl_lazy_test_server ")
+            |r| r.starts_with("allow shell ")
+                || r.starts_with("allow aidl_lazy_test_server ")
+                || r.starts_with("allow apexd ")
         ));
         Ok(())
     }
@@ -1577,7 +1590,7 @@ mod tests {
         inputs
             .get_mut("system/etc/selinux/plat_sepolicy.cil")
             .unwrap()
-            .push_str(" (type init) (type shell) (type derive_classpath) (type linkerconfig) (type servicemanager) (type aidl_lazy_test_server) (type properties_device) (type system_server_startup)");
+            .push_str(" (type init) (type shell) (type derive_classpath) (type linkerconfig) (type servicemanager) (type aidl_lazy_test_server) (type apexd) (type properties_device) (type system_server_startup)");
         let plan = generate("p0001", &inputs)?;
         let rules: Vec<_> = plan
             .rules
@@ -1585,7 +1598,7 @@ mod tests {
             .filter(|r| r.contains(" ksu "))
             .cloned()
             .collect();
-        assert_eq!(rules.len(), 21);
+        assert_eq!(rules.len(), 23);
         assert!(rules.contains(&"allow ssal_p0001_shell ksu fifo_file { read }".to_owned()));
         for permission in ["getattr", "ioctl"] {
             let rule = format!("allow ssal_p0001_shell ksu fifo_file {{ {permission} }}");
@@ -1608,6 +1621,7 @@ mod tests {
             "linkerconfig",
             "servicemanager",
             "aidl_lazy_test_server",
+            "apexd",
             "zygote",
             "system_server_startup",
             "system_server",

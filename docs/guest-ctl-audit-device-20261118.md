@@ -127,3 +127,24 @@ Host property를 직접 설정한 명령은 없지만 **완전한 Host property 
 Luna가 이전 진단 observer의 proc-attr 읽기에서 멈춘 `tr`와 그 부모 script만 cmdline/PPid/starttime으로 확인해 정리했다. 최종 observer는 timeout을 둔 cat을 사용한다. 모든 evidence를 로컬로 복사한 뒤 기기의 정확한 staging 디렉터리 `/data/local/tmp/ssal-ctl-audit-20261118`를 제거하고 부재를 확인했다. 모듈 바이너리, Guest userdata/profile, 기존 로그 및 추가된 Guest 정책은 유지했다. `.userdata-*.img`는 없었다.
 
 남은 위험은 foreground/신뢰된 실행 파일 계약, process-group 이탈, writable inode 내용 변경, privilege exec 후 PDEATHSIG 해제, session teardown 전의 고아 zombie 및 stale property state이다. 별도 root 권한을 가진 공격자가 mount/정책/프로세스를 변경하는 상황까지 막는 보안 경계를 증명한 것은 아니다. 실제 삼성 순정 커널·잠긴 부트로더·One UI 복구 및 SystemServer 부팅은 미검증이다.
+
+## HEAD(2b9717b) 재검증 결과 (TB320FC / HA1WAQ7P)
+
+`HEAD`(`2b9717b`) 소스를 `ssal-dev` 컨테이너에서 `./scripts/build-android.sh` 및 `out/guest-ctl-audit-20261118/harness`(`ssal-ctl-audit-worker`, `ssal = { path = "../../.." }`)로 빌드해 `TB320FC`(`HA1WAQ7P`, Android 15, Enforcing, `y702` 프로필)에서 재검증했다.
+
+### 실제 확인된 결과
+- **프로덕션 `HEAD` 바이너리 (`shell-6968.log`)**:
+  - Guest 셸(`uid=2000`, `gid=2000`, `u:r:ssal_p0001_shell:s0`, `/dev/socket/init` 부재, `ro.build.version.sdk=36`)에서 `setprop ctl.start ssal-mock` 및 `setprop ctl.interface_start aidl/dev.ssal.IMock/default`가 `Access denied`로 거부되고 `ctl.*` 및 `init.svc.ssal-mock`이 기록되지 않음을 확인(`PROD_SHELL_CTL_DENIAL_PASS`).
+- **`CTL_AUDIT` 드라이버 포함 하네스 (`shell-9777.log`)**:
+  - 호출자 `caller_pid=10693`, `sid=u:r:ssal_p0001_init:s0`에서 `init.svc.ssal-mock` 초기 `stopped` → `start`/`start`(중복)/`stop`/`restart`(정지 중)/`restart`(실행 중) → `interface_stop`/`interface_start`(`aidl/dev.ssal.IMock/default`) → `interface_restart`/`interface_stop`(`dev.ssal.mock@1.0::IMock/default`) 모두 `status=0` 및 기대 상태 전이를 확인.
+  - 미등록·잘못된 대상(`not-registered`, `aidl/not-registered`, `../ssal-mock`) 모두 `status=32` 거부 확인(`CTL_AUDIT_PASS ordinary_and_interface_controls`).
+  - `ssal-mock` 자식(`PID 10980`): `SID=u:r:ssal_p0001_shell:s0`, `Uid=2000`, `Gid=2000`, `Groups=`(비어 있음), `CapEff=0000000000000000`, `NoNewPrivs=0`, cgroup `4:memory:/ssal_guest`, `3:cpuset:/ssal_guest`, `2:cpu:/ssal_guest`, `1:blkio:/ssal_guest`, `0::/ssal_guest` 확인.
+  - `CTL_AUDIT_INJECT worker_pid=10693`로 worker에만 SIGKILL 주입 후 `ssal-mock`(`PID 10980`)이 session subreaper(`PID 9777`)에 재입양되고, Guest 셸은 생존(`AFTER_WORKER_FAILURE_STATE=running`, 후속 `setprop ctl.start ssal-mock` 실패, `GUEST_SHELL_SURVIVED_PROPERTY_FAILURE`)하며, 세션 종료 시 `Guest owned descendant pid=10980 membership=/ssal_guest pidfd=verified` 회수·cgroup/mount/loop(46 allocations) 정리를 확인.
+- **Host 상태 보존 (`HOST_PRESERVED_PASS` / `HARNESS_HOST_PRESERVED_PASS`)**:
+  - 실행 전후 `boot_id`, `getenforce`(`Enforcing`), `/proc/1/mountinfo` SHA256, `system_server` PID, `servicemanager` PID 동일 및 Host `init.svc.ssal-mock` 부재 확인.
+- **정리 (Luna 서브에이전트)**:
+  - `/data/local/tmp/ssal-ctl-harness-20261118`, `/data/local/ssal/guests/y702/environment.json`, 잔여 `ssal_p0001` 프로세스 부재 및 워크스페이스 내 `.userdata-*.img` 부재 확인.
+
+### 미검증 항목
+- 이번 재검증에서는 전체 Host property diff는 다시 수집하지 않았다(이전 감사 기록의 4개 property 차이는 본문 참조).
+- 실제 삼성 순정 커널·잠긴 부트로더·One UI 복구 및 SystemServer / `apexservice` 등 실제 Android 서비스의 `ctl.*` 연동은 미검증이다.

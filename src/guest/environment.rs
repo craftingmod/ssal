@@ -13,6 +13,7 @@ pub(crate) fn start_property_service(
     root: &Path,
     bin: &Path,
     host_mount_namespace: &Path,
+    initrc: bool,
 ) -> io::Result<Service> {
     // Reuse the established servicemanager view: libselinux rejects an RO root.
     // All control endpoints stay RO; only existing AV/context query files are RW.
@@ -80,6 +81,9 @@ pub(crate) fn start_property_service(
         "property_contexts": ["/run/ssal/guest_property_contexts"],
         "build_props": ["/system/build.prop", "/run/ssal/guest_build.prop"],
     });
+    if initrc {
+        config["initrc"] = true.into();
+    }
     let plan = ssal::guest_policy::runtime::load(root)?;
     if let Some(plan) = &plan {
         let mut paths = Vec::new();

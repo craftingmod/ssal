@@ -58,6 +58,22 @@ Android 서비스 종료·실패 시 열린 Shell의 lease가 해제될 때까�
 
 로컬 PTY 회귀는 `python3 tests/shell_transport.py /build/target/debug/ssal`, 기기 회귀는 `scripts/test-guest-shell.sh`, Android 실패 시 수명 분리 검증은 `scripts/test-shell-android-lifecycle.sh`를 사용합니다. 수명 분리 검증 스크립트는 지정 프로필의 mapped SID를 가진 Guest 서비스에만 실패를 주입합니다.
 
+### Guest init.rc 실험
+
+일회용 Guest userdata 복제본과 빈 worker 디렉터리를 준비한 뒤, 기기의 root 셸에서 기존 Zygote worker에 `SSAL_GUEST_INITRC=1`을 붙여 실행합니다.
+
+```sh
+SSAL_GUEST_INITRC=1 /path/to/ssald --guest-zygote-7a-worker SYSTEM_IMG DISPOSABLE_USERDATA WORKER_DIR
+```
+
+Guest 시스템 파티션의 rc와 Guest property 기반 import를 읽습니다. `early-init`·`init`에서 `servicemanager`를 시작하고, private Binder 준비 확인 후 `late-init`에서 이어지는 트리거로 Zygote를 시작합니다. 시작과 생략 로그에 rc 파일과 행 번호가 표시됩니다.
+
+부팅 이벤트에 붙은 property 조건은 해당 부팅 단계의 Guest 스냅샷에서 평가합니다. Property Service는 `servicemanager.ready=true`에서 순수 `on property:...` 액션을 한 번 평가한 뒤, Guest property가 생성되거나 값이 바뀔 때 관련 액션을 실행합니다. 여러 조건은 모두 만족해야 하며, 부팅 이벤트가 붙은 액션은 property 변경으로 다시 실행되지 않습니다.
+
+실시간 액션은 명시적으로 등록된 Guest 서비스의 `start`·`class_start`, `trigger`, Guest init SELinux 권한이 있는 비영속 `setprop`을 지원합니다. 등록 서비스는 이름·실행 파일·인수가 일치하는 rc 선언의 `oneshot`과 `restart_period`를 상속합니다. Property Service의 `services` 설정에서 두 옵션을 덮어쓸 수 있습니다. rc 선언과 일치하지 않는 등록 서비스는 `"oneshot": false` 또는 초 단위 `"restart_period"`를 지정하면 자동 재시작합니다.
+
+재시작 간격은 직전 기동 시각을 기준으로 하며 기본값은 5초입니다. 비정상 종료에는 최소 5초를 적용합니다. 명시적 `ctl.stop`은 대기 중인 자동 재시작도 취소합니다. 현재 Zygote worker가 직접 감독하는 `servicemanager`와 Zygote에는 기존 진단 수명주기를 적용합니다. Vendor/ODM HAL, APEX rc, `onrestart` 훅과 재부팅 동작은 이 경로의 실행 범위 밖입니다. SystemServer 시작에는 기존 `SSAL_START_SYSTEM_SERVER=1`과 APEX Binder 준비 검사가 필요합니다.
+
 ## 빌드
 
 WSLc, Bun과 네트워크가 필요합니다. PowerShell에서 실행합니다.

@@ -2,6 +2,9 @@
 pub mod guest_lock_compat;
 #[path = "guest/selinux/mod.rs"]
 pub mod guest_policy;
+#[cfg(unix)]
+#[path = "guest/initrc.rs"]
+pub mod guest_initrc;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 #[path = "guest/properties/mod.rs"]
 pub mod guest_properties;
