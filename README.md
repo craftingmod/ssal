@@ -66,7 +66,11 @@ Android 서비스 종료·실패 시 열린 Shell의 lease가 해제될 때까�
 SSAL_GUEST_INITRC=1 /path/to/ssald --guest-zygote-7a-worker SYSTEM_IMG DISPOSABLE_USERDATA WORKER_DIR
 ```
 
-Guest 시스템 파티션의 rc와 Guest property 기반 import를 읽습니다. `early-init`·`init`에서 `servicemanager`를 시작하고, private Binder 준비 확인 후 `late-init`에서 이어지는 트리거로 Zygote를 시작합니다. 시작과 생략 로그에 rc 파일과 행 번호가 표시됩니다.
+Guest 시스템 파티션의 rc와 Guest property 기반 import를 읽습니다. 하나의 부팅 큐에서 `early-init`·`init`·`late-init`와 rc의 후속 트리거를 순서대로 처리합니다. 각 시작 요청에서 서비스 준비 검사를 마친 뒤 남은 명령을 이어서 처리합니다. 시작과 생략 로그에 rc 파일과 행 번호가 표시됩니다.
+
+SystemServer 또는 APEX 검사 모드에서는 `late-init`에서 이어지는 `start apexd`·`restart apexd`를 기존 `ssal-apexservice` 감독 경로에 연결합니다. 기존 Guest APEX 마운트와 linkerconfig를 재사용합니다. private Binder 등록과 AIDL 조회 검사가 통과하면 Guest property에 `apexd.status=activated`를 기록합니다. 매핑이나 준비 검사가 실패하면 Zygote 시작 전에 중단합니다.
+
+`SSAL_GUEST_SYSTEM_SUSPEND=1`을 지정한 Guest 서비스 워커는 private Binder에 `android.system.suspend.ISystemSuspend/default`, `suspend_control`, `suspend_control_internal`을 등록합니다. Guest의 `PARTIAL` wakelock은 이름과 개수에 관계없이 하나의 Host `SSAL:VirtualWakeLock`으로 합쳐집니다. Host broker는 상속된 소켓을 통해 획득·해제만 처리하고, 마지막 Guest 토큰 해제 또는 연결 종료 시 Host 토큰을 반환합니다. 연속으로 잠금을 5분간 보유하면 broker가 토큰을 반환하고 종료합니다. `FULL`, autosuspend, 강제 절전, 콜백 및 Host 통계는 지원하지 않습니다.
 
 부팅 이벤트에 붙은 property 조건은 해당 부팅 단계의 Guest 스냅샷에서 평가합니다. Property Service는 `servicemanager.ready=true`에서 순수 `on property:...` 액션을 한 번 평가한 뒤, Guest property가 생성되거나 값이 바뀔 때 관련 액션을 실행합니다. 여러 조건은 모두 만족해야 하며, 부팅 이벤트가 붙은 액션은 property 변경으로 다시 실행되지 않습니다.
 
