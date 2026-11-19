@@ -13,7 +13,7 @@ pub mod native;
 pub mod runtime;
 mod symbols;
 
-const VERSION: u32 = 49;
+const VERSION: u32 = 50;
 
 type Names = BTreeMap<String, String>;
 
@@ -1168,6 +1168,7 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
         "apexd",
         "installd",
         "artd",
+        "vold",
         concurrent::SYSTEM_SUSPEND_DOMAIN,
         "zygote",
         "system_server_startup",
@@ -1342,6 +1343,18 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
             &[init, device, "dir", "relabelfrom"],
         );
         plan.rules.insert(rule);
+    }
+    if let Some(vold_exec) = plan.types.get("vold_exec") {
+        let rule = format!("allow {vold_exec} tmpfs filesystem {{ associate }}");
+        if plan.rules.insert(rule.clone()) {
+            native::record(
+                &mut native_rules,
+                rule,
+                1,
+                1,
+                &[vold_exec, "tmpfs", "filesystem", "associate"],
+            );
+        }
     }
     // binderfs context= mounts require the Guest binder label to associate with its filesystem.
     for device in ["binder_device", "hwbinder_device"]

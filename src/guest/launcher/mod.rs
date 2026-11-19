@@ -43,6 +43,7 @@ pub(in crate::guest) fn uses_own_diagnostics(executable: &str) -> bool {
     // The Rust Binder services use mapped exec SIDs and write their own diagnostics.
     [
         crate::guest::init::binder_service::APEX.executable,
+        crate::guest::init::binder_service::VOLD.executable,
         system_suspend::SERVICE.executable,
         health::SERVICE.executable,
         hwbinder::COMPOSER,
@@ -71,6 +72,7 @@ fn mapped_exec_domain(executable: &str, exec_context: Option<&[u8]>) -> &'static
             hwbinder::COMPOSER => "hal_graphics_composer_default",
             hwbinder::GRAPHICS_ALLOCATOR => "hal_graphics_allocator_default",
             "/run/ssal/ssal-apexservice" => crate::guest::init::binder_service::APEX.domain,
+            "/run/ssal/ssal-vold" => crate::guest::init::binder_service::VOLD.domain,
             "/run/ssal/ssal-system-suspend" => system_suspend::SERVICE.domain,
             "/run/ssal/ssal-health" => health::SERVICE.domain,
             "/apex/com.android.sdkext/bin/derive_classpath" => "derive_classpath",
@@ -1061,6 +1063,9 @@ pub(crate) fn verify(
     if start_system_server {
         health::SERVICE.install(mounts, root, &bin)
             .map_err(|error| io::Error::other(format!("install Guest Health HAL: {error}")))?;
+        if bin.join("ssal-vold").is_file() {
+            crate::guest::init::binder_service::VOLD.install(mounts, root, &bin)?;
+        }
     }
     if suspend_enabled {
         system_suspend::SERVICE.install(mounts, root, &bin)?;
@@ -1478,6 +1483,15 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
                 std::thread::sleep(Duration::from_millis(200));
             }
             boot_services.push(start_data_service(root, INSTALLD, "installd")?);
+            if bin.join("ssal-vold").is_file() {
+                boot_services.push(
+                    crate::guest::init::binder_service::VOLD.start_with_hwbinder(
+                        root,
+                        guest_binder,
+                        Some(hwbinder_rdev),
+                    )?,
+                );
+            }
         }
         if installd_probe {
             probe_installd(root, userdata, host_mount_namespace, guest_binder)?;

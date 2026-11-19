@@ -17,6 +17,13 @@ pub(crate) const APEX: BinderService = BinderService {
     exec_type: "apexd_exec",
 };
 
+pub(crate) const VOLD: BinderService = BinderService {
+    name: "vold",
+    executable: "/run/ssal/ssal-vold",
+    domain: "vold",
+    exec_type: "vold_exec",
+};
+
 impl BinderService {
     pub fn install(&self, mounts: &mut Mounts, root: &Path, bin: &Path) -> io::Result<()> {
         let plan = ssal::guest_policy::runtime::load(root)?.ok_or_else(|| {
@@ -34,14 +41,28 @@ impl BinderService {
     }
 
     pub fn start(&self, root: &Path, guest_binder: u64) -> io::Result<Service> {
+        self.start_with_hwbinder(root, guest_binder, None)
+    }
+
+    pub fn start_with_hwbinder(
+        &self,
+        root: &Path,
+        guest_binder: u64,
+        guest_hwbinder: Option<u64>,
+    ) -> io::Result<Service> {
         let plan = ssal::guest_policy::runtime::load(root)?
             .ok_or_else(|| io::Error::other("Guest Binder policy missing"))?;
         let context = plan.context(self.domain, true)?;
         let device = guest_binder.to_string();
+        let hw = guest_hwbinder.map(|v| v.to_string());
+        let mut args = vec!["serve", device.as_str(), context.as_str()];
+        if let Some(hw) = hw.as_deref() {
+            args.push(hw);
+        }
         let mut service = Service::start(
             root,
             self.executable,
-            &["serve", &device, &context],
+            &args,
             self.name,
             0,
             Some(crate::guest::launcher::GUEST_PROBE_CONTEXT),
