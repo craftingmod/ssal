@@ -1,0 +1,13 @@
+[package]
+name = "ssal-virtual-composer"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+ssal-binder-service = { path = "../binder-service" }
+rsbinder = { version = "=0.13.0", default-features = false, features = ["android_14_plus"] }
+libc = "0.2"
+
+[build-dependencies]
+rsbinder-aidl = "=0.13.0"

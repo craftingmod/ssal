@@ -3,6 +3,7 @@ use ssal::namespace_mounts::{mount, Mounts};
 use std::fs;
 use std::fs::File;
 use std::io;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -255,6 +256,7 @@ pub(super) fn prepare(
         let original = if package.extension().is_some_and(|x| x == "capex") {
             let original = cache.join(format!("{index}.apex"));
             unzip(package, "original_apex", &original)?;
+            fs::set_permissions(&original, fs::Permissions::from_mode(0o644))?;
             if let Some(plan) = policy {
                 ssal::guest_policy::runtime::set_label(
                     &original,
@@ -315,15 +317,22 @@ pub(super) fn prepare(
         })().map_err(|e| io::Error::new(e.kind(), format!("APEX package {}: {e}", package.display())))?;
     }
     ssal::apex_registry::validate(&registry).map_err(io::Error::other)?;
-    fs::write(root.join(INFO_LIST), info_list(&registry))?;
-    fs::write(root.join(ssal::apex_registry::PATH.trim_start_matches('/')), serde_json::to_vec(&registry)?)?;
+    let info_path = root.join(INFO_LIST);
+    let registry_path = root.join(ssal::apex_registry::PATH.trim_start_matches('/'));
+    fs::write(&info_path, info_list(&registry))?;
+    fs::write(&registry_path, serde_json::to_vec(&registry)?)?;
+    #[cfg(unix)]
+    {
+        fs::set_permissions(&info_path, fs::Permissions::from_mode(0o644))?;
+        fs::set_permissions(&registry_path, fs::Permissions::from_mode(0o644))?;
+    }
     if let Some(plan) = policy {
         ssal::guest_policy::runtime::set_label(
-            &root.join(INFO_LIST),
+            &info_path,
             &plan.context("apex_info_file", false)?,
         )?;
         ssal::guest_policy::runtime::set_label(
-            &root.join(ssal::apex_registry::PATH.trim_start_matches('/')),
+            &registry_path,
             &plan.context("apex_info_file", false)?,
         )?;
     }

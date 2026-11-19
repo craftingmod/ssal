@@ -16,7 +16,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 const AREA: &str = "/dev/__properties__";
@@ -595,6 +595,7 @@ fn initialize(
     file.write_all(&info)
         .map_err(|e| io::Error::new(e.kind(), format!("write {}: {e}", info_path.display())))?;
     drop(file);
+    std::fs::set_permissions(&info_path, std::fs::Permissions::from_mode(0o444))?;
     label(&info_path, INFO_CONTEXT)?;
     let mut area = SystemProperties::new_area(directory).map_err(|e| {
         io::Error::other(format!("create property area {}: {e}", directory.display()))

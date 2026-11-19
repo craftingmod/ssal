@@ -156,6 +156,7 @@ fn main() {
             || arg == "--guest-processgroup-worker"
             || arg == "--guest-memory-worker"
             || arg == "--guest-service-worker"
+            || arg == "--guest-hwbinder-worker"
             || arg == "--guest-services-6a-worker"
             || arg == "--guest-services-6b-worker"
             || arg == "--guest-zygote-7a-worker"

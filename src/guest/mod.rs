@@ -11,6 +11,8 @@ pub(crate) mod concurrent;
 #[cfg(unix)]
 pub(crate) mod environment;
 #[cfg(unix)]
+mod hwbinder;
+#[cfg(unix)]
 pub(crate) mod init;
 #[cfg(unix)]
 pub(crate) mod launcher;

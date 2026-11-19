@@ -45,22 +45,33 @@ pub(crate) fn start_property_service(
         "persist.ssal_probe u:object_r:ssal_guest_property_area:s0 exact uint\n",
     )?;
     let overrides = runtime.join("guest_build.prop");
-    fs::write(
-        &overrides,
-        [
-            "servicemanager.ready=false",
-            // This worker starts only app_process64; ZygoteInit otherwise waits 60s for a secondary.
-            "ro.product.cpu.abilist=arm64-v8a",
-            "ro.product.cpu.abilist64=arm64-v8a",
-            "ro.product.cpu.abilist32=",
-            "ro.zygote=zygote64",
-            "ro.build.version.codename=REL",
-            "dalvik.vm.dex2oat64.enabled=true",
-            "ro.zygote.disable_gl_preload=1",
-        ]
-        .join("\n")
-            + "\n",
-    )?;
+    let mut build_props = vec![
+        "servicemanager.ready=false",
+        // This worker starts only app_process64; ZygoteInit otherwise waits 60s for a secondary.
+        "ro.product.cpu.abilist=arm64-v8a",
+        "ro.product.cpu.abilist64=arm64-v8a",
+        "ro.product.cpu.abilist32=",
+        "ro.zygote=zygote64",
+        "ro.build.version.codename=REL",
+        "dalvik.vm.dex2oat64.enabled=true",
+        "ro.zygote.disable_gl_preload=1",
+    ];
+    if crate::guest::concurrent::graphics::requested() {
+        build_props.extend([
+            "ro.hardware.egl=adreno",
+            "ro.board.platform=taro",
+            "ro.sf.lcd_density=320",
+            "ro.vndk.version=32",
+            "ro.board.api_level=31",
+            "ro.vendor.api_level=31",
+            "vendor.gralloc.use_dma_buf_heaps=1",
+        ]);
+    }
+    if crate::guest::launcher::graphics_system_server_requested() {
+        // The worker mounts one system image and has no init cppreopt service.
+        build_props.push("ro.cp_system_other_odex=0");
+    }
+    fs::write(&overrides, build_props.join("\n") + "\n")?;
     if !root.join("system/build.prop").is_file() {
         return Err(io::Error::other("Guest /system/build.prop missing"));
     }
@@ -252,6 +263,7 @@ pub(crate) fn managed(mode: &str) -> bool {
         "--shell-worker"
             | "--guest-child-worker"
             | "--guest-service-worker"
+            | "--guest-hwbinder-worker"
             | "--guest-services-6a-worker"
             | "--guest-services-6b-worker"
             | "--guest-zygote-7a-worker"

@@ -2,7 +2,8 @@
 use crate::diagnostics::launcher::{
     fork_probe, system_server_preflight, system_server_runtime_sid,
 };
-use crate::guest::concurrent::system_suspend;
+use crate::guest::concurrent::{graphics, system_suspend};
+use crate::guest::hwbinder;
 use crate::guest::environment::start_property_service;
 use crate::guest::init::{wait_for_system_server, Service};
 use ssal::guest_initrc::{self as initrc, BootService};
@@ -32,11 +33,18 @@ pub(crate) fn installd_probe_requested() -> bool {
     std::env::var_os("SSAL_GUEST_INSTALLD_PROBE").as_deref() == Some(std::ffi::OsStr::new("1"))
 }
 
+pub(super) fn graphics_system_server_requested() -> bool {
+    std::env::var_os("SSAL_START_SYSTEM_SERVER").as_deref() == Some(std::ffi::OsStr::new("1"))
+        && graphics::requested()
+}
+
 pub(in crate::guest) fn uses_own_diagnostics(executable: &str) -> bool {
     // The Rust Binder services use mapped exec SIDs and write their own diagnostics.
     [
         crate::guest::init::binder_service::APEX.executable,
         system_suspend::SERVICE.executable,
+        hwbinder::COMPOSER,
+        "/vendor/bin/hw/vendor.qti.hardware.display.allocator-service",
     ]
     .contains(&executable)
 }
@@ -55,7 +63,11 @@ fn mapped_exec_domain(executable: &str, exec_context: Option<&[u8]>) -> &'static
         match executable {
             "/system/bin/app_process64" => "zygote",
             "/system/bin/servicemanager" => "servicemanager",
+            crate::guest::hwbinder::MANAGER => "hwservicemanager",
+            crate::guest::hwbinder::ALLOCATOR => "hal_allocator_default",
             "/system/bin/surfaceflinger" => "surfaceflinger",
+            hwbinder::COMPOSER => "hal_graphics_composer_default",
+            hwbinder::GRAPHICS_ALLOCATOR => "hal_graphics_allocator_default",
             "/run/ssal/ssal-apexservice" => crate::guest::init::binder_service::APEX.domain,
             "/run/ssal/ssal-system-suspend" => system_suspend::SERVICE.domain,
             "/apex/com.android.sdkext/bin/derive_classpath" => "derive_classpath",
@@ -67,17 +79,24 @@ fn mapped_exec_domain(executable: &str, exec_context: Option<&[u8]>) -> &'static
     }
 }
 
-fn retest_surfaceflinger(root: &Path, guest_binder: u64) -> io::Result<()> {
+pub(crate) fn retest_surfaceflinger(
+    root: &Path,
+    guest_binder: u64,
+    guest_hwbinder: Option<u64>,
+) -> io::Result<()> {
     let plan = ssal::guest_policy::runtime::load(root)?
         .ok_or_else(|| io::Error::other("Guest SELinux plan missing for SurfaceFlinger"))?;
     let sid = plan.context("surfaceflinger", true)?;
     let gpu = fs::metadata(root.join("dev").join(crate::guest::concurrent::graphics::KGSL))?;
     let binder = fs::metadata(root.join("dev/binder"))?;
-    if binder.rdev() != guest_binder || root.join("dev/hwbinder").exists() {
+    let actual_hwbinder = fs::metadata(root.join("dev/hwbinder"))
+        .ok()
+        .map(|device| device.rdev());
+    if binder.rdev() != guest_binder || actual_hwbinder != guest_hwbinder {
         return Err(io::Error::other("Y702 Guest graphics/Binder device isolation mismatch"));
     }
     println!(
-        "SF_RETEST_BEGIN uid=1000 sid={sid} gpu_rdev={} binder_rdev={} host_hwbinder=absent",
+        "SF_RETEST_BEGIN uid=1000 sid={sid} gpu_rdev={} binder_rdev={} hwbinder_rdev={actual_hwbinder:?}",
         gpu.rdev(),
         binder.rdev()
     );
@@ -96,8 +115,8 @@ fn retest_surfaceflinger(root: &Path, guest_binder: u64) -> io::Result<()> {
             None
         }
     };
-    if let Some(service) = &service {
-        let pid = service.pid();
+    if let Some(running) = &service {
+        let pid = running.pid();
         let actual_sid = fs::read_to_string(format!("/proc/{pid}/attr/current"))
             .map(|sid| sid.trim_matches(['\0', '\n']).to_owned())
             .unwrap_or_else(|error| format!("unavailable:{error}"));
@@ -107,32 +126,53 @@ fn retest_surfaceflinger(root: &Path, guest_binder: u64) -> io::Result<()> {
                 status
                     .lines()
                     .find(|line| line.starts_with("Uid:"))
-                    .map(str::to_owned)
+                    .and_then(|line| line.split_whitespace().nth(1).map(str::to_owned))
             })
-            .unwrap_or_else(|| "uid=unavailable".into());
+            .unwrap_or_else(|| "unavailable".into());
         println!("SF_RETEST_PROCESS pid={pid} {actual_uid} sid={actual_sid}");
-        std::thread::sleep(Duration::from_millis(500));
-    }
-    let shell = plan.context("shell", true)?;
-    for name in ["SurfaceFlinger", "SurfaceFlingerAIDL"] {
-        let result = (|| {
-            let mut command = command(root, "/system/bin/service", 1000, Some(shell.as_bytes()))?;
-            command.args(["check", name]);
-            crate::guest::process::command::run_with_timeout(
-                &mut command,
-                "Guest SurfaceFlinger Binder lookup",
-                Duration::from_secs(3),
-            )
-        })();
-        match result {
-            Ok(output) => println!(
-                "SF_RETEST_BINDER {name}: status={} stdout={} stderr={}",
-                output.status,
-                String::from_utf8_lossy(&output.stdout).trim(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            ),
-            Err(error) => println!("SF_RETEST_BINDER {name}: not run: {error}"),
+        if actual_uid != "1000" || actual_sid != sid {
+            service.take().unwrap().stop()?;
+            return Err(io::Error::other(format!(
+                "Guest SurfaceFlinger identity mismatch: uid={actual_uid} sid={actual_sid}"
+            )));
         }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if running.exited()? {
+                break;
+            }
+            if let Ok(out) = run(
+                root,
+                "/system/bin/sh",
+                &["-c", "service check SurfaceFlingerAIDL"],
+                2000,
+            ) {
+                if out.contains(": found") {
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    }
+    for name in ["SurfaceFlinger", "SurfaceFlingerAIDL"] {
+        let result = run(
+            root,
+            "/system/bin/sh",
+            &["-c", &format!("service check {name}")],
+            2000,
+        );
+        match result {
+            Ok(output) => println!("SF_RETEST_BINDER {name}: {}", output.trim()),
+            Err(error) => println!("SF_RETEST_BINDER {name}: failed: {error}"),
+        }
+    }
+    if let Ok(displays) = run(
+        root,
+        "/system/bin/sh",
+        &["-c", "dumpsys SurfaceFlinger --display-id"],
+        2000,
+    ) {
+        println!("SF_RETEST_DISPLAY_ID: {}", displays.trim());
     }
     let alive = service
         .as_ref()
@@ -166,9 +206,11 @@ pub(crate) fn command(
             || std::env::var_os("SSAL_START_SYSTEM_SERVER").is_some()));
     let derive_classpath_linker = executable == "/system/bin/bootstrap/linker64"
         && exec_context == Some(DERIVE_CLASSPATH_CONTEXT);
+    let mapped_installd =
+        executable == INSTALLD && (installd_probe_requested() || graphics_system_server_requested());
     let mut command = crate::guest::process::command::root_command(root, executable, pivot)?;
     let exec_context = if let Some(plan) = ssal::guest_policy::runtime::load(root)? {
-        let original = if executable == INSTALLD && installd_probe_requested() {
+        let original = if mapped_installd {
             "installd"
         } else {
             mapped_exec_domain(executable, exec_context)
@@ -222,7 +264,7 @@ pub(crate) fn command(
         );
     }
     let parent = std::process::id() as libc::pid_t;
-    let installd_namespace = (executable == INSTALLD && installd_probe_requested())
+    let installd_namespace = mapped_installd
         .then(|| fs::read_link("/proc/self/ns/mnt"))
         .transpose()?;
     unsafe {
@@ -758,8 +800,19 @@ fn isolated(root: &Path, userdata: &Path) -> io::Result<()> {
 
 fn start_data_service(root: &Path, exe: &str, name: &str) -> io::Result<Service> {
     if exe == INSTALLD {
-        for path in ["data/misc/user", "data/misc/installd"] {
-            crate::guest::mount::directory(root, path, 0o755)?;
+        let plan = if installd_probe_requested() || graphics_system_server_requested() {
+            ssal::guest_policy::runtime::load(root)?
+        } else {
+            None
+        };
+        for (path, label) in [
+            ("data/misc/user", "misc_user_data_file"),
+            ("data/misc/installd", "install_data_file"),
+        ] {
+            let path = crate::guest::mount::directory(root, path, 0o755)?;
+            if let Some(plan) = &plan {
+                ssal::guest_policy::runtime::set_label(&path, &plan.context(label, false)?)?;
+            }
         }
     }
     Service::start(root, exe, &[], name, 0, Some(GUEST_PROBE_CONTEXT), &[])
@@ -848,6 +901,59 @@ fn probe_installd(root: &Path, userdata: &Path, host_ns: &Path, binder: u64) -> 
     result
 }
 
+fn check_boot_services(services: &mut [Service]) -> io::Result<()> {
+    crate::guest::process::supervision::check_interrupted()?;
+    for service in services {
+        service.drain_output()?;
+        if service.exited()? {
+            return Err(io::Error::other(format!(
+                "Guest boot service {} exited (see {})",
+                service.pid(),
+                service.log.display(),
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn system_server_display_progress(stderr: &str, pid: u32) -> (bool, bool) {
+    let pid = pid.to_string();
+    let mut waited_for_display = false;
+    let mut ready = [false; 3];
+    let mut readiness_failed = false;
+    for line in stderr.lines() {
+        if line.split_whitespace().nth(2) != Some(pid.as_str()) {
+            continue;
+        }
+        if let Some((_, timing)) = line.split_once(" SystemServerTiming: ") {
+            waited_for_display |= timing.starts_with("WaitForDisplay took to complete:");
+            for (seen, phase) in ready.iter_mut().zip([
+                "MakeWindowManagerServiceReady took to complete:",
+                "MakeDisplayManagerServiceReady took to complete:",
+                "StartActivityManagerReadyPhase took to complete:",
+            ]) {
+                *seen |= timing.starts_with(phase);
+            }
+        }
+        if let Some((_, message)) = line.split_once(" SystemServer: ") {
+            readiness_failed |= message.contains("making Window Manager Service ready")
+                || message.contains("making Display Manager Service ready");
+        }
+    }
+    (
+        waited_for_display,
+        waited_for_display && ready.into_iter().all(|seen| seen) && !readiness_failed,
+    )
+}
+
+fn report_system_server_display_progress(root: &Path, pid: u32) -> io::Result<bool> {
+    let stderr = fs::read(root.parent().unwrap().join("phase7b/stderr.log"))?;
+    let (display, ready) = system_server_display_progress(&String::from_utf8_lossy(&stderr), pid);
+    println!("GUEST_DMS_DEFAULT_DISPLAY pid={pid} phase_returned={display}");
+    println!("GUEST_SYSTEM_READY pid={pid} phase_returned={ready}");
+    Ok(ready)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn verify(
     mounts: &mut Mounts,
@@ -866,6 +972,7 @@ pub(crate) fn verify(
         ssal::guest_policy::runtime::load(root)?.is_some(),
     )?;
     let apex_check_only = std::env::var_os("SSAL_GUEST_APEX_CHECK_ONLY").is_some();
+    let system_server_graphics = graphics_system_server_requested();
     let suspend_enabled = system_suspend::enabled();
     let installd_probe = phase7a && installd_probe_requested();
     if installd_probe && (start_system_server || apex_check_only || suspend_enabled) {
@@ -985,6 +1092,18 @@ pub(crate) fn verify(
     File::create(&aidl_server)?;
     let plan = ssal::guest_policy::runtime::load(root)?
         .ok_or_else(|| io::Error::other("Guest SELinux plan missing for AIDL server"))?;
+    if system_server_graphics {
+        graphics::install_virtual_composer_vintf(mounts, root, &plan)?;
+        let target = root.join(hwbinder::COMPOSER.trim_start_matches('/'));
+        File::create(&target)?;
+        ssal::guest_policy::runtime::set_label(&target, &plan.context("system_file", false)?)?;
+        ssal::guest_policy::runtime::bind_file(
+            mounts,
+            root,
+            &bin.join("ssal-virtual-composer"),
+            &target,
+        )?;
+    }
     ssal::guest_policy::runtime::set_label(
         &aidl_server,
         &plan.context("aidl_lazy_test_server_exec", false)?,
@@ -1005,6 +1124,7 @@ pub(crate) fn verify(
         )?;
     }
     let mut binder = crate::binder_probe::Session::new();
+    let mut hw_driver = crate::guest::binder::Session::new();
     if system_server_preflight {
         system_server_preflight::prepare(mounts, root, &bin)?;
     }
@@ -1240,8 +1360,10 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
         }
         println!("GUEST_SERVICEMANAGER_READINESS=PASS property=servicemanager.ready:true context_manager=Guest_handle_0 service_lookup=aidl_lazy_test_1 private_binder={major}:{minor}");
         println!("PHASE5B=PASS shell=PASS private_aidl=PASS properties=PASS host_control_socket=ABSENT private_binder={major}:{minor}");
-        if std::env::var("SSAL_Y702_SURFACEFLINGER_RETEST").as_deref() == Ok("1") {
-            retest_surfaceflinger(root, guest_binder)?;
+        if !system_server_graphics
+            && std::env::var("SSAL_Y702_SURFACEFLINGER_RETEST").as_deref() == Ok("1")
+        {
+            retest_surfaceflinger(root, guest_binder, None)?;
         }
         let mut apexservice = if apex_enabled {
             let apex = &crate::guest::init::binder_service::APEX;
@@ -1277,6 +1399,69 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
         let mut suspend = suspend_enabled
             .then(|| system_suspend::start(root, &bin, guest_binder))
             .transpose()?;
+        let mut boot_services = Vec::new();
+        if system_server_graphics {
+            let (major, minor) = hw_driver.provision_hwbinder(root)?;
+            let hwbinder_rdev = libc::makedev(major, minor);
+            let mut hwmanager = Service::start(
+                root,
+                hwbinder::MANAGER,
+                &[],
+                "hwservicemanager",
+                1000,
+                None,
+                &[],
+            )?;
+            hwbinder::wait_manager(root, &mut hwmanager, &plan, host_mount_namespace, hwbinder_rdev)?;
+            boot_services.push(hwmanager);
+            boot_services.push(Service::start(
+                root,
+                hwbinder::GRAPHICS_ALLOCATOR,
+                &[],
+                "graphics-allocator",
+                1000,
+                None,
+                &[],
+            )?);
+            boot_services.push(hwbinder::start_composer(
+                root,
+                &plan,
+                guest_binder,
+                hwbinder_rdev,
+            )?);
+            boot_services.push(Service::start(
+                root,
+                "/system/bin/surfaceflinger",
+                &[],
+                "surfaceflinger",
+                1000,
+                None,
+                &[],
+            )?);
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                check_boot_services(&mut boot_services)?;
+                let registry = run(
+                    root,
+                    "/system/bin/sh",
+                    &["-c", "service check SurfaceFlinger; service check SurfaceFlingerAIDL"],
+                    2000,
+                )?;
+                if registry.contains("Service SurfaceFlinger: found")
+                    && registry.contains("Service SurfaceFlingerAIDL: found")
+                {
+                    println!("GUEST_SURFACEFLINGER_READY=PASS {registry:?}");
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    return Err(io::Error::other(format!(
+                        "Guest SurfaceFlinger registration timed out: {registry}"
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            boot_services.push(start_data_service(root, INSTALLD, "installd")?);
+        }
         if installd_probe {
             probe_installd(root, userdata, host_mount_namespace, guest_binder)?;
         } else if phase7a {
@@ -1561,6 +1746,7 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
             let deadline = Instant::now() + Duration::from_secs(observation_seconds);
             while Instant::now() < deadline {
                 crate::guest::process::supervision::check_interrupted()?;
+                check_boot_services(&mut boot_services)?;
                 if use_initrc {
                     if let Some(service) = &mut property_service {
                         service.drain_output()?;
@@ -1585,6 +1771,10 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
                     diagnostics.tick()?;
                 }
                 if zygote.exited()? {
+                    if let (true, Some(pid)) = (system_server_graphics, system_server_pid) {
+                        zygote.tick_diagnostics()?;
+                        report_system_server_display_progress(root, pid)?;
+                    }
                     return Err(io::Error::other("Guest Zygote exited during residence"));
                 }
                 std::thread::sleep(Duration::from_millis(100));
@@ -1622,6 +1812,14 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
                     return Err(io::Error::other("Guest SystemServer identity changed"));
                 }
                 println!("PHASE7A_SYSTEM_SERVER=PASS framework_entry=true residence_seconds={observation_seconds}");
+                if system_server_graphics {
+                    zygote.tick_diagnostics()?;
+                    if !report_system_server_display_progress(root, expected)? {
+                        return Err(io::Error::other(
+                            "Guest SystemServer did not verify display and SystemReady phases",
+                        ));
+                    }
+                }
             }
             if controlled_fork {
                 fork_probe::run(root, &mut zygote, true)?;
@@ -1750,6 +1948,13 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
             }
         }
         if let Some(service) = &mut apexservice { service.stop()?; }
+        while let Some(mut service) = boot_services.pop() {
+            service.stop()?;
+        }
+        if system_server_graphics {
+            hw_driver.cleanup()?;
+            fs::remove_file(root.join("dev/hwbinder"))?;
+        }
         if let Some((service, broker)) = &mut suspend {
             service.stop()?;
             broker.stop()?;
@@ -1796,6 +2001,9 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
     }
     if let Err(error) = binder.cleanup() {
         cleanup_errors.push(format!("Private Binder cleanup: {error}"));
+    }
+    if let Err(error) = hw_driver.cleanup() {
+        cleanup_errors.push(format!("Private HwBinder cleanup: {error}"));
     }
     if fs::read_to_string("/sys/fs/selinux/enforce")?.trim() != "1" {
         cleanup_errors.push("Host global Enforcing changed".into());
@@ -1963,6 +2171,21 @@ mod tests {
     }
 
     #[test]
+    fn display_progress_requires_completed_phases_from_the_guest_pid() {
+        let stderr = [
+            "11-20 01:00:00.000 42 42 V SystemServerTiming: WaitForDisplay took to complete: 1ms",
+            "11-20 01:00:00.000 42 42 V SystemServerTiming: MakeWindowManagerServiceReady took to complete: 1ms",
+            "11-20 01:00:00.000 42 42 V SystemServerTiming: MakeDisplayManagerServiceReady took to complete: 1ms",
+            "11-20 01:00:00.000 42 42 V SystemServerTiming: StartActivityManagerReadyPhase took to complete: 1ms",
+        ];
+        assert_eq!(system_server_display_progress(&stderr[..3].join("\n"), 42), (true, false));
+        assert_eq!(system_server_display_progress(&stderr.join("\n"), 43), (false, false));
+        assert_eq!(system_server_display_progress(&stderr.join("\n"), 42), (true, true));
+        let failed = format!("{}\n11-20 01:00:00.000 42 42 E SystemServer: BOOT FAILURE making Display Manager Service ready", stderr.join("\n"));
+        assert_eq!(system_server_display_progress(&failed, 42), (true, false));
+    }
+
+    #[test]
     fn native_zygote_options_precede_java_socket_argument() {
         let args = zygote_args(false, true);
         assert_eq!(
@@ -2058,6 +2281,7 @@ mod tests {
             &directory.join("missing-cgroup"),
             crate::diagnostics::zygote::launch_time(),
             Instant::now(),
+            None,
         )?);
         assert!(service
             .wait_for_socket(Path::new("ssal_7b_fixture_absent"))
@@ -2110,6 +2334,7 @@ mod tests {
             &directory.join("missing-cgroup"),
             crate::diagnostics::zygote::launch_time(),
             Instant::now(),
+            None,
         )?);
         let mut query = Command::new("/bin/sh");
         query.current_dir(&directory).args(["-c", "i=0; while [ $i -lt 200 ]; do if [ -f ready ]; then echo abi-ready; exit 0; fi; i=$((i+1)); sleep 0.01; done; exit 1"]);

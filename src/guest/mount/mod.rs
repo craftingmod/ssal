@@ -105,6 +105,7 @@ pub(super) fn verify(
     let mut cgroups = crate::guest::cgroup::GuestCgroups::default();
     let overlay_backing = userdata.join(format!(".ssal-overlay-{}", std::process::id()));
     let mut overlay_created = false;
+    let hwbinder = mode == "--guest-hwbinder-worker";
     let mapped_launch = matches!(
         mode,
         "--guest-child-worker"
@@ -117,9 +118,14 @@ pub(super) fn verify(
         mode == "--guest-zygote-7a-worker" && crate::guest::launcher::installd_probe_requested();
     let surfaceflinger_retest =
         std::env::var("SSAL_Y702_SURFACEFLINGER_RETEST").as_deref() == Ok("1");
-    if surfaceflinger_retest && mode != "--guest-service-worker" {
+    let system_server_graphics = mode == "--guest-zygote-7a-worker"
+        && crate::guest::launcher::graphics_system_server_requested();
+    if surfaceflinger_retest
+        && !matches!(mode, "--guest-service-worker" | "--guest-hwbinder-worker")
+        && !system_server_graphics
+    {
         return Err(io::Error::other(
-            "Y702 SurfaceFlinger retest requires --guest-service-worker",
+            "Y702 SurfaceFlinger retest requires a guest service or HwBinder worker",
         ));
     }
     if surfaceflinger_retest && !crate::guest::concurrent::graphics::requested() {
@@ -129,7 +135,8 @@ pub(super) fn verify(
     }
     let y702_graphics =
         (mode == "--shell-worker" && crate::guest::concurrent::graphics::requested())
-            || surfaceflinger_retest;
+            || surfaceflinger_retest
+            || system_server_graphics;
     if y702_graphics {
         crate::guest::concurrent::graphics::require_y702()?;
     }
@@ -137,7 +144,7 @@ pub(super) fn verify(
         && std::env::var("SSAL_SHELL_APPLIED_POLICY_ONLY").as_deref() == Ok("1");
     let policy = if installd_probe || shell_applied_policy_only {
         Some(ssal::guest_policy::runtime::load_applied_for_probe(system, profile_dir)?)
-    } else if mode == "--prepare-worker"
+    } else if hwbinder || mode == "--prepare-worker"
         || mode == "--shell-worker"
         || (mapped_launch && profile_dir.join("selinux/plan.json").is_file())
     {
@@ -149,7 +156,7 @@ pub(super) fn verify(
     } else {
         None
     };
-    if matches!(
+    if hwbinder || matches!(
         mode,
         "--guest-processgroup-worker"
             | "--guest-memory-worker"
@@ -225,7 +232,7 @@ pub(super) fn verify(
         }
         devices::prepare_guest_dev(&mut mounts, &root, y702_graphics)?;
         if let Some(plan) = &policy {
-            if mapped_launch {
+            if mapped_launch || hwbinder {
                 devices::prepare_guest_ashmem(&root, plan)?;
             }
             let socket = root.join("dev/socket");
@@ -273,7 +280,7 @@ pub(super) fn verify(
             libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
             "",
         )?;
-        if matches!(
+        if hwbinder || matches!(
             mode,
             "--guest-cgroup-worker"
                 | "--guest-child-worker"
@@ -284,7 +291,7 @@ pub(super) fn verify(
                 | "--guest-services-6b-worker"
                 | "--guest-zygote-7a-worker"
         ) {
-            if matches!(
+            if hwbinder || matches!(
                 mode,
                 "--guest-processgroup-worker"
                     | "--guest-cgroup-worker"
@@ -308,7 +315,7 @@ pub(super) fn verify(
         if mode == "--guest-processgroup-worker" {
             return crate::guest::cgroup::processgroup_probe(&mut mounts, &mut cgroups, &root);
         }
-        for path in &profile.host_readonly {
+        for path in profile.host_readonly.iter().filter(|_| !hwbinder) {
             let source = Path::new("/").join(path);
             if source.is_dir() {
                 mounts.bind(&source, &root.join(path), true, false)?;
@@ -474,6 +481,15 @@ pub(super) fn verify(
                 plan,
                 shell_applied_policy_only,
             )?;
+            if (hwbinder && surfaceflinger_retest) || system_server_graphics {
+                crate::guest::concurrent::graphics::apply_hwbinder_vintf_access(plan)?;
+                crate::guest::concurrent::graphics::apply_surfaceflinger_graphics_access(plan)?;
+                crate::guest::concurrent::graphics::apply_virtual_composer_access(plan)?;
+                crate::guest::concurrent::graphics::apply_graphics_allocator_access(plan)?;
+            }
+        }
+        if hwbinder {
+            return crate::guest::hwbinder::verify(&mut mounts, &root, host_mount_namespace);
         }
         if mode == "--shell-worker" {
             return crate::guest::shell::standalone(

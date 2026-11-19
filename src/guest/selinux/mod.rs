@@ -13,7 +13,7 @@ pub mod native;
 pub mod runtime;
 mod symbols;
 
-const VERSION: u32 = 35;
+const VERSION: u32 = 39;
 
 type Names = BTreeMap<String, String>;
 
@@ -150,6 +150,17 @@ impl Plan {
                 .types
                 .get(original)
                 .ok_or_else(|| invalid(format!("GSI type missing: {original}")))?;
+            let rule = format!("allow {domain} kernel security {{ compute_av }}");
+            self.rules.insert(rule.clone());
+            native::record(
+                &mut self.native_rules,
+                rule,
+                1,
+                1,
+                &[domain, "kernel", "security", "compute_av"],
+            );
+        }
+        if let Some(domain) = self.types.get("hwservicemanager") {
             let rule = format!("allow {domain} kernel security {{ compute_av }}");
             self.rules.insert(rule.clone());
             native::record(
@@ -1149,13 +1160,18 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
         "derive_classpath",
         "linkerconfig",
         "servicemanager",
+        "hwservicemanager",
+        "hal_allocator_default",
         "aidl_lazy_test_server",
         "apexd",
+        "installd",
         concurrent::SYSTEM_SUSPEND_DOMAIN,
         "zygote",
         "system_server_startup",
         "system_server",
         "surfaceflinger",
+        "hal_graphics_composer_default",
+        "hal_graphics_allocator_default",
     ] {
         if let Some(domain) = plan.types.get(original) {
             for (class, permission) in [("fd", "use"), ("fifo_file", "write")] {
@@ -1314,7 +1330,10 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
         plan.rules.insert(rule);
     }
     // binderfs context= mounts require the Guest binder label to associate with its filesystem.
-    if let Some(device) = plan.types.get("binder_device") {
+    for device in ["binder_device", "hwbinder_device"]
+        .into_iter()
+        .filter_map(|name| plan.types.get(name))
+    {
         let rule = format!("allow {device} {device} filesystem {{ associate }}");
         if plan.rules.insert(rule.clone()) {
             native::record(
@@ -1324,6 +1343,68 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
                 1,
                 &[device, device, "filesystem", "associate"],
             );
+        }
+    }
+    if let Some(shell) = plan.types.get("shell") {
+        // lshal resolves built-in manager bookkeeping; the HIDL probe also resolves IAllocator.
+        for service in [
+            "hidl_manager_hwservice",
+            "hidl_token_hwservice",
+            "hidl_allocator_hwservice",
+        ]
+        .into_iter()
+        .filter_map(|name| plan.types.get(name))
+        {
+            let rule = format!("allow {shell} {service} hwservice_manager {{ find }}");
+            if plan.rules.insert(rule.clone()) {
+                native::record(
+                    &mut native_rules,
+                    rule,
+                    1,
+                    1,
+                    &[shell, service, "hwservice_manager", "find"],
+                );
+            }
+        }
+        if let Some(manager) = plan.types.get("hwservicemanager") {
+            // IBase::debug receives the Guest lshal pipe's write end.
+            for (class, permission) in [("fd", "use"), ("fifo_file", "write")] {
+                let rule = format!("allow {manager} {shell} {class} {{ {permission} }}");
+                if plan.rules.insert(rule.clone()) {
+                    native::record(
+                        &mut native_rules,
+                        rule,
+                        1,
+                        1,
+                        &[manager, shell, class, permission],
+                    );
+                }
+            }
+        }
+        if let Some(allocator) = plan.types.get("hal_allocator_default") {
+            for (source, target, class, permissions) in [
+                (shell, allocator, "binder", &["call", "transfer"][..]),
+                (shell, allocator, "fd", &["use"][..]),
+                (allocator, shell, "binder", &["transfer"][..]),
+                (allocator, shell, "fd", &["use"][..]),
+                (allocator, shell, "fifo_file", &["write"][..]),
+            ] {
+                let rule = format!(
+                    "allow {source} {target} {class} {{ {} }}",
+                    permissions.join(" ")
+                );
+                if plan.rules.insert(rule.clone()) {
+                    for permission in permissions {
+                        native::record(
+                            &mut native_rules,
+                            rule.clone(),
+                            1,
+                            1,
+                            &[source, target, class, permission],
+                        );
+                    }
+                }
+            }
         }
     }
     // memfd uses the shared kernel tmpfs SID, outside the relabeled Guest mounts.
@@ -1557,6 +1638,38 @@ mod tests {
         ])
     }
     #[test]
+    fn hwbinder_labels_and_rules_target_guest_types() -> io::Result<()> {
+        let mut inputs = fixture();
+        inputs
+            .get_mut("system/etc/selinux/plat_sepolicy.cil")
+            .unwrap()
+            .push_str(" (type init) (type servicemanager) (type shell) (type hwservicemanager) (type hal_allocator_default) (type hwbinder_device) (type hidl_token_hwservice) (type hidl_allocator_hwservice)");
+        let contexts = "system/etc/selinux/plat_hwservice_contexts";
+        inputs.insert(contexts.into(), "android.hidl.token::ITokenManager u:object_r:hidl_token_hwservice:s0\nandroid.hidl.allocator::IAllocator u:object_r:hidl_allocator_hwservice:s0\n".into());
+        let plan = generate("p0001", &inputs)?;
+        assert!(plan.contexts[contexts].contains("u:object_r:ssal_p0001_hidl_token_hwservice:s0"));
+        assert!(plan.contexts[contexts].contains("u:object_r:ssal_p0001_hidl_allocator_hwservice:s0"));
+        for rule in [
+            "allow ssal_p0001_hwservicemanager kernel security { compute_av }",
+            "allow ssal_p0001_hwbinder_device ssal_p0001_hwbinder_device filesystem { associate }",
+            "allow ssal_p0001_shell ssal_p0001_hidl_token_hwservice hwservice_manager { find }",
+            "allow ssal_p0001_shell ssal_p0001_hidl_allocator_hwservice hwservice_manager { find }",
+            "allow ssal_p0001_hwservicemanager ssal_p0001_shell fd { use }",
+            "allow ssal_p0001_hwservicemanager ssal_p0001_shell fifo_file { write }",
+            "allow ssal_p0001_shell ssal_p0001_hal_allocator_default binder { call transfer }",
+            "allow ssal_p0001_shell ssal_p0001_hal_allocator_default fd { use }",
+            "allow ssal_p0001_hal_allocator_default ssal_p0001_shell binder { transfer }",
+            "allow ssal_p0001_hal_allocator_default ssal_p0001_shell fd { use }",
+            "allow ssal_p0001_hal_allocator_default ssal_p0001_shell fifo_file { write }",
+        ] {
+            assert!(plan.rules.contains(rule), "missing rule: {rule}");
+            assert!(plan.native_rules.contains_key(rule), "missing native rule: {rule}");
+        }
+        assert!(!plan.rules.iter().any(|rule| rule.contains(" hwbinder_device ")));
+        Ok(())
+    }
+
+    #[test]
     fn launcher_aidl_calls_only_extend_guest_peers() -> io::Result<()> {
         let mut inputs = fixture();
         inputs
@@ -1599,7 +1712,7 @@ mod tests {
         inputs
             .get_mut("system/etc/selinux/plat_sepolicy.cil")
             .unwrap()
-            .push_str(" (type surfaceflinger)");
+            .push_str(" (type surfaceflinger) (type installd)");
         let plan = generate("p0001", &inputs)?;
         let rules: Vec<_> = plan
             .rules
@@ -1607,7 +1720,7 @@ mod tests {
             .filter(|r| r.contains(" ksu "))
             .cloned()
             .collect();
-        assert_eq!(rules.len(), 25);
+        assert_eq!(rules.len(), 27);
         assert!(rules.contains(&"allow ssal_p0001_shell ksu fifo_file { read }".to_owned()));
         for permission in ["getattr", "ioctl"] {
             let rule = format!("allow ssal_p0001_shell ksu fifo_file {{ {permission} }}");
@@ -1631,6 +1744,7 @@ mod tests {
             "servicemanager",
             "aidl_lazy_test_server",
             "apexd",
+            "installd",
             "zygote",
             "system_server_startup",
             "system_server",

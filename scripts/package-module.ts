@@ -33,8 +33,10 @@ const entries: { name: string; path: string; mode: number }[] = [
     "ssal-selinux-identity",
     "ssal-enforcing-binder",
     "ssal-property-service",
+    "ssal-hwbinder-probe.sh",
     "ssal-apexservice",
     "ssal-system-suspend",
+    "ssal-virtual-composer",
     "ssal-context-map.so",
     "phase3-ipc",
     "ssal-phase2-log.so",
@@ -75,6 +77,13 @@ if (existsSync("out/bin/ssal-binder-probe") || existsSync("out/bin/ssal-binder-p
     { name: "NOTICE.binder-probe", path: "native/binder-probe/NOTICE", mode: 0o100644 },
     { name: "LICENSE.binder-probe", path: "native/binder-probe/LICENSE.apache-2.0", mode: 0o100644 },
   )
+}
+if (existsSync("out/bin/ssal-hwbinder-probe")) {
+  entries.push({
+    name: "bin/ssal-hwbinder-probe",
+    path: "out/bin/ssal-hwbinder-probe",
+    mode: 0o100755,
+  })
 }
 async function addWeb(dir: string, prefix = "webroot"): Promise<void> {
   for (const entry of (await readdir(dir, { withFileTypes: true })).sort(

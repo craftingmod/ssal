@@ -6,6 +6,14 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt};
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 pub fn init(expected_device: u64, expected_context: &str) -> Result<()> {
+    init_with_hwbinder(expected_device, None, expected_context)
+}
+
+pub fn init_with_hwbinder(
+    expected_device: u64,
+    expected_hwbinder: Option<u64>,
+    expected_context: &str,
+) -> Result<()> {
     let binder = fs::metadata("/dev/binder")?;
     let context = fs::read_to_string("/proc/self/attr/current")?;
     if !binder.file_type().is_char_device()
@@ -17,9 +25,11 @@ pub fn init(expected_device: u64, expected_context: &str) -> Result<()> {
     }
     // The launcher closes inherited FDs; also refuse another Binder device alias.
     for name in ["/dev/hwbinder", "/dev/vndbinder", "/dev/binderfs/binder"] {
-        if fs::metadata(name)
-            .is_ok_and(|m| m.file_type().is_char_device() && m.rdev() != expected_device)
-        {
+        if fs::metadata(name).is_ok_and(|m| {
+            m.file_type().is_char_device()
+                && m.rdev() != expected_device
+                && !(name == "/dev/hwbinder" && expected_hwbinder == Some(m.rdev()))
+        }) {
             return Err(format!("unexpected Binder device accessible: {name}").into());
         }
     }

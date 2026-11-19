@@ -119,6 +119,7 @@ fn exercise(group: &Path, directory: &Path) -> io::Result<()> {
         group,
         launch_ms,
         started,
+        None,
     )?;
     // Bounded wait for the stopped allocator; no external PID is ever moved or killed.
     loop {

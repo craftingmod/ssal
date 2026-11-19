@@ -3,7 +3,7 @@ use crate::namespace_mounts::Mounts;
 use std::ffi::CString;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::process::Command;
 
 #[derive(Default, Serialize, Deserialize)]
@@ -813,6 +813,7 @@ pub fn install(plan: &Plan, mounts: &mut Mounts, root: &Path) -> io::Result<()> 
     let scratch = root.parent().unwrap().join("selinux-overlay");
     let runtime = root.join("run/ssal");
     fs::create_dir_all(&runtime)?;
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o755))?;
     let file_context = plan.context("system_file", false)?;
     // compose_system creates these links on the Guest tmpfs, outside the system overlay.
     for entry in fs::read_dir(root)? {
@@ -840,8 +841,10 @@ pub fn install(plan: &Plan, mounts: &mut Mounts, root: &Path) -> io::Result<()> 
         .iter()
         .map(|(a, b)| format!("{a} {b}\n"))
         .collect();
-    fs::write(runtime.join("selinux-types"), mapping)?;
-    set_label(&runtime.join("selinux-types"), &file_context)?;
+    let types = runtime.join("selinux-types");
+    fs::write(&types, mapping)?;
+    fs::set_permissions(&types, fs::Permissions::from_mode(0o644))?;
+    set_label(&types, &file_context)?;
     let library = runtime.join("ssal-context-map.so");
     File::create(&library)?;
     bind_file(
@@ -863,6 +866,7 @@ pub fn install(plan: &Plan, mounts: &mut Mounts, root: &Path) -> io::Result<()> 
         }
         let source = scratch.join(path.replace('/', "_"));
         fs::write(&source, text)?;
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o644))?;
         set_label(&source, &file_context)?;
         mounts.bind(&source, &target, true, false)?;
     }

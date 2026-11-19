@@ -172,14 +172,14 @@ pub(crate) fn worker_admitted(
         .parent()
         .ok_or_else(|| io::Error::other("profile parent missing"))?;
     let data_file = crate::guest::userdata::open(userdata)?;
-    if installd_probe {
+    if installd_probe || mode == "--guest-hwbinder-worker" {
         let original = fs::metadata(profile_dir.join("userdata.img"))?;
         let copy = data_file.metadata()?;
         if !userdata.file_name().and_then(|name| name.to_str()).is_some_and(|name| {
             name.starts_with(".userdata-") && name.ends_with(".img")
         }) || (copy.dev(), copy.ino()) == (original.dev(), original.ino())
         {
-            return Err(io::Error::other("Guest installd probe requires temporary userdata"));
+            return Err(io::Error::other("Guest probe requires temporary userdata"));
         }
     }
     crate::guest::userdata::lock(&data_file)?;

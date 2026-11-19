@@ -84,6 +84,8 @@ SystemServer 또는 APEX 검사 모드에서는 `late-init`에서 이어지는 `
 
 재시작 간격은 직전 기동 시각을 기준으로 하며 기본값은 5초입니다. 비정상 종료에는 최소 5초를 적용합니다. 명시적 `ctl.stop`은 대기 중인 자동 재시작도 취소합니다. 현재 Zygote worker가 직접 감독하는 `servicemanager`와 Zygote에는 기존 진단 수명주기를 적용합니다. Vendor/ODM HAL, APEX rc, `onrestart` 훅과 재부팅 동작은 이 경로의 실행 범위 밖입니다. SystemServer 시작에는 기존 `SSAL_START_SYSTEM_SERVER=1`과 APEX Binder 준비 검사가 필요합니다.
 
+Lenovo Y702에서 `SSAL_START_SYSTEM_SERVER=1 SSAL_Y702_GRAPHICS=1`을 사용하면 worker가 Zygote 시작 전에 hwservicemanager와 그래픽 allocator를 private HwBinder에서 시작하고, `ssal-virtual-composer`와 SurfaceFlinger를 private Binder에 등록합니다. `ssal-virtual-composer`는 `ssald`와 같은 디렉터리에 배치합니다. `GUEST_DMS_DEFAULT_DISPLAY`와 `GUEST_SYSTEM_READY`의 `phase_returned=true`는 같은 Guest SystemServer의 부팅 로그에서 각 단계의 반환이 확인됐음을 뜻합니다.
+
 ## 빌드
 
 WSLc, Bun과 네트워크가 필요합니다. PowerShell에서 실행합니다.

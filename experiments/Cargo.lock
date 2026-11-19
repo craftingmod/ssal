@@ -683,6 +683,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ssal-virtual-composer"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "rsbinder",
+ "rsbinder-aidl",
+ "ssal-binder-service",
+]
+
+[[package]]
 name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

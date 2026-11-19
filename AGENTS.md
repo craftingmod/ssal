@@ -8,6 +8,7 @@ vendor has huge codebase so don't read unless explicit request.
 
 ## Rule
 
+- **ALWAYS USE `gpt-6-luna` model for subagent except explicit request. DO NOT USE SUBAGENT WHEN MODEL UNAVAIABLE.**
 - Run WSL and WSLc commands outside of the sandbox to build.
 - Prioritize incremental runtime validation and first boot over exhaustive preemptive hardening. Avoid blocking all progress on unverified risks.
 - Cleanup work sholud be run on Luna sub-agent.
@@ -15,7 +16,7 @@ vendor has huge codebase so don't read unless explicit request.
 
 ## Analyze log
 
-- Delegate bulk logcat/dmesg/AVC analysis to a low-cost subagent(Luna) when available.
+- Delegate bulk logcat/dmesg/AVC analysis to a low-cost subagent(`gpt-6-luna`) when available.
 - Pre-filter logs locally; return only concise findings with timestamps, source paths, and line numbers.
 - Never load complete raw logs into the main agent context unless explicitly requested.
 

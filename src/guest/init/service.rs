@@ -208,12 +208,16 @@ impl Service {
             output: Vec::new(),
         };
         if diagnostic {
+            // Package scanning can emit several MiB before SystemReady.
+            let stderr_limit = (is_zygote && crate::guest::launcher::graphics_system_server_requested())
+                .then_some(16 * 1024 * 1024);
             service.diagnostics = Some(crate::diagnostics::zygote::Diagnostics::attach(
                 &mut service.child,
                 &diagnostic_dir,
                 &crate::guest::cgroup::memory_group(crate::guest::cgroup::backend()?),
                 launch_ms,
                 started,
+                stderr_limit,
             )?);
             println!("Guest diagnostics={}", diagnostic_dir.display());
         }

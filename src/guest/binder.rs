@@ -4,7 +4,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 #[repr(C)]
@@ -34,6 +34,28 @@ pub(crate) struct Session {
     created_mount: Option<u64>,
 }
 
+#[derive(Clone, Copy)]
+enum Driver {
+    Binder,
+    HwBinder,
+}
+
+impl Driver {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Binder => "binder",
+            Self::HwBinder => "hwbinder",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Binder => "binder_device",
+            Self::HwBinder => "hwbinder_device",
+        }
+    }
+}
+
 impl Session {
     pub(crate) fn new() -> Self {
         Self {
@@ -53,17 +75,98 @@ impl Session {
         root: &Path,
         label: Option<&str>,
     ) -> io::Result<(u32, u32, i32)> {
-        let host = fs::metadata("/dev/binder")?;
-        if !host.file_type().is_char_device() {
-            return Err(io::Error::other("host binder is not a character device"));
-        }
         let target = crate::guest::mount::guest_path(root, "dev/binderfs")?;
+        self.provision_driver(root, &target, Driver::Binder, label)
+    }
+
+    pub(crate) fn provision_hwbinder(&mut self, root: &Path) -> io::Result<(u32, u32)> {
+        if !fs::read_to_string("/proc/filesystems")?
+            .lines()
+            .any(|line| line.split_whitespace().last() == Some("binder"))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "kernel binderfs unavailable",
+            ));
+        }
+        let backing = crate::guest::mount::directory(root, "dev/.ssal-hwbinder/binderfs", 0o700)?;
+        // Some kernels populate binder and vndbinder by default. Expose only the HwBinder alias.
+        fs::set_permissions(backing.parent().unwrap(), fs::Permissions::from_mode(0o700))?;
+        let (major, minor, _) = self.provision_driver(root, &backing, Driver::HwBinder, None)?;
+        let device = self
+            .device
+            .as_ref()
+            .ok_or_else(|| io::Error::other("private HwBinder absent"))?;
+        device.set_permissions(fs::Permissions::from_mode(0o666))?;
+        // Verify binder_mmap on an independent open FD without disturbing the session handle.
+        let alias = crate::guest::mount::guest_path(root, "dev/hwbinder")?;
+        let mmap_probe = OpenOptions::new().read(true).write(true).open(&alias)?;
+        let mapped = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                mmap_probe.as_raw_fd(),
+                0,
+            )
+        };
+        if mapped == libc::MAP_FAILED {
+            return Err(io::Error::other(format!(
+                "private HwBinder mmap: {}",
+                io::Error::last_os_error()
+            )));
+        }
+        if unsafe { libc::munmap(mapped, 4096) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        println!("GUEST_HWBINDER_MMAP=PASS device={major}:{minor} bytes=4096");
+        Ok((major, minor))
+    }
+
+    fn provision_driver(
+        &mut self,
+        root: &Path,
+        target: &Path,
+        driver: Driver,
+        label: Option<&str>,
+    ) -> io::Result<(u32, u32, i32)> {
+        let name = driver.name();
+        let mut host_devices = Vec::new();
+        let host_paths: &[_] = match driver {
+            Driver::Binder => &["/dev/binder"],
+            Driver::HwBinder => &["/dev/binder", "/dev/hwbinder", "/dev/vndbinder"],
+        };
+        for &host_path in host_paths {
+            match fs::metadata(host_path) {
+                Ok(meta) if meta.file_type().is_char_device() => {
+                    host_devices.push((host_path, meta.rdev()));
+                }
+                Ok(_) => {
+                    return Err(io::Error::other(format!(
+                        "{host_path} is not a character device"
+                    )))
+                }
+                Err(error)
+                    if error.kind() == io::ErrorKind::NotFound
+                        && matches!(driver, Driver::HwBinder) =>
+                {
+                    ()
+                }
+                Err(error) => return Err(error),
+            }
+        }
         if !target.is_dir() {
             return Err(io::Error::other("binderfs mountpoint missing"));
         }
         let mapped = ssal::guest_policy::runtime::load(root)?
-            .map(|p| p.context("binder_device", false))
+            .map(|p| p.context(driver.label(), false))
             .transpose()?;
+        if matches!(driver, Driver::HwBinder) && mapped.is_none() {
+            return Err(io::Error::other(
+                "private HwBinder requires a mapped Guest label",
+            ));
+        }
         let label = mapped.as_deref().or(label);
         let options = CString::new(match label {
             Some(context)
@@ -79,7 +182,7 @@ impl Session {
         if unsafe {
             libc::mount(
                 c"binder".as_ptr(),
-                cpath(&target)?.as_ptr(),
+                cpath(target)?.as_ptr(),
                 c"binder".as_ptr(),
                 libc::MS_NOSUID | libc::MS_NOEXEC,
                 options.as_ptr().cast(),
@@ -92,7 +195,7 @@ impl Session {
                 format!("mount private binderfs {}: {e}", target.display()),
             ));
         }
-        self.mounts.push(target.clone());
+        self.mounts.push(target.to_owned());
         let control = OpenOptions::new()
             .read(true)
             .write(true)
@@ -106,20 +209,24 @@ impl Session {
         };
         // Inspect the original node before any alias bind hides its genfs label.
         // Only reuse a default node on the fresh mount whose control FD we own.
-        let source = target.join("binder");
+        let source = target.join(name);
         let created_by = match fs::symlink_metadata(&source) {
             Ok(meta) if meta.file_type().is_char_device() => "kernel_mount_default",
-            Ok(_) => return Err(io::Error::other("private binder is not a character device")),
+            Ok(_) => {
+                return Err(io::Error::other(format!(
+                    "private {name} is not a character device"
+                )))
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => "BINDER_CTL_ADD",
             Err(e) => return Err(e),
         };
-        request.name[..6].copy_from_slice(b"binder");
+        request.name[..name.len()].copy_from_slice(name.as_bytes());
         // _IOWR('b', 1, struct binderfs_device), size=264 on arm64 and x86_64.
         if created_by == "BINDER_CTL_ADD"
             && unsafe { libc::ioctl(control.as_raw_fd(), 0xc1086201u32 as _, &mut request) } != 0
         {
             return Err(io::Error::other(format!(
-                "BINDER_CTL_ADD: {}",
+                "BINDER_CTL_ADD {name}: {}",
                 io::Error::last_os_error()
             )));
         }
@@ -131,7 +238,7 @@ impl Session {
         }
         if !meta.file_type().is_char_device()
             || meta.rdev() != libc::makedev(request.major, request.minor)
-            || meta.rdev() == host.rdev()
+            || host_devices.iter().any(|(_, rdev)| *rdev == meta.rdev())
             || mount_id(&device)? != private_mount
         {
             return Err(io::Error::other(
@@ -139,8 +246,11 @@ impl Session {
             ));
         }
         println!("private Binder original node: created_by={created_by}; dev={} inode={} rdev={} mode=0{:o} uid={} gid={} label={}", meta.dev(), meta.ino(), meta.rdev(), meta.mode() & 0o7777, meta.uid(), meta.gid(), ssal::unix::image_context(&device).unwrap_or_else(|e| format!("unavailable: {e}")));
-        let alias = crate::guest::mount::guest_path(root, "dev")?.join("binder");
+        let alias = crate::guest::mount::guest_path(root, "dev")?.join(name);
         match fs::symlink_metadata(&alias) {
+            Ok(_) if matches!(driver, Driver::HwBinder) => {
+                return Err(io::Error::other("Guest HwBinder alias must start absent"));
+            }
             Ok(meta) if !meta.file_type().is_symlink() => (),
             Ok(_) => return Err(io::Error::other("Guest Binder alias is a symlink")),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -163,7 +273,7 @@ impl Session {
             } != 0
             {
                 return Err(io::Error::other(format!(
-                    "bind private /dev/binder: {}",
+                    "bind private /dev/{name}: {}",
                     io::Error::last_os_error()
                 )));
             }
@@ -174,9 +284,9 @@ impl Session {
         if (alias_meta.dev(), alias_meta.ino(), alias_meta.rdev())
             != (meta.dev(), meta.ino(), meta.rdev())
         {
-            return Err(io::Error::other(
-                "guest /dev/binder does not resolve to private device",
-            ));
+            return Err(io::Error::other(format!(
+                "guest /dev/{name} does not resolve to private device"
+            )));
         }
         let mut protocol: i32 = 0;
         if unsafe { libc::ioctl(device.as_raw_fd(), 0xc0046209u32 as _, &mut protocol) } != 0 {
@@ -190,7 +300,21 @@ impl Session {
                 "unsupported arm64 Binder protocol {protocol}"
             )));
         }
-        println!("private Binder device: {}:{} mount_id={private_mount}; host device={}:{}; protocol={protocol}; label={}", request.major, request.minor, libc::major(host.rdev()), libc::minor(host.rdev()), ssal::unix::image_context(&device).unwrap_or_else(|e| format!("unavailable: {e}")));
+        let actual_label = ssal::unix::image_context(&device);
+        if matches!(driver, Driver::HwBinder) && actual_label.as_deref().ok() != mapped.as_deref() {
+            return Err(io::Error::other("private HwBinder SELinux label mismatch"));
+        }
+        if matches!(driver, Driver::Binder) {
+            let host = host_devices[0].1;
+            println!("private Binder device: {}:{} mount_id={private_mount}; host device={}:{}; protocol={protocol}; label={}", request.major, request.minor, libc::major(host), libc::minor(host), actual_label.unwrap_or_else(|e| format!("unavailable: {e}")));
+        } else {
+            let host = host_devices
+                .iter()
+                .find(|(path, _)| *path == "/dev/hwbinder")
+                .map(|(_, rdev)| format!("{}:{}", libc::major(*rdev), libc::minor(*rdev)))
+                .unwrap_or_else(|| "absent".into());
+            println!("GUEST_HWBINDER_DEVICE=PASS device={}:{} rdev={} mount_id={private_mount} host_hwbinder={host} protocol={protocol} label={}", request.major, request.minor, meta.rdev(), actual_label?);
+        }
         self.device = Some(device);
         drop(alias_file);
         drop(control);

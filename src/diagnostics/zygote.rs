@@ -15,6 +15,7 @@ pub(crate) struct Stream {
     output: File,
     seen: u64,
     saved: usize,
+    limit: usize,
 }
 impl Stream {
     pub(crate) fn new(
@@ -31,6 +32,7 @@ impl Stream {
             output,
             seen: 0,
             saved: 0,
+            limit: LIMIT,
         })
     }
     pub(crate) fn drain(&mut self) -> io::Result<()> {
@@ -41,8 +43,8 @@ impl Stream {
                 Ok(0) => break,
                 Ok(n) => {
                     self.seen += n as u64;
-                    // shortcut: retain the first MiB, add a tail ring if real runs exceed it.
-                    let keep = n.min(LIMIT - self.saved);
+                    // shortcut: keep the first bytes, add a tail ring if boot exceeds the cap.
+                    let keep = n.min(self.limit.saturating_sub(self.saved));
                     self.output.write_all(&buffer[..keep])?;
                     self.saved += keep;
                 }
@@ -93,6 +95,7 @@ impl Diagnostics {
         cgroup: &Path,
         launch_ms: u128,
         started: Instant,
+        stderr_limit: Option<usize>,
     ) -> io::Result<Self> {
         let mut result = Self {
             stdout: Stream::new(
@@ -117,12 +120,13 @@ impl Diagnostics {
             started,
             sample_at: Instant::now(),
         };
+        result.stderr.limit = stderr_limit.unwrap_or(LIMIT);
         writeln!(
             result.metadata,
             "{}",
             serde_json::json!({
                 "event": "launch", "unix_ms": launch_ms, "pid": child.id(),
-                "cgroup": cgroup, "stream_limit_bytes": LIMIT,
+                "cgroup": cgroup, "stream_limit_bytes": LIMIT, "stderr_limit_bytes": result.stderr.limit,
                 "native_capture": "Guest-only abort interposer + SIGSEGV ucontext/maps/bounded stack/FP capture + liblog stderr logger; offline symbolization",
                 "host_debuggerd_tombstoned": "unchanged; not connected",
             })
@@ -242,6 +246,7 @@ mod tests {
             &dir.join("absent"),
             unix_ms(),
             Instant::now(),
+            None,
         )?;
         let deadline = Instant::now() + Duration::from_secs(10);
         let status = loop {
@@ -298,6 +303,7 @@ mod tests {
             &dir.join("absent"),
             unix_ms(),
             Instant::now(),
+            None,
         )?;
         let status = child.wait()?;
         let started = Instant::now();

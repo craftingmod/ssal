@@ -127,6 +127,21 @@ pub(super) fn prepare_guest_dev(
             Some("u:object_r:gpu_device:s0"),
         )?;
         expected.insert(graphics::KGSL.to_owned());
+        let dma_heap = directory(&dev, "dma_heap", 0o755)?;
+        for name in ["system", "qcom,system"] {
+            let source = Path::new("/dev/dma_heap").join(name);
+            if let Ok(meta) = fs::symlink_metadata(&source) {
+                if meta.file_type().is_char_device() {
+                    let target = dma_heap.join(name);
+                    OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&target)?;
+                    mounts.bind(&source, &target, false, false)?;
+                }
+            }
+        }
+        expected.insert("dma_heap".to_owned());
     }
     let actual: std::collections::BTreeSet<String> = fs::read_dir(&dev)?
         .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
