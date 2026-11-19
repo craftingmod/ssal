@@ -27,6 +27,7 @@ pub(crate) const GUEST_PROBE_CONTEXT: &[u8] = b"u:r:ssal_guest_probe:s0\0";
 const PROPERTY_SERVICE_CONTEXT: &[u8] = b"u:r:ssal_property:s0\0";
 const AIDL_SERVER_CONTEXT: &[u8] = b"u:r:aidl_lazy_test_server:s0\0";
 const INSTALLD: &str = "/system/bin/installd";
+const ARTD: &str = "/apex/com.android.art/bin/artd";
 const INSTALLD_CAPS: u32 = 0xff;
 
 pub(crate) fn installd_probe_requested() -> bool {
@@ -76,6 +77,7 @@ fn mapped_exec_domain(executable: &str, exec_context: Option<&[u8]>) -> &'static
             "/apex/com.android.runtime/bin/linkerconfig" | "/system/bin/linkerconfig" => {
                 "linkerconfig"
             }
+            ARTD => "artd",
             _ => "shell",
         }
     }
@@ -908,6 +910,10 @@ fn check_boot_services(services: &mut [Service]) -> io::Result<()> {
     for service in services {
         service.drain_output()?;
         if service.exited()? {
+            let log = fs::read_to_string(&service.log).unwrap_or_default();
+            if !log.is_empty() {
+                eprintln!("Guest boot service {} log:\n{log}", service.pid());
+            }
             return Err(io::Error::other(format!(
                 "Guest boot service {} exited (see {})",
                 service.pid(),
@@ -1592,6 +1598,24 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
             }
             if let Some(jars) = classpaths.standalone_system_server.as_deref() {
                 zygote_env.push(("STANDALONE_SYSTEMSERVER_JARS", jars));
+            }
+            if system_server_graphics && !runtime_sid {
+                let mut artd_env = vec![
+                    ("BOOTCLASSPATH", classpaths.boot.as_str()),
+                    ("SYSTEMSERVERCLASSPATH", classpaths.system_server.as_str()),
+                ];
+                if let Some(classpath) = classpaths.dex2oat.as_deref() {
+                    artd_env.push(("DEX2OATBOOTCLASSPATH", classpath));
+                }
+                boot_services.push(Service::start(
+                    root,
+                    ARTD,
+                    &[],
+                    "artd",
+                    0,
+                    Some(GUEST_PROBE_CONTEXT),
+                    &artd_env,
+                )?);
             }
             zygote_env.push(("SSAL_PHASE7I_PROPERTIES", "1"));
             if controlled_fork && std::env::var_os("SSAL_PHASE7FC_BYPASS_SETCONTEXT").is_some() {

@@ -13,7 +13,7 @@ pub mod native;
 pub mod runtime;
 mod symbols;
 
-const VERSION: u32 = 48;
+const VERSION: u32 = 49;
 
 type Names = BTreeMap<String, String>;
 
@@ -1167,6 +1167,7 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
         "aidl_lazy_test_server",
         "apexd",
         "installd",
+        "artd",
         concurrent::SYSTEM_SUSPEND_DOMAIN,
         "zygote",
         "system_server_startup",
