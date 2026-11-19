@@ -281,7 +281,7 @@ pub(super) fn verify(mounts: &mut Mounts, root: &Path, host_namespace: &Path) ->
         println!("GUEST_HWBINDER_PROBE_READ={}", readable.trim());
     }
     if surfaceflinger_retest {
-        crate::guest::concurrent::graphics::install_virtual_composer_vintf(mounts, root, &plan)?;
+        crate::guest::concurrent::graphics::install_vintf(mounts, root, &plan, true, false)?;
     }
     native_probe("empty")?;
     shell_probe("empty")?;

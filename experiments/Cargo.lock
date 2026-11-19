@@ -674,6 +674,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ssal-health"
+version = "0.1.0"
+dependencies = [
+ "rsbinder",
+ "rsbinder-aidl",
+ "serde",
+ "serde_json",
+ "ssal-binder-service",
+]
+
+[[package]]
 name = "ssal-system-suspend"
 version = "0.1.0"
 dependencies = [

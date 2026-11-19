@@ -36,6 +36,7 @@ const entries: { name: string; path: string; mode: number }[] = [
     "ssal-hwbinder-probe.sh",
     "ssal-apexservice",
     "ssal-system-suspend",
+    "ssal-health",
     "ssal-virtual-composer",
     "ssal-context-map.so",
     "phase3-ipc",

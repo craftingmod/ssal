@@ -880,9 +880,11 @@ pub fn bind_file(mounts: &mut Mounts, root: &Path, source: &Path, target: &Path)
     };
     if !source.is_file() {
         // shortcut: copy individual patches; add private tree copies for directory patches.
-        return Err(invalid(
-            "mapped Guest policy requires file patches, not directory bind sources",
-        ));
+        return Err(invalid(format!(
+            "mapped Guest policy requires file patches, not directory bind sources: {} -> {}",
+            source.display(),
+            target.display()
+        )));
     }
     let existing = crate::unix::image_context(&File::open(target)?).ok();
     let mapped = existing

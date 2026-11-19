@@ -1,0 +1,14 @@
+# Y702 Guest Health HAL · 2026-11-20
+
+LineageOS 이미지 `7b9ba62e8b48b6e40432be949ae0858a8971175c79502550e74691222d3889ff`의 `services.jar`에서 `HealthServiceWrapperAidl`이 `ServiceManager.waitForDeclaredService("android.hardware.health.IHealth/default")`를 호출하는 것을 확인했다. 이미지의 Health VINTF 항목은 호환성 매트릭스에 있었고, Guest가 읽는 manifest에는 해당 인스턴스 선언이 없었다. 기존 그래픽 worker는 기본 디스플레이와 PackageManager를 통과한 뒤 `StartBatteryService`에서 `NoSuchElementException`으로 종료됐다. [GSI 조사 자료](../out/guest-health-gsi) · [기존 worker 로그](../out/dms-system-server-20261120/a8-evidence.txt)
+
+GSI의 `IHealth`에 `getHingeInfo` 트랜잭션 16이 있고 `BatteryHealthData`의 parcel 필드가 AOSP frozen V4와 일치한다. Rust 바인딩을 해당 AIDL 스냅샷과 해시 `c8d014c7bb950af538396f3e5a409c69b7b9335c`에서 생성한다. C++ 예제의 초기 콜백, 갱신 통지, Binder 사망 시 등록 해제를 Rust로 구현했다. Guest 프로세스는 읽기 전용 배터리 조회와 콜백을 제공한다. [AOSP Health V4](https://android.googlesource.com/platform/hardware/interfaces/+/refs/heads/android17-release/health/aidl/aidl_api/android.hardware.health/4/) · [AOSP Health 참고 구현](https://android.googlesource.com/platform/hardware/interfaces/+/refs/heads/android17-release/health/aidl/default/Health.cpp)
+
+worker는 Guest VINTF framework fragment를 마운트하고, private Binder의 선언 조회와 등록이 끝난 뒤 Zygote를 시작한다. Health는 별도 Enforcing Guest 도메인으로 실행된다. 기본 소스는 Host BatteryService와 고정된 배터리 sysfs 항목을 5초마다 읽는 공급자다. 공급자는 상속된 단방향 파이프로 스냅샷을 전송하며 Guest에서 Host로 요청을 받는 인터페이스가 없다. `SSAL_GUEST_HEALTH_SOURCE=diagnostic`은 배터리 75%, 기술명 `SSAL diagnostic (synthetic)`을 반환한다. 입력 공급자가 제공하지 않는 선택적 배터리 속성과 충전 정책 설정은 AIDL `EX_UNSUPPORTED_OPERATION`으로 응답한다.
+
+## Y702 실기기 결과
+
+- 진단 실행의 Guest Health PID 26665가 private Binder에 등록됐고, Guest SystemServer PID 26784에 초기 건강 상태 콜백을 전달했다. `WaitForDisplay`는 31ms, `StartPackageManagerService`는 2866ms, `StartBatteryService`는 10ms에 반환했다. [진단 실행 로그](../out/guest-health-20261120/diag5-evidence.txt)
+- Guest 로그 `11-19 19:05:56.957`에 PackageManager가 `/data/data/com.android.providers.settings`의 `restorecon` 실패를 기록했다. `19:06:00.811`에 `SettingsProvider`가 `/data/user_de/0/com.android.providers.settings/databases` 부재로 `SQLITE_CANTOPEN`을 내며 SystemServer가 종료됐다. `GUEST_SYSTEM_READY`는 `phase_returned=false`였다. [진단 실행 로그](../out/guest-health-20261120/diag5-evidence.txt)
+- 진단 종료 후 Host Health HIDL PID 1327과 Host SystemServer PID 2280이 유지됐고 SELinux는 Enforcing이었다. worker는 Guest cgroup, mount, loop 정리를 확인했고 검증용 임시 userdata를 제거했다. [종료 결과](../out/guest-health-20261120/diag5-run.txt)
+- Host 읽기 전용 실행은 배터리 98%, 상태 `FULL`을 전달했고 초기 콜백을 확인했다. Guest SystemServer PID 31021에서 기본 디스플레이, PackageManager, BatteryService(20ms), UsageStats(6ms)가 시작됐다. Guest 로그 `11-19 19:08:04.133`에 같은 `SettingsProvider` 오류가 발생해 `SystemReady`에 도달하지 못했다. Host Health HIDL PID 1327과 SELinux Enforcing을 재확인했고, 양쪽 검증용 userdata와 Guest 프로세스, cgroup, mount, loop 정리를 확인했다. [Host 소스 실행 로그](../out/guest-health-20261120/host1-evidence.txt) · [종료 결과](../out/guest-health-20261120/host1-run.txt)

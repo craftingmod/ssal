@@ -13,7 +13,7 @@ pub mod native;
 pub mod runtime;
 mod symbols;
 
-const VERSION: u32 = 39;
+const VERSION: u32 = 46;
 
 type Names = BTreeMap<String, String>;
 
@@ -171,16 +171,18 @@ impl Plan {
                 &[domain, "kernel", "security", "compute_av"],
             );
         }
-        if let Some(domain) = self.types.get("zygote") {
-            let rule = format!("allow {domain} kernel security {{ check_context }}");
-            self.rules.insert(rule.clone());
-            native::record(
-                &mut self.native_rules,
-                rule,
-                1,
-                1,
-                &[domain, "kernel", "security", "check_context"],
-            );
+        for original in ["zygote", "installd"] {
+            if let Some(domain) = self.types.get(original) {
+                let rule = format!("allow {domain} kernel security {{ check_context }}");
+                self.rules.insert(rule.clone());
+                native::record(
+                    &mut self.native_rules,
+                    rule,
+                    1,
+                    1,
+                    &[domain, "kernel", "security", "check_context"],
+                );
+            }
         }
         Ok(())
     }
@@ -1439,6 +1441,7 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
             plan.rules.insert(rule);
         }
     }
+    concurrent::add_health_rules(&mut plan, &mut native_rules)?;
     plan.native_rules = native_rules;
     // Partial offline fixtures remain supported; mounted preparation requires these types.
     if ["init", "socket_device", "property_socket"]
@@ -1555,7 +1558,7 @@ mod tests {
             "p0001",
             &BTreeMap::from([(
                 "policy.cil".into(),
-                "(type init) (type servicemanager)".into(),
+                "(type init) (type servicemanager) (type zygote) (type installd)".into(),
             )]),
         )?;
         let generated = serde_json::to_vec(&plan)?;
@@ -1572,7 +1575,9 @@ mod tests {
             added,
             vec![
                 "allow ssal_p0001_init kernel security { compute_av }",
+                "allow ssal_p0001_installd kernel security { check_context }",
                 "allow ssal_p0001_servicemanager kernel security { compute_av }",
+                "allow ssal_p0001_zygote kernel security { check_context }",
             ]
         );
         assert_eq!(
@@ -1580,7 +1585,7 @@ mod tests {
                 .iter()
                 .map(|b| b.commands)
                 .sum::<usize>(),
-            2
+            4
         );
         Ok(())
     }
@@ -1637,6 +1642,31 @@ mod tests {
             ("system/etc/selinux/plat_seapp_contexts".into(), "user=system domain=system_server type=system_file levelFrom=user\n".into()),
         ])
     }
+    #[test]
+    fn health_domain_is_private_and_does_not_inherit_host_power_access() -> io::Result<()> {
+        let mut inputs = fixture();
+        inputs
+            .get_mut("system/etc/selinux/plat_sepolicy.cil")
+            .unwrap()
+            .push_str(" (type servicemanager) (type hal_health_service)");
+        let plan = generate("p0001", &inputs)?;
+        let health = &plan.types["ssal_health"];
+        assert!(plan.rules.contains(&format!(
+            "allow {health} ssal_p0001_hal_health_service service_manager {{ add find }}"
+        )));
+        assert!(plan.rules.contains(&format!(
+            "allow {health} ssal_p0001_system_server binder {{ call transfer }}"
+        )));
+        assert!(!plan.rules.iter().any(|rule| {
+            rule.starts_with(&format!("typeattribute {health} "))
+                || rule.starts_with(&format!("allow {health} "))
+                    && rule.split_whitespace().nth(2).is_some_and(|target| {
+                        target == "binder_device" || target.contains("sysfs")
+                    })
+        }));
+        Ok(())
+    }
+
     #[test]
     fn hwbinder_labels_and_rules_target_guest_types() -> io::Result<()> {
         let mut inputs = fixture();

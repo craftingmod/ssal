@@ -2,7 +2,7 @@
 use crate::diagnostics::launcher::{
     fork_probe, system_server_preflight, system_server_runtime_sid,
 };
-use crate::guest::concurrent::{graphics, system_suspend};
+use crate::guest::concurrent::{graphics, health, system_suspend};
 use crate::guest::hwbinder;
 use crate::guest::environment::start_property_service;
 use crate::guest::init::{wait_for_system_server, Service};
@@ -43,6 +43,7 @@ pub(in crate::guest) fn uses_own_diagnostics(executable: &str) -> bool {
     [
         crate::guest::init::binder_service::APEX.executable,
         system_suspend::SERVICE.executable,
+        health::SERVICE.executable,
         hwbinder::COMPOSER,
         "/vendor/bin/hw/vendor.qti.hardware.display.allocator-service",
     ]
@@ -70,6 +71,7 @@ fn mapped_exec_domain(executable: &str, exec_context: Option<&[u8]>) -> &'static
             hwbinder::GRAPHICS_ALLOCATOR => "hal_graphics_allocator_default",
             "/run/ssal/ssal-apexservice" => crate::guest::init::binder_service::APEX.domain,
             "/run/ssal/ssal-system-suspend" => system_suspend::SERVICE.domain,
+            "/run/ssal/ssal-health" => health::SERVICE.domain,
             "/apex/com.android.sdkext/bin/derive_classpath" => "derive_classpath",
             "/apex/com.android.runtime/bin/linkerconfig" | "/system/bin/linkerconfig" => {
                 "linkerconfig"
@@ -1050,6 +1052,10 @@ pub(crate) fn verify(
     if start_system_server || apex_check_only {
         crate::guest::init::binder_service::APEX.install(mounts, root, &bin)?;
     }
+    if start_system_server {
+        health::SERVICE.install(mounts, root, &bin)
+            .map_err(|error| io::Error::other(format!("install Guest Health HAL: {error}")))?;
+    }
     if suspend_enabled {
         system_suspend::SERVICE.install(mounts, root, &bin)?;
     }
@@ -1092,8 +1098,10 @@ pub(crate) fn verify(
     File::create(&aidl_server)?;
     let plan = ssal::guest_policy::runtime::load(root)?
         .ok_or_else(|| io::Error::other("Guest SELinux plan missing for AIDL server"))?;
+    if start_system_server || system_server_graphics {
+        graphics::install_vintf(mounts, root, &plan, system_server_graphics, start_system_server)?;
+    }
     if system_server_graphics {
-        graphics::install_virtual_composer_vintf(mounts, root, &plan)?;
         let target = root.join(hwbinder::COMPOSER.trim_start_matches('/'));
         File::create(&target)?;
         ssal::guest_policy::runtime::set_label(&target, &plan.context("system_file", false)?)?;
@@ -1400,6 +1408,9 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
             .then(|| system_suspend::start(root, &bin, guest_binder))
             .transpose()?;
         let mut boot_services = Vec::new();
+        if start_system_server {
+            health::start(root, &bin, guest_binder, &mut boot_services)?;
+        }
         if system_server_graphics {
             let (major, minor) = hw_driver.provision_hwbinder(root)?;
             let hwbinder_rdev = libc::makedev(major, minor);
@@ -2142,6 +2153,7 @@ mod tests {
             ("/system/bin/surfaceflinger", "surfaceflinger"),
             ("/run/ssal/ssal-apexservice", "apexd"),
             ("/run/ssal/ssal-system-suspend", "system_suspend"),
+            ("/run/ssal/ssal-health", "ssal_health"),
             ("/system/bin/sh", "shell"),
         ] {
             assert_eq!(

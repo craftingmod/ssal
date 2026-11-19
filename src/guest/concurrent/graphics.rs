@@ -168,10 +168,12 @@ const VIRTUAL_COMPOSER_VINTF: &str = r#"<manifest version="1.0" type="framework"
 </manifest>
 "#;
 
-pub(in crate::guest) fn install_virtual_composer_vintf(
+pub(in crate::guest) fn install_vintf(
     mounts: &mut Mounts,
     root: &Path,
     plan: &ssal::guest_policy::Plan,
+    composer: bool,
+    health: bool,
 ) -> io::Result<()> {
     let manifest_dir = crate::guest::mount::guest_path(root, "system/system_ext/etc/vintf/manifest")
         .or_else(|_| crate::guest::mount::guest_path(root, "system/etc/vintf/manifest"))?;
@@ -192,15 +194,25 @@ pub(in crate::guest) fn install_virtual_composer_vintf(
             ssal::guest_policy::runtime::set_label(&dest, &file_context)?;
         }
     }
-    let fragment = staging.join("ssal_virtual_composer.xml");
-    fs::write(&fragment, VIRTUAL_COMPOSER_VINTF)?;
-    fs::set_permissions(&fragment, fs::Permissions::from_mode(0o644))?;
-    ssal::guest_policy::runtime::set_label(&fragment, &file_context)?;
+    for (enabled, name, xml) in [
+        (composer, "ssal_virtual_composer.xml", VIRTUAL_COMPOSER_VINTF),
+        (health, "ssal_health.xml", super::health::VINTF),
+    ] {
+        if enabled {
+            let fragment = staging.join(name);
+            fs::write(&fragment, xml)?;
+            fs::set_permissions(&fragment, fs::Permissions::from_mode(0o644))?;
+            ssal::guest_policy::runtime::set_label(&fragment, &file_context)?;
+            println!("Guest VINTF fragment={name} dir={}", manifest_dir.display());
+        }
+    }
     mounts.bind(&staging, &manifest_dir, true, true)?;
-    println!(
-        "GUEST_VIRTUAL_COMPOSER_VINTF=PASS dir={} fragment=ssal_virtual_composer.xml",
-        manifest_dir.display()
-    );
+    if composer {
+        println!(
+            "GUEST_VIRTUAL_COMPOSER_VINTF=PASS dir={} fragment=ssal_virtual_composer.xml",
+            manifest_dir.display()
+        );
+    }
     Ok(())
 }
 
