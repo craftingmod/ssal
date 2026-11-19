@@ -1,0 +1,14 @@
+# Opt-in P0.2 test policy for the y702 mapped p0001 Guest. No boot-time load.
+type ssal_p0001_p02_frame_bridge domain
+type ssal_p0001_p02_bridge_exec file_type
+type ssal_p0001_p02_bridge_state file_type
+type ssal_p0001_p02_frame_socket file_type
+allow ssal_p0001_p02_frame_bridge ssal_p0001_p02_bridge_exec file { entrypoint execute read open getattr map }
+allow ssal_p0001_p02_frame_bridge ssal_p0001_p02_bridge_state dir search
+allow ssal_p0001_p02_frame_bridge ssal_p0001_p02_bridge_state file { open write append }
+allow ssal_p0001_p02_frame_bridge ssal_p0001_shell_data_file dir { search write add_name }
+allow ssal_p0001_p02_frame_bridge ssal_p0001_p02_frame_socket sock_file create
+allow ssal_p0001_p02_frame_bridge ssal_p0001_p02_frame_bridge unix_stream_socket { create bind listen accept read getopt }
+type_transition ssal_p0001_p02_frame_bridge ssal_p0001_shell_data_file sock_file ssal_p0001_p02_frame_socket frame
+allow ssal_p0001_shell ssal_p0001_p02_frame_socket sock_file write
+allow ssal_p0001_shell ssal_p0001_p02_frame_bridge unix_stream_socket connectto

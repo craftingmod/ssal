@@ -116,7 +116,9 @@ pub fn verify(
     );
     let installd_probe =
         mode == "--guest-zygote-7a-worker" && crate::guest::launcher::installd_probe_requested();
-    let policy = if installd_probe {
+    let shell_applied_policy_only = mode == "--shell-worker"
+        && std::env::var("SSAL_SHELL_APPLIED_POLICY_ONLY").as_deref() == Ok("1");
+    let policy = if installd_probe || shell_applied_policy_only {
         Some(ssal::guest_policy::runtime::load_applied_for_probe(system, profile_dir)?)
     } else if mode == "--prepare-worker"
         || mode == "--shell-worker"
