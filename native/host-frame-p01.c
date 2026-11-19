@@ -34,14 +34,28 @@ static int validate_frame(const unsigned char *frame, ssize_t size) {
     return matches != 16;
 }
 
-static int receive_frame(int fd) {
+static int publish_presenter_frame(const unsigned char *frame, ssize_t size) {
+    if (validate_frame(frame, size))
+        return 1;
+    static const char hex[] = "0123456789abcdef";
+    char record[2 * (SSAL_P01_HEADER + SSAL_P01_PIXELS) + 1];
+    for (ssize_t i = 0; i < size; ++i) {
+        record[2 * i] = hex[frame[i] >> 4];
+        record[2 * i + 1] = hex[frame[i] & 15];
+    }
+    record[2 * size] = '\0';
+    // Reuse the bridge's existing write-only private state file.
+    return printf("SSAL_PRESENTER_FRAME=%s\n", record) < 0;
+}
+
+static int receive_frame(int fd, bool bridge) {
     unsigned char frame[SSAL_P01_HEADER + SSAL_P01_PIXELS];
     ssize_t size = recv(fd, frame, sizeof frame, MSG_TRUNC);
     if (size < 0) {
         perror("Host recv");
         return 1;
     }
-    return validate_frame(frame, size);
+    return bridge ? publish_presenter_frame(frame, size) : validate_frame(frame, size);
 }
 
 static int listen_for_guest(const char *path, const char *expected_sid, bool bridge) {
@@ -72,9 +86,11 @@ static int listen_for_guest(const char *path, const char *expected_sid, bool bri
     int peer = accept(listener, NULL, NULL);
     if (peer < 0)
         perror("Host accept");
-    int failed = peer < 0 || ssal_frame_peer(peer, 2000, 2000, expected_sid) || receive_frame(peer);
+    int failed = peer < 0 || ssal_frame_peer(peer, 2000, 2000, expected_sid) ||
+                 receive_frame(peer, bridge);
     if (peer >= 0)
         close(peer);
+    close(listener);
     if (!bridge)
         unlink(path);
     return failed;
@@ -84,7 +100,7 @@ int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc == 4 && !strcmp(argv[1], "--listen"))
         return listen_for_guest(argv[2], argv[3], false);
-    if (argc == 3 && !strcmp(argv[1], "--bridge")) {
+    if (argc == 3 && (!strcmp(argv[1], "--bridge") || !strcmp(argv[1], "--bridge-test"))) {
         if (getuid() != 2000 || geteuid() != 2000 || getgid() != 2000 || getegid() != 2000)
             return 2;
         int log = open("state/receiver.txt", O_WRONLY | O_APPEND | O_CLOEXEC | O_NOFOLLOW);
@@ -92,6 +108,16 @@ int main(int argc, char **argv) {
             return 1;
         if (log > STDERR_FILENO)
             close(log);
+        if (!strcmp(argv[1], "--bridge-test")) {
+            unsigned char frame[SSAL_P01_HEADER + SSAL_P01_PIXELS] = {
+                'S', 'S', 'A', 'L', SSAL_P01_WIDTH, SSAL_P01_HEIGHT, SSAL_P01_STRIDE, SSAL_P01_RGBA8,
+            };
+            for (size_t i = SSAL_P01_HEADER; i < sizeof frame; i += 4)
+                frame[i] = frame[i + 3] = 255;
+            printf("Host presenter test fixture pid=%ld uid=%u gid=%u\n",
+                   (long)getpid(), getuid(), getgid());
+            return publish_presenter_frame(frame, sizeof frame);
+        }
         return listen_for_guest("frame", argv[2], true);
     }
     if (argc != 3) {
@@ -119,7 +145,7 @@ int main(int argc, char **argv) {
         _exit(127);
     }
     close(pair[1]);
-    int invalid = receive_frame(pair[0]);
+    int invalid = receive_frame(pair[0], false);
     close(pair[0]);
 
     int status;

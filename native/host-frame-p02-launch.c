@@ -9,8 +9,9 @@
 #include <unistd.h>
 
 int main(int argc, char **argv) {
-    if (argc != 3 || argv[1][0] != '/' || geteuid() != 0) {
-        fprintf(stderr, "usage: %s ABSOLUTE_BRIDGE_ROOT GUEST_SID\n", argv[0]);
+    if ((argc != 3 && (argc != 4 || strcmp(argv[3], "--presenter-test"))) ||
+        argv[1][0] != '/' || geteuid() != 0) {
+        fprintf(stderr, "usage: %s ABSOLUTE_BRIDGE_ROOT GUEST_SID [--presenter-test]\n", argv[0]);
         return 2;
     }
     int attr = open("/proc/self/attr/exec", O_WRONLY | O_CLOEXEC);
@@ -37,7 +38,8 @@ int main(int argc, char **argv) {
         perror("set bridge credentials and close inherited descriptors");
         return 1;
     }
-    execl("/state/receiver", "host-frame-p02", "--bridge", argv[2], (char *)NULL);
+    execl("/state/receiver", "host-frame-p02", argc == 4 ? "--bridge-test" : "--bridge",
+          argv[2], (char *)NULL);
     perror("exec frame bridge");
     return 1;
 }
