@@ -1,4 +1,5 @@
 //! Disposable Guest service launcher; shared PID namespace is intentional.
+mod net;
 use crate::diagnostics::launcher::{
     fork_probe, system_server_preflight, system_server_runtime_sid,
 };
@@ -44,6 +45,7 @@ pub(in crate::guest) fn uses_own_diagnostics(executable: &str) -> bool {
     [
         crate::guest::init::binder_service::APEX.executable,
         crate::guest::init::binder_service::VOLD.executable,
+        crate::guest::init::binder_service::NETD.executable,
         system_suspend::SERVICE.executable,
         health::SERVICE.executable,
         hwbinder::COMPOSER,
@@ -73,6 +75,7 @@ fn mapped_exec_domain(executable: &str, exec_context: Option<&[u8]>) -> &'static
             hwbinder::GRAPHICS_ALLOCATOR => "hal_graphics_allocator_default",
             "/run/ssal/ssal-apexservice" => crate::guest::init::binder_service::APEX.domain,
             "/run/ssal/ssal-vold" => crate::guest::init::binder_service::VOLD.domain,
+            "/run/ssal/ssal-netd" => crate::guest::init::binder_service::NETD.domain,
             "/run/ssal/ssal-system-suspend" => system_suspend::SERVICE.domain,
             "/run/ssal/ssal-health" => health::SERVICE.domain,
             "/apex/com.android.sdkext/bin/derive_classpath" => "derive_classpath",
@@ -1055,6 +1058,13 @@ pub(crate) fn verify(
             guest_net_namespace.display()
         );
     }
+    let _guest_veth_peer_ns = if phase7a {
+        let peer_ns = net::setup_guest_veth()?;
+        println!("Guest virtual ethernet ready: eth0 (veth, UP|RUNNING)");
+        Some(peer_ns)
+    } else {
+        None
+    };
     let runtime = crate::guest::mount::directory(root, "run/ssal", 0o755)?;
     let bin = std::env::current_exe()?.parent().unwrap().to_owned();
     if start_system_server || apex_check_only {
@@ -1065,6 +1075,9 @@ pub(crate) fn verify(
             .map_err(|error| io::Error::other(format!("install Guest Health HAL: {error}")))?;
         if bin.join("ssal-vold").is_file() {
             crate::guest::init::binder_service::VOLD.install(mounts, root, &bin)?;
+        }
+        if bin.join("ssal-netd").is_file() {
+            crate::guest::init::binder_service::NETD.install(mounts, root, &bin)?;
         }
     }
     if suspend_enabled {
@@ -1486,6 +1499,15 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
             if bin.join("ssal-vold").is_file() {
                 boot_services.push(
                     crate::guest::init::binder_service::VOLD.start_with_hwbinder(
+                        root,
+                        guest_binder,
+                        Some(hwbinder_rdev),
+                    )?,
+                );
+            }
+            if bin.join("ssal-netd").is_file() {
+                boot_services.push(
+                    crate::guest::init::binder_service::NETD.start_with_hwbinder(
                         root,
                         guest_binder,
                         Some(hwbinder_rdev),

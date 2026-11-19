@@ -685,6 +685,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ssal-netd"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "rsbinder",
+ "ssal-binder-service",
+]
+
+[[package]]
 name = "ssal-system-suspend"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,10 @@
+[package]
+name = "ssal-netd"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+ssal-binder-service = { path = "../binder-service" }
+libc = "=0.2.191"
+rsbinder = { version = "=0.13.0", default-features = false, features = ["android_14_plus"] }

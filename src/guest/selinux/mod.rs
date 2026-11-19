@@ -13,7 +13,7 @@ pub mod native;
 pub mod runtime;
 mod symbols;
 
-const VERSION: u32 = 50;
+const VERSION: u32 = 51;
 
 type Names = BTreeMap<String, String>;
 
@@ -1169,6 +1169,7 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
         "installd",
         "artd",
         "vold",
+        "netd",
         concurrent::SYSTEM_SUSPEND_DOMAIN,
         "zygote",
         "system_server_startup",
@@ -1344,16 +1345,18 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
         );
         plan.rules.insert(rule);
     }
-    if let Some(vold_exec) = plan.types.get("vold_exec") {
-        let rule = format!("allow {vold_exec} tmpfs filesystem {{ associate }}");
-        if plan.rules.insert(rule.clone()) {
-            native::record(
-                &mut native_rules,
-                rule,
-                1,
-                1,
-                &[vold_exec, "tmpfs", "filesystem", "associate"],
-            );
+    for exec_name in ["vold_exec", "netd_exec"] {
+        if let Some(exec_type) = plan.types.get(exec_name) {
+            let rule = format!("allow {exec_type} tmpfs filesystem {{ associate }}");
+            if plan.rules.insert(rule.clone()) {
+                native::record(
+                    &mut native_rules,
+                    rule,
+                    1,
+                    1,
+                    &[exec_type, "tmpfs", "filesystem", "associate"],
+                );
+            }
         }
     }
     // binderfs context= mounts require the Guest binder label to associate with its filesystem.

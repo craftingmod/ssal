@@ -24,6 +24,13 @@ pub(crate) const VOLD: BinderService = BinderService {
     exec_type: "vold_exec",
 };
 
+pub(crate) const NETD: BinderService = BinderService {
+    name: "netd",
+    executable: "/run/ssal/ssal-netd",
+    domain: "netd",
+    exec_type: "netd_exec",
+};
+
 impl BinderService {
     pub fn install(&self, mounts: &mut Mounts, root: &Path, bin: &Path) -> io::Result<()> {
         let plan = ssal::guest_policy::runtime::load(root)?.ok_or_else(|| {
