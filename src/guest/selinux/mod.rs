@@ -13,7 +13,7 @@ pub mod native;
 pub mod runtime;
 mod symbols;
 
-const VERSION: u32 = 51;
+const VERSION: u32 = 56;
 
 type Names = BTreeMap<String, String>;
 
@@ -1170,6 +1170,7 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
         "artd",
         "vold",
         "netd",
+        "audioserver",
         concurrent::SYSTEM_SUSPEND_DOMAIN,
         "zygote",
         "system_server_startup",
@@ -1345,7 +1346,7 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
         );
         plan.rules.insert(rule);
     }
-    for exec_name in ["vold_exec", "netd_exec"] {
+    for exec_name in ["vold_exec", "netd_exec", "audioserver_exec"] {
         if let Some(exec_type) = plan.types.get(exec_name) {
             let rule = format!("allow {exec_type} tmpfs filesystem {{ associate }}");
             if plan.rules.insert(rule.clone()) {
@@ -1356,6 +1357,31 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
                     1,
                     &[exec_type, "tmpfs", "filesystem", "associate"],
                 );
+            }
+        }
+    }
+    if let Some(audioserver) = plan.types.get("audioserver") {
+        for hw_name in ["hal_audio_hwservice", "hidl_base_hwservice"] {
+            if let Some(hw_type) = plan.types.get(hw_name) {
+                let rule = format!("allow {audioserver} {hw_type} hwservice_manager {{ add }}");
+                if plan.rules.insert(rule.clone()) {
+                    native::record(
+                        &mut native_rules,
+                        rule,
+                        1,
+                        1,
+                        &[audioserver, hw_type, "hwservice_manager", "add"],
+                    );
+                }
+            }
+        }
+        for (target, class, perm) in [
+            ("ksu", "unix_stream_socket", "connectto"),
+            ("tmpfs", "sock_file", "write"),
+        ] {
+            let rule = format!("allow {audioserver} {target} {class} {{ {perm} }}");
+            if plan.rules.insert(rule.clone()) {
+                native::record(&mut native_rules, rule, 1, 1, &[audioserver, target, class, perm]);
             }
         }
     }

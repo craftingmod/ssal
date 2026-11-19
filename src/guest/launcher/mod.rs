@@ -46,6 +46,7 @@ pub(in crate::guest) fn uses_own_diagnostics(executable: &str) -> bool {
         crate::guest::init::binder_service::APEX.executable,
         crate::guest::init::binder_service::VOLD.executable,
         crate::guest::init::binder_service::NETD.executable,
+        "/run/ssal/ssal-virtual-audio",
         system_suspend::SERVICE.executable,
         health::SERVICE.executable,
         hwbinder::COMPOSER,
@@ -76,6 +77,8 @@ fn mapped_exec_domain(executable: &str, exec_context: Option<&[u8]>) -> &'static
             "/run/ssal/ssal-apexservice" => crate::guest::init::binder_service::APEX.domain,
             "/run/ssal/ssal-vold" => crate::guest::init::binder_service::VOLD.domain,
             "/run/ssal/ssal-netd" => crate::guest::init::binder_service::NETD.domain,
+            "/run/ssal/ssal-virtual-audio" => "audioserver",
+            "/system/bin/audioserver" => "audioserver",
             "/run/ssal/ssal-system-suspend" => system_suspend::SERVICE.domain,
             "/run/ssal/ssal-health" => health::SERVICE.domain,
             "/apex/com.android.sdkext/bin/derive_classpath" => "derive_classpath",
@@ -1079,6 +1082,14 @@ pub(crate) fn verify(
         if bin.join("ssal-netd").is_file() {
             crate::guest::init::binder_service::NETD.install(mounts, root, &bin)?;
         }
+        if bin.join("ssal-virtual-audio").is_file() {
+            let plan = ssal::guest_policy::runtime::load(root)?
+                .ok_or_else(|| io::Error::other("Virtual Audio HAL requires Guest SELinux policy"))?;
+            let target = root.join("run/ssal/ssal-virtual-audio");
+            File::create(&target)?;
+            ssal::guest_policy::runtime::set_label(&target, &plan.context("audioserver_exec", false)?)?;
+            ssal::guest_policy::runtime::bind_file(mounts, root, &bin.join("ssal-virtual-audio"), &target)?;
+        }
     }
     if suspend_enabled {
         system_suspend::SERVICE.install(mounts, root, &bin)?;
@@ -1513,6 +1524,60 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
                         Some(hwbinder_rdev),
                     )?,
                 );
+            }
+            struct ChildGuard(Option<std::process::Child>);
+            impl Drop for ChildGuard {
+                fn drop(&mut self) {
+                    if let Some(mut child) = self.0.take() {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    }
+                }
+            }
+            let mut _host_audio_bridge = ChildGuard(None);
+            if bin.join("ssal-virtual-audio").is_file() {
+                let audio_host_bin = bin.join("ssal-audio-host");
+                if audio_host_bin.is_file() {
+                    let sock_path = root.join("run/ssal/audio.sock");
+                    let mut child = Command::new(&audio_host_bin)
+                        .arg("serve")
+                        .arg(&sock_path)
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::inherit())
+                        .spawn()?;
+                    if let Some(stdout) = child.stdout.take() {
+                        use std::io::{BufRead, BufReader};
+                        let mut line = String::new();
+                        let _ = BufReader::new(stdout).read_line(&mut line);
+                        if line.starts_with("host_audio_bridge_ready=") {
+                            println!("Host audio bridge ready: {}", sock_path.display());
+                        }
+                    }
+                    _host_audio_bridge.0 = Some(child);
+                }
+                let hw_rdev_str = hwbinder_rdev.to_string();
+                let mut vaudio = Service::start(
+                    root,
+                    "/run/ssal/ssal-virtual-audio",
+                    &["serve", &hw_rdev_str],
+                    "virtual-audio",
+                    1041,
+                    None,
+                    &[],
+                )?;
+                vaudio.wait_text(
+                    "guest_hwbinder_registered=android.hardware.audio@7.0::IDevicesFactory/default",
+                )?;
+                boot_services.push(vaudio);
+                boot_services.push(Service::start(
+                    root,
+                    "/system/bin/audioserver",
+                    &[],
+                    "audioserver",
+                    1041,
+                    Some(GUEST_PROBE_CONTEXT),
+                    &[],
+                )?);
             }
         }
         if installd_probe {
