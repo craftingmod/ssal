@@ -4,7 +4,7 @@ mod devices;
 mod filesystem;
 pub(crate) mod loop_device;
 pub(crate) mod namespace;
-mod profile;
+pub(in crate::guest) mod profile;
 mod readonly;
 
 pub(crate) fn seal_system(root: &Path) -> io::Result<()> {
@@ -13,8 +13,7 @@ pub(crate) fn seal_system(root: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 use devices::{GUEST_DEVICE_NODES, GUEST_DEV_ENTRIES};
-pub use profile::{description, PROFILE_NAME};
-use profile::{profile, relative as profile_relative};
+use profile::{relative as profile_relative, Profile};
 pub(crate) use ssal::namespace_mounts::guest_path;
 #[cfg(test)]
 use ssal::namespace_mounts::inject_compat_file;
@@ -87,7 +86,7 @@ pub(super) fn same_directory(source: &Path, target: &Path) -> io::Result<()> {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn verify(
+pub(super) fn verify(
     system: &Path,
     userdata: &Path,
     profile_dir: &Path,
@@ -97,8 +96,8 @@ pub fn verify(
     host_mount_namespace: &Path,
     force_regen: bool,
     admission: &mut Option<File>,
+    profile: &Profile,
 ) -> io::Result<()> {
-    let profile = profile()?;
     let root = base.join("rootfs");
     let cache = base.join("apex-cache");
     fs::create_dir(&root)?;
@@ -624,6 +623,7 @@ pub fn verify(
 
 #[cfg(test)]
 mod tests {
+    use crate::guest::concurrent::mount_profile::profile;
     use super::*;
 
     #[test]

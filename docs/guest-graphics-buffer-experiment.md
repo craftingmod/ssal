@@ -2,7 +2,7 @@
 
 Gralloc 없이 ANGLE을 직접 초기화한 후속 실험은 [B0 런타임 보고서](guest-graphics-b0-angle-swiftshader-20261119.md)에 기록했다.
 
-2026-11-19 KST · **BLOCKED — Guest 전용 allocator/mapper와 사용할 소프트웨어 Vulkan 드라이버를 확보하지 못했다.** GSI에는 플랫폼 EGL/GLES와 ANGLE이 있다. 현재 SSAL 프로필은 Guest 준비 중 Host vendor 전체를 읽기 전용으로 bind하므로 이번 실험에 사용할 수 없다. 선행 조건에서 중단했고 A/B 프로그램은 작성하거나 실행하지 않았다. 실제 픽셀·fence·FD 수명은 미측정이다. [Astra 실험 B](surfaceflinger-astra-architecture.md#L74) · [마운트 프로필](../module/profiles/mounts/initial.json#L20) · [bind 호출](../src/guest/mount/mod.rs#L292)
+2026-11-19 KST · **BLOCKED — Guest 전용 allocator/mapper와 사용할 소프트웨어 Vulkan 드라이버를 확보하지 못했다.** GSI에는 플랫폼 EGL/GLES와 ANGLE이 있다. 현재 SSAL 프로필은 Guest 준비 중 Host vendor 전체를 읽기 전용으로 bind하므로 이번 실험에 사용할 수 없다. 선행 조건에서 중단했고 A/B 프로그램은 작성하거나 실행하지 않았다. 실제 픽셀·fence·FD 수명은 미측정이다. [Astra 실험 B](surfaceflinger-astra-architecture.md#L74) · [마운트 프로필](../module/profiles/concurrent/mounts/initial.json#L20) · [bind 호출](../src/guest/mount/mod.rs#L292)
 
 ## 실측 환경과 근거
 

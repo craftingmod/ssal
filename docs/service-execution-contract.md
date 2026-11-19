@@ -1,8 +1,8 @@
-# 게스트 서비스 실행 계약
+# Concurrent Mode 게스트 서비스 실행 계약
 
 결정일: 2026-10-31. 계약 이름: `isolated-userspace-v1`.
 
-이 문서는 SSAL의 목표 서비스 실행 방식을 확정한다. [기계 판독 정의](../module/profiles/services/initial.json)는 빌드 시 포함하고 모듈에 참고용으로 배포한다. [검증 코드](../src/service_contract.rs)는 형식·경로·도메인·의존성을 검사하고 prepare에서 기동 차단 사유를 출력한다. 설치된 JSON을 수정해 서비스를 활성화하는 기능은 없다.
+이 문서는 [Concurrent Mode](modes/concurrent.md)의 초기 서비스 실행 계약을 기록한다. [기계 판독 정의](../module/profiles/concurrent/services/initial.json)는 빌드 시 포함하고 모듈에 참고용으로 배포한다. [검증 코드](../src/guest/concurrent/service_contract.rs)는 형식·경로·도메인·의존성을 검사하고 prepare에서 기동 차단 사유를 출력한다. 설치된 JSON을 수정해 서비스를 활성화하는 기능은 없다.
 
 **현재 운영 서비스 구현은 계약 검증과 진단까지다.** 게스트 property server, 서비스 운영용 private framework Binder/servicemanager, HAL 중계, 서비스 런처와 복구 엔진은 아직 완성하지 않았다. `launch_enabled=false`이며 이를 true로 바꾼 계약도 현재 검증기는 거부한다. shell probe 통과로 서비스를 자동 실행하지 않는다. `switch`·`return`도 계속 거부한다.
 

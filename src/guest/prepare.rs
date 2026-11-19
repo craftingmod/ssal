@@ -1,3 +1,4 @@
+use super::concurrent::mount_profile;
 use sha2::{Digest, Sha256};
 use ssal::unix::{image_context, valid_image_name, IMAGE_CONTEXT};
 use std::fs::{self, File, OpenOptions};
@@ -38,7 +39,7 @@ pub fn check(root: &Path, name: &str) -> io::Result<CheckedProfile> {
     }
     if profile
         .get("mount_profile")
-        .is_some_and(|value| value.as_str() != Some(crate::guest::mount::PROFILE_NAME))
+        .is_some_and(|value| value.as_str() != Some(mount_profile::PROFILE_NAME))
     {
         return Err(io::Error::other("unsupported mount profile"));
     }
@@ -119,7 +120,7 @@ pub fn check(root: &Path, name: &str) -> io::Result<CheckedProfile> {
     } else {
         "unavailable".into()
     };
-    let report = format!("profile: {name}\nimage: {id}\nimage SELinux context: {image_label}\nimage size and SHA-256: OK\nsystem ext4 magic: OK\nuserdata raw ext4 image: {}\nspace: {space}\nmount namespace: {}\nloop control: {}\ndevice: {device}\nvendor VINTF manifest: {}\nAndroid version, VINTF, HAL and service compatibility: not verified\n{}", userdata.display(), if namespace { "available" } else { "missing" }, if loop_control { "available" } else { "missing" }, if Path::new("/vendor/etc/vintf/manifest.xml").exists() { "present" } else { "not found at standard path" }, crate::guest::mount::description()?);
+    let report = format!("profile: {name}\nimage: {id}\nimage SELinux context: {image_label}\nimage size and SHA-256: OK\nsystem ext4 magic: OK\nuserdata raw ext4 image: {}\nspace: {space}\nmount namespace: {}\nloop control: {}\ndevice: {device}\nvendor VINTF manifest: {}\nAndroid version, VINTF, HAL and service compatibility: not verified\n{}", userdata.display(), if namespace { "available" } else { "missing" }, if loop_control { "available" } else { "missing" }, if Path::new("/vendor/etc/vintf/manifest.xml").exists() { "present" } else { "not found at standard path" }, mount_profile::description()?);
     Ok(CheckedProfile {
         system,
         userdata,
@@ -295,6 +296,7 @@ pub(crate) fn worker_admitted(
             &host_mount_namespace,
             force_regen,
             &mut admission,
+            &mount_profile::profile()?,
         )?;
         Ok(())
     })();

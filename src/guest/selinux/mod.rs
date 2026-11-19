@@ -6,6 +6,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
 
+#[path = "../concurrent/selinux.rs"]
+mod concurrent;
 pub mod native;
 #[cfg(unix)]
 pub mod runtime;
@@ -1149,7 +1151,7 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
         "servicemanager",
         "aidl_lazy_test_server",
         "apexd",
-        "system_suspend",
+        concurrent::SYSTEM_SUSPEND_DOMAIN,
         "zygote",
         "system_server_startup",
         "system_server",
@@ -1295,20 +1297,7 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
             native::record(&mut native_rules, rule, 1, 1, &[apexd, apexd, "binder", "call"]);
         }
     }
-    // Only the launcher supplies the connected broker socket to this Guest domain.
-    if let Some(domain) = plan.types.get("system_suspend") {
-        let rule = format!("allow {domain} ksu unix_stream_socket {{ read write shutdown }}");
-        for permission in ["read", "write", "shutdown"] {
-            native::record(
-                &mut native_rules,
-                rule.clone(),
-                1,
-                1,
-                &[domain, "ksu", "unix_stream_socket", permission],
-            );
-        }
-        plan.rules.insert(rule);
-    }
+    concurrent::add_system_suspend_rules(&mut plan, &mut native_rules);
     // Property files are created under the directory type, then receive their final Guest label.
     if let (Some(init), Some(directory)) =
         (plan.types.get("init"), plan.types.get("properties_device"))

@@ -2,6 +2,7 @@
 use crate::diagnostics::launcher::{
     fork_probe, system_server_preflight, system_server_runtime_sid,
 };
+use crate::guest::concurrent::system_suspend;
 use crate::guest::environment::start_property_service;
 use crate::guest::init::{wait_for_system_server, Service};
 use ssal::guest_initrc::{self as initrc, BootService};
@@ -31,6 +32,15 @@ pub(crate) fn installd_probe_requested() -> bool {
     std::env::var_os("SSAL_GUEST_INSTALLD_PROBE").as_deref() == Some(std::ffi::OsStr::new("1"))
 }
 
+pub(in crate::guest) fn uses_own_diagnostics(executable: &str) -> bool {
+    // The Rust Binder services use mapped exec SIDs and write their own diagnostics.
+    [
+        crate::guest::init::binder_service::APEX.executable,
+        system_suspend::SERVICE.executable,
+    ]
+    .contains(&executable)
+}
+
 pub(in crate::guest) use crate::guest::runtime::zygote::{
     system_server_requested, zygote_args, zygote_sockets,
 };
@@ -46,7 +56,7 @@ fn mapped_exec_domain(executable: &str, exec_context: Option<&[u8]>) -> &'static
             "/system/bin/app_process64" => "zygote",
             "/system/bin/servicemanager" => "servicemanager",
             "/run/ssal/ssal-apexservice" => crate::guest::init::binder_service::APEX.domain,
-            "/run/ssal/ssal-system-suspend" => crate::guest::init::binder_service::SUSPEND.domain,
+            "/run/ssal/ssal-system-suspend" => system_suspend::SERVICE.domain,
             "/apex/com.android.sdkext/bin/derive_classpath" => "derive_classpath",
             "/apex/com.android.runtime/bin/linkerconfig" | "/system/bin/linkerconfig" => {
                 "linkerconfig"
@@ -66,7 +76,7 @@ pub(crate) fn command(
 ) -> io::Result<Command> {
     crate::guest::process::supervision::check_interrupted()?;
     // A real Guest mount root also gives Zygote's FD allowlist Guest-relative proc paths.
-    let suspend = executable == crate::guest::init::binder_service::SUSPEND.executable;
+    let suspend = executable == system_suspend::SERVICE.executable;
     let pivot = suspend || (executable == "/system/bin/app_process64"
         && (std::env::var_os("SSAL_PHASE7FB_FORK").is_some()
             || std::env::var_os("SSAL_START_SYSTEM_SERVER").is_some()));
@@ -139,17 +149,8 @@ pub(crate) fn command(
             }
             // The root transition already ran; only this child joins Guest cgroups.
             join_cgroups(&pre_exec_cgroups)?;
-            if suspend && Path::new("/sys/power").try_exists()? {
-                if libc::mount(
-                    c"tmpfs".as_ptr(),
-                    c"/sys/power".as_ptr(),
-                    c"tmpfs".as_ptr(),
-                    libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
-                    std::ptr::null(),
-                ) != 0
-                {
-                    return Err(io::Error::last_os_error());
-                }
+            if suspend {
+                system_suspend::mask_host_power()?;
             }
             if let Some(context) = &exec_context {
                 fs::write("/proc/thread-self/attr/exec", context)?;
@@ -781,7 +782,7 @@ pub(crate) fn verify(
         ssal::guest_policy::runtime::load(root)?.is_some(),
     )?;
     let apex_check_only = std::env::var_os("SSAL_GUEST_APEX_CHECK_ONLY").is_some();
-    let suspend_enabled = std::env::var("SSAL_GUEST_SYSTEM_SUSPEND").as_deref() != Ok("0");
+    let suspend_enabled = system_suspend::enabled();
     let installd_probe = phase7a && installd_probe_requested();
     if installd_probe && (start_system_server || apex_check_only || suspend_enabled) {
         return Err(io::Error::other("Guest installd probe requires an isolated service run"));
@@ -859,7 +860,7 @@ pub(crate) fn verify(
         crate::guest::init::binder_service::APEX.install(mounts, root, &bin)?;
     }
     if suspend_enabled {
-        crate::guest::init::binder_service::SUSPEND.install(mounts, root, &bin)?;
+        system_suspend::SERVICE.install(mounts, root, &bin)?;
     }
     let mut runtime_bins = vec![
         "phase3-ipc",
@@ -1187,7 +1188,7 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
             );
         }
         let mut suspend = suspend_enabled
-            .then(|| crate::guest::init::binder_service::start_suspend(root, &bin, guest_binder))
+            .then(|| system_suspend::start(root, &bin, guest_binder))
             .transpose()?;
         if installd_probe {
             probe_installd(root, userdata, host_mount_namespace, guest_binder)?;
@@ -1844,6 +1845,7 @@ mod tests {
             ("/system/bin/app_process64", "zygote"),
             ("/system/bin/servicemanager", "servicemanager"),
             ("/run/ssal/ssal-apexservice", "apexd"),
+            ("/run/ssal/ssal-system-suspend", "system_suspend"),
             ("/system/bin/sh", "shell"),
         ] {
             assert_eq!(

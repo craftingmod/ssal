@@ -1,4 +1,4 @@
-//! Target execution contract, not a service launcher. Never derives service
+//! Concurrent Mode execution contract. Never derives service
 //! readiness from successful probes in the management SELinux domain.
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -7,7 +7,7 @@ use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path};
 
-const CONTRACT: &str = include_str!("../../../module/profiles/services/initial.json");
+const CONTRACT: &str = include_str!("../../../module/profiles/concurrent/services/initial.json");
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

@@ -47,7 +47,7 @@ flowchart LR
 
 - `src/guest_launcher.rs::derive_guest_classpath()`는 Guest `derive_classpath`를 호출한다. `classpath_exports()`는 `BOOTCLASSPATH`와 `DEX2OATBOOTCLASSPATH`만 반환하고 `SYSTEMSERVERCLASSPATH`는 무시한다. `src/guest_probe.rs::root_command()`는 `env_clear()`를 호출하므로 Host 환경변수에서 우연히 상속되지도 않는다. 현재 Guest Zygote 환경에는 이를 다시 넣는 코드가 없다. AOSP `ZygoteInit`은 `SYSTEMSERVERCLASSPATH`로 system-server class loader를 만든다. 8B 전에 GSI에서 계산한 Guest 값으로만 이 환경을 추가해야 한다. ([classpath 파서](../src/guest_launcher.rs#L615), [classpath 파생](../src/guest_launcher.rs#L644), [Guest env 초기화](../src/guest_probe.rs#L296), [Zygote launch](../src/guest_launcher.rs#L1088))
 - 현재 인자는 `--zygote --socket-name=zygote`이며 로그에도 `start_system_server=false`라고 남긴다. 이 경로가 Guest `init.zygote64.rc`를 실행하거나 Host init에 등록되지는 않는다. ([Guest Zygote 인자](../src/guest_launcher.rs#L1117))
-- Profile은 `launch_enabled=false`이고 `ssald`는 `switch`와 `return`을 거부한다. `prepare`/worker와 별개로, 이번 Phase에서 일반 전환 경로는 열린 상태가 아니다. ([서비스 계약](../src/service_contract.rs#L121), [초기 계약](../module/profiles/services/initial.json), [`ssald` 차단](../src/ssald.rs#L376))
+- Profile은 `launch_enabled=false`이고 `ssald`는 `switch`와 `return`을 거부한다. `prepare`/worker와 별개로, 이번 Phase에서 일반 전환 경로는 열린 상태가 아니다. ([서비스 계약](../src/service_contract.rs#L121), [초기 계약](../module/profiles/concurrent/services/initial.json), [`ssald` 차단](../src/ssald.rs#L376))
 
 ## AOSP 시작 구간과 필수 입력
 

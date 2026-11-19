@@ -57,7 +57,7 @@ Test B는 `/proc/1/root` 및 Host `/proc/<pid>/fd` 경로를 Guest에서 차단�
 
 `src/binder_probe.rs::Session::provision`은 Guest root의 `/dev/binderfs`에 새 binderfs를 mount하고 `binder` node를 준비한다. Node `rdev`, mount ID, alias path와 protocol을 검사하고 Host `/dev/binder`와 같으면 실패한다. Phase 2C/4 보고서에서 Guest `/dev/binder`와 rsbinder process FD는 같은 private device(`rdev=507:5`); Host Binder는 `507:1`; protocol 8이었다. Probe-only `src/binder_wire.rs`도 예상 identity와 열린 FD를 확인하며 실패 시 Host Binder fallback을 하지 않는다.
 
-이것은 private Binder가 설치된 시험 세션의 증거다. `module/profiles/mounts/initial.json`의 기본 `initial-shared-dev` profile만으로는 `/dev/binder`가 private하지 않다. private binderfs 세션의 `/dev/hwbinder`·`/dev/vndbinder` symlink는 `/dev/binderfs` 아래로 다시 해석되지만, 해당 Guest node가 실제 있는지 또는 어떤 identity인지 기록하지 않았다.
+이것은 private Binder가 설치된 시험 세션의 증거다. `module/profiles/concurrent/mounts/initial.json`의 기본 `initial-shared-dev` profile만으로는 `/dev/binder`가 private하지 않다. private binderfs 세션의 `/dev/hwbinder`·`/dev/vndbinder` symlink는 `/dev/binderfs` 아래로 다시 해석되지만, 해당 Guest node가 실제 있는지 또는 어떤 identity인지 기록하지 않았다.
 
 Android 16 Guest SDK 36의 Test B는 private `servicemanager`에서 `aidl_lazy_test_1` 등록/조회 및 nonce transaction을 수행했다. Host에서는 시험 이름이 보이지 않았고 Host의 `package`/`activity` 서비스는 계속 보였다. Phase 3은 Private Binder의 Rust AIDL 동기 호출, callback Binder object 전달, death/restart/reconnect를 Enforcing에서 통과했다. `ParcelFileDescriptor`/Binder FD 전달과 실제 production `IInstalld`/`IArtd` AIDL caller 호환성은 Phase 4에서 미검증이다.
 

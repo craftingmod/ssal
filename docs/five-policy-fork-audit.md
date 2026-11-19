@@ -30,7 +30,7 @@
 ## Guest Zygote SID: 코드, 선언, 런타임 증거
 
 - [`src/guest_launcher.rs`](../src/guest_launcher.rs#L18)는 Guest context 상수로 `u:r:ssal_guest_probe:s0`를 정의한다. Zygote 실행도 같은 context로 시작하고(`#L1278-L1302`), 시작 후 `/proc/<pid>/attr/current`를 읽어 이 SID인지 검사한다(`#L1310-L1318`). 검증을 통과한 경우에만 `Guest Zygote ready ... domain=...`를 기록한다(`#L1349`). 따라서 **현재 launcher의 의도 SID는 `ssal_guest_probe`**다.
-- [`module/profiles/services/initial.json`](../module/profiles/services/initial.json#L55)은 `zygote` 서비스 SID를 `u:r:zygote:s0`로 선언한다. 전역 `selinux.permissive` 선언은 `false`다(`#L20`). 따라서 profile SID와 launcher의 의도 SID는 서로 다르다. Profile metadata를 실제 실행 SID의 증거로 볼 수 없다.
+- [`module/profiles/concurrent/services/initial.json`](../module/profiles/concurrent/services/initial.json#L55)은 `zygote` 서비스 SID를 `u:r:zygote:s0`로 선언한다. 전역 `selinux.permissive` 선언은 `false`다(`#L20`). 따라서 profile SID와 launcher의 의도 SID는 서로 다르다. Profile metadata를 실제 실행 SID의 증거로 볼 수 없다.
 - 2026-11-04 [`worker.log`](zygote-phase7a-run-20261104/worker.log#L234-L247)는 Zygote 시작을 기록한 뒤, abstract socket readiness 전에 PID 15920이 SIGABRT로 종료됐다고 기록한다. `Guest Zygote ready` 또는 해당 PID의 `attr/current`는 기록되지 않았다. 이 실행 로그로 실제 Zygote SID를 확정할 수 없다. 같은 run의 다른 Guest 서비스는 `ssal_guest_probe` SID를 기록하지만 이는 Zygote PID의 SID를 증명하지 않는다. Host `before.txt`/`after.txt`의 `u:r:zygote:s0`와 `u:r:system_server:s0`도 Host 프로세스 관측이다.
 
 요약하면 **launch code expected SID = `ssal_guest_probe`; service profile declared SID = `zygote`; observed Guest Zygote PID SID = 미관측**이다. 또한 11월 4일 Host binary에 `ssal_guest_probe` type이 없고 로컬 `module/sepolicy.rule`의 permissive 선언만으로 당시 동적 policy 적용을 증명할 수 없다.

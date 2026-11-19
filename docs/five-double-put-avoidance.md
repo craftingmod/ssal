@@ -58,7 +58,7 @@ SELinux hook은 clone_flags나 child의 향후 SID를 검사하지 않는다. so
 
 src/guest_launcher/fork_probe.rs:188-212의 --zygote-fork-client는 ssald가 Command::spawn으로 시작하는 별도 client다. 이 client의 fork 검사는 ssald SID에서 먼저 일어나며, 이후 Binder 요청을 처리하는 Zygote의 child fork는 앞 표의 별도 검사다. src/guest_probe.rs:495의 stdout/stderr reader threads도 현재 SSAL 부모 프로세스에서 CLONE_VM thread를 만든다. 여러 진단용 Command/fork 경로는 같은 caller-SID 원칙을 따른다. src/unix.rs:262 등 일부 fork/threads는 cfg(test) 안에 있어 서비스 runtime 경로에서 제외했다.
 
-실행 코드가 설정하는 Guest Zygote SID는 u:r:ssal_guest_probe:s0이지만 module/profiles/services/initial.json:55는 u:r:zygote:s0로 기록돼 있다. 이 profile metadata와 현재 launcher 구현이 일치하지 않으므로 실제 적용 SID는 런타임 기록 없이는 확정하지 않는다.
+실행 코드가 설정하는 Guest Zygote SID는 u:r:ssal_guest_probe:s0이지만 module/profiles/concurrent/services/initial.json:55는 u:r:zygote:s0로 기록돼 있다. 이 profile metadata와 현재 launcher 구현이 일치하지 않으므로 실제 적용 SID는 런타임 기록 없이는 확정하지 않는다.
 
 서비스 helper가 child에서 UID/GID를 바꾸는 것은 부모의 fork 권한을 대체하지 않는다. 따라서 Guest child를 root 또는 system UID로 만들 것이라는 목표만으로 fork 검사가 통과한다고 판단할 수 없다.
 

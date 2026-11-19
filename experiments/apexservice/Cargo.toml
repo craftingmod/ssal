@@ -4,10 +4,6 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
-[[bin]]
-name = "ssal-system-suspend"
-path = "src/suspend.rs"
-
 [dependencies]
 ssal-binder-service = { path = "../binder-service" }
 libc = "=0.2.191"

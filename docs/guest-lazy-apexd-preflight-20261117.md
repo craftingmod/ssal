@@ -78,7 +78,7 @@ Guest status를 `ready` 또는 `activated`로 미리 설정해 OnStart를 건너
 선언하거나, 빈 활성 목록을 성공으로 판정하지 않았다.
 
 현재 mount profile의 `/metadata`는 빈 RO tmpfs이고
-`module/profiles/mounts/initial.json:runtime_tmpfs`에서 Host metadata와 분리된다.
+`module/profiles/concurrent/mounts/initial.json:runtime_tmpfs`에서 Host metadata와 분리된다.
 `/data`는 Guest userdata다. apexd가 사용하는 `/data/apex/active`,
 `/data/apex/decompressed`, `/data/apex/sessions`, `/data/apex/images`,
 `/metadata/apex/images`, `/metadata/apex/sessions` 등의 상태 경로는 별도 검증이

@@ -12,6 +12,7 @@ fi
 export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$android_linker"
 cargo build --locked --release --target aarch64-linux-android
 cargo build --locked --release --manifest-path experiments/apexservice/Cargo.toml --target aarch64-linux-android
+cargo build --locked --release --manifest-path experiments/system-suspend/Cargo.toml --target aarch64-linux-android
 mkdir -p out/bin
 install -m 755 "$CARGO_TARGET_DIR/aarch64-linux-android/release/ssal-apexservice" out/bin/ssal-apexservice
 install -m 755 "$CARGO_TARGET_DIR/aarch64-linux-android/release/ssal-system-suspend" out/bin/ssal-system-suspend

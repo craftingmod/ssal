@@ -158,7 +158,7 @@ def prepare(folder, image):
                         fields = line.split()
                         if len(fields) >= 2 and fields[1] == label:
                             record["service_names"].append(fields[0])
-    contract = json.loads(Path("module/profiles/services/initial.json").read_text())
+    contract = json.loads(Path("module/profiles/concurrent/services/initial.json").read_text())
     for service in contract["services"]:
         inventory.setdefault(service["domain"], {"files": [], "service_names": []})["contract_service"] = service["name"]
     inventory.setdefault("u:object_r:ssal_image_file:s0", {"files": ["module/sepolicy.rule"], "service_names": []})

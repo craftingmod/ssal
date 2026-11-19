@@ -74,12 +74,7 @@ impl Service {
         let log = root.join(format!("run/ssal/{name}.log"));
         File::create(&log)?;
         let mut command = crate::guest::launcher::command(root, exe, uid, exec_context)?;
-        // The Rust APEX service uses the mapped exec SID and writes its own diagnostics.
-        let rust_service = [
-            super::binder_service::APEX.executable,
-            super::binder_service::SUSPEND.executable,
-        ]
-        .contains(&exe);
+        let rust_service = crate::guest::launcher::uses_own_diagnostics(exe);
         let installd_probe = name == "installd" && crate::guest::launcher::installd_probe_requested();
         command.stdin(input);
         if !rust_service && name != "memory-probe" {

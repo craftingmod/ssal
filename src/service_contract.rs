@@ -1,3 +1,3 @@
-//! Compatibility facade for the Guest service contract.
+//! Compatibility facade for the existing Concurrent Mode service contract.
 
-pub(crate) use crate::guest::init::contract::{blocked_summary, report};
+pub(crate) use crate::guest::concurrent::service_contract::{blocked_summary, report};

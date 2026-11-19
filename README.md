@@ -3,6 +3,14 @@
 SSAL — System Switching Abstraction Layer.
 > The name came first. The acronym came later.
 
+## 아키텍처
+
+- **SSAL Core Runtime**은 Guest Init, Binder, Property, SELinux, Mount, Lifecycle을 두 모드에 제공합니다. [공통 구조](docs/architecture.md)
+- **Concurrent Mode**는 Host Framework를 유지하며 Guest를 격리 실행합니다. Virtual Composer 설계와 제한적 HAL 중개는 이 모드에 속합니다. [Concurrent Mode](docs/modes/concurrent.md)
+- **Exclusive Mode**는 Host Framework 중지·복원과 물리 HAL 인계를 통해 Guest를 독점 실행하는 목표입니다. [Exclusive Mode](docs/modes/exclusive.md)
+
+현재 Guest worker는 Host Framework를 유지합니다. `ssal switch`와 `ssal return`은 차단돼 있습니다.
+
 ## AGENT
 
 KernelSU 모듈과 Android arm64 CLI의 초기 구현입니다. `ssald`가 root 전용 소켓을 제공하며 `ssal doctor`, `ssal status`, `ssal logs`, `ssal add <image_name> <raw-ext4-image>`를 지원합니다. 이미지 이름은 영문 대소문자, 숫자, `_`, `-`로 1~64자까지 지정합니다. 이름별로 이미지를 등록하며 `ssal status`에서 목록과 백그라운드 작업 결과를 확인합니다. 기존 `lineage` 등록은 업데이트 후 그대로 유지됩니다. 원본은 변경하지 않고 복사하며, 재등록 시 기존 userdata는 건드리지 않습니다.
@@ -70,8 +78,6 @@ Guest 시스템 파티션의 rc와 Guest property 기반 import를 읽습니다.
 
 SystemServer 또는 APEX 검사 모드에서는 `late-init`에서 이어지는 `start apexd`·`restart apexd`를 기존 `ssal-apexservice` 감독 경로에 연결합니다. 기존 Guest APEX 마운트와 linkerconfig를 재사용합니다. private Binder 등록과 AIDL 조회 검사가 통과하면 Guest property에 `apexd.status=activated`를 기록합니다. 매핑이나 준비 검사가 실패하면 Zygote 시작 전에 중단합니다.
 
-`SSAL_GUEST_SYSTEM_SUSPEND=1`을 지정한 Guest 서비스 워커는 private Binder에 `android.system.suspend.ISystemSuspend/default`, `suspend_control`, `suspend_control_internal`을 등록합니다. Guest의 `PARTIAL` wakelock은 이름과 개수에 관계없이 하나의 Host `SSAL:VirtualWakeLock`으로 합쳐집니다. Host broker는 상속된 소켓을 통해 획득·해제만 처리하고, 마지막 Guest 토큰 해제 또는 연결 종료 시 Host 토큰을 반환합니다. 연속으로 잠금을 5분간 보유하면 broker가 토큰을 반환하고 종료합니다. `FULL`, autosuspend, 강제 절전, 콜백 및 Host 통계는 지원하지 않습니다.
-
 부팅 이벤트에 붙은 property 조건은 해당 부팅 단계의 Guest 스냅샷에서 평가합니다. Property Service는 `servicemanager.ready=true`에서 순수 `on property:...` 액션을 한 번 평가한 뒤, Guest property가 생성되거나 값이 바뀔 때 관련 액션을 실행합니다. 여러 조건은 모두 만족해야 하며, 부팅 이벤트가 붙은 액션은 property 변경으로 다시 실행되지 않습니다.
 
 실시간 액션은 명시적으로 등록된 Guest 서비스의 `start`·`class_start`, `trigger`, Guest init SELinux 권한이 있는 비영속 `setprop`을 지원합니다. 등록 서비스는 이름·실행 파일·인수가 일치하는 rc 선언의 `oneshot`과 `restart_period`를 상속합니다. Property Service의 `services` 설정에서 두 옵션을 덮어쓸 수 있습니다. rc 선언과 일치하지 않는 등록 서비스는 `"oneshot": false` 또는 초 단위 `"restart_period"`를 지정하면 자동 재시작합니다.
@@ -97,8 +103,6 @@ wslc exec --workdir /src ssal-dev cargo test --locked --lib
 결과는 `out/ssal-module.zip`과 `out/bin/`에 생성됩니다. 설치 후 root 셸에서 `export PATH="/data/adb/modules/ssal/bin:$PATH"`를 실행하면 해당 셸에서 `ssal`을 사용할 수 있습니다. 또는 `/data/adb/modules/ssal/bin/ssal`을 직접 실행합니다. 사용자 이미지와 상태는 모듈 업데이트 및 제거 시 보존됩니다. 빌더 이미지를 다시 빌드하고 기존 `ssal-dev`를 교체하려면 `bun run update:windows`를 실행합니다. 기존 컨테이너가 실행 중이면 중지한 뒤 삭제하고 새 컨테이너를 생성합니다. 다른 작업공간이나 이미지에 연결된 동명의 컨테이너는 교체하지 않습니다.
 
 WebUI 소스는 `frontend/`에 있으며 `bun run build:web`으로 `out/webroot/`에 빌드합니다. `bun run package`는 빌드된 바이너리와 WebUI를 모듈 ZIP으로 묶습니다. KernelSU 모듈 WebUI의 버튼으로 데몬을 재시작할 수 있으며, 이미지 등록 중에는 재시작이 거부됩니다.
-
-상세 목표와 남은 단계는 [아키텍처](docs/architecture.md)를 참고하세요.
 
 SELinux 전환 사전 검사는 `ssal probe-selinux-transition PROFILE_NAME`으로 실행합니다. [검사 범위와 기기 결과](docs/selinux-transition-probe.md)를 참고하세요.
 

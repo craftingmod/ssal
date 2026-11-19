@@ -190,7 +190,7 @@ ELF 의존성은 추출된 SF ELF에 llvm-readobj로 동적 dependency와 undefi
 | src/guest/initrc.rs:87–107 | SSAL BootService allowlist는 servicemanager/apexd/zygote이며 surfaceflinger는 없다. |
 | src/guest/properties/services.rs:18–73 | ctl interface는 명시된 ServiceDefinition mapping을 사용한다. 기본 config에 SF mapping이 있다는 근거는 없다. |
 | docs/guest-ctl-experimental-20261118.md:47–69 | services/interfaces 기본값과 ctl registry exact matching; interface mapping이 실제 Binder 등록을 대체하지 않는다는 계약. |
-| module/profiles/mounts/initial.json:1–22; src/guest/mount/profile.rs:84–87; src/guest/mount/mod.rs:251–299; src/guest/mount/devices.rs:8–16 | Guest /dev, fresh RO /sys, read-only vendor/odm/vendor_dlkm 및 Host runtime bind 범위. |
+| module/profiles/concurrent/mounts/initial.json:1–22; src/guest/concurrent/mount_profile.rs:45; src/guest/mount/mod.rs:251–299; src/guest/mount/devices.rs:8–16 | Guest /dev, fresh RO /sys, read-only vendor/odm/vendor_dlkm 및 Host runtime bind 범위. |
 | src/guest/binder.rs:56–178 | private BinderFS 생성, /dev/binder bind, Host device와 분리 검증. |
 | tools/rsbinder/Cargo.toml:1–19; docs/rsbinder-phase3-results.md:106–110; docs/rsbinder-phase5a-results.md:14,62 | 현재 rsbinder 0.13 dependency와 기존 custom AIDL/callback 시험 범위. GUI/FD/native graphics contract 시험은 아니다. |
 | docs/system-server-static-analysis.md:134–144 | 2026-11-04 정적 분석도 default display와 headless/virtual-display 경계를 미확인으로 남겼다. 그 문서의 실행 상태는 이번 run 이전의 기록이다. |

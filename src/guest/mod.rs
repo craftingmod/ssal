@@ -1,9 +1,13 @@
+//! SSAL Core Runtime and the existing Guest worker composition.
+
 #[cfg(unix)]
 pub(crate) mod binder;
 #[cfg(unix)]
 pub(crate) mod cgroup;
 #[cfg(unix)]
 pub(crate) mod compat;
+#[cfg(unix)]
+pub(crate) mod concurrent;
 #[cfg(unix)]
 pub(crate) mod environment;
 #[cfg(unix)]

@@ -55,7 +55,7 @@ pub(super) fn create_profile(
         };
         let manifest = serde_json::json!({"version": 3, "name": name, "image_name": image_name, "image_id": id,
             "selinux_id": ssal::guest_policy::allocate_id(root)?,
-            "mount_profile": crate::guest::mount::PROFILE_NAME,
+            "mount_profile": crate::guest::concurrent::mount_profile::PROFILE_NAME,
             "guest_lock_compat": ssal::guest_lock_compat::Config::default(),
             "guest_lock_compat_creation": {"version": 1, "userdata_state": "empty-at-creation", "application_phase": "before-first-service", "migration_allowed": false},
             "device": {"product_device": property("ro.product.device"), "product_model": property("ro.product.model"), "build_fingerprint": property("ro.build.fingerprint"), "configuration": null},
@@ -174,7 +174,7 @@ mod tests {
             profile["guest_lock_compat_creation"]["migration_allowed"],
             false
         );
-        assert_eq!(profile["mount_profile"], crate::guest::mount::PROFILE_NAME);
+        assert_eq!(profile["mount_profile"], crate::guest::concurrent::mount_profile::PROFILE_NAME);
         assert!(crate::guest::userdata::open(&root.join("guests/profile1/userdata.img")).is_ok());
         assert!(root.join("guests/profile2/profile.json").exists());
         assert!(create_profile(&root, "lineage", Some("profile1"), 32 * 1024 * 1024).is_err());

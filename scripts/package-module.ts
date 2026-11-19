@@ -15,12 +15,16 @@ const entries: { name: string; path: string; mode: number }[] = [
     "customize.sh",
     "uninstall.sh",
     "restart.sh",
-    "profiles/mounts/initial.json",
-    "profiles/services/initial.json",
   ].map((name) => ({
     name,
     path: `module/${name}`,
     mode: name.endsWith(".sh") ? 0o100755 : 0o100644,
+  })),
+  // Preserve the installed paths for the existing Concurrent Mode profiles.
+  ...["mounts", "services"].map((kind) => ({
+    name: `profiles/${kind}/initial.json`,
+    path: `module/profiles/concurrent/${kind}/initial.json`,
+    mode: 0o100644,
   })),
   ...[
     "ssal",

@@ -93,7 +93,7 @@ Parent가 가진 capability의 일부를 child에 요청하는 경로가 있으�
 - SELinux: `Enforcing`; kernel enforce 값 `1`.
 - boot ID: `03834516-215d-4fd6-8960-1b833882595e`.
 - Host 핵심 process snapshot: zygote64 PID 1840 / `u:r:zygote:s0`, system_server PID 2911 / `u:r:system_server:s0`, adbd PID 8989 / `u:r:adbd:s0`, netd PID 1838 / `u:r:netd:s0`. 실행 후 같은 PID/context가 관찰됐고 worker는 `HOST_SAFETY_SNAPSHOT=UNCHANGED`를 기록했다.
-- `module/profiles/services/initial.json`: `launch_enabled=false` 유지.
+- `module/profiles/concurrent/services/initial.json`: `launch_enabled=false` 유지.
 - `src/ssald.rs`: `switch` 및 `return` 차단 유지.
 - global permissive, broad Host allow, Host init rc 재사용, Host 핵심 프로세스 signal은 사용하지 않았다.
 

@@ -1,13 +1,16 @@
-# ssal / ssald 아키텍처 구상
+# SSAL 아키텍처
 
-작성일: 2026-10-30  
-상태: 구현 전 설계 초안
+SSAL은 순정 삼성 커널에서 Guest에 독립 userdata와 실행 환경을 제공한다. **SSAL Core Runtime** 위에 **Concurrent Mode**와 **Exclusive Mode**를 두며, 각 모드가 Host Framework와 하드웨어를 사용하는 방식을 결정한다.
 
-구현 진행: `prepare`에 적용한 초기 mount 구성과 현재 제약은 [초기 마운트 프로필](initial-mount-profile.md)에 정리한다. 아래 hot-switch·서비스 분리 항목은 목표 설계다.
+| 계층 | 책임 | 저장소 경계 |
+| --- | --- | --- |
+| **SSAL Core Runtime** | Guest Init과 서비스 감독, private Binder, Guest Property, Guest SELinux, mount와 userdata, Guest Lifecycle | [Guest 공통 모듈](../src/guest/mod.rs), [플랫폼 기본 기능](../src/platform/mod.rs), [공통 Binder 서비스 기반](../experiments/binder-service/src/lib.rs) |
+| **Concurrent Mode** | Host Framework를 유지한 채 Guest를 격리 실행하고 Virtual Composer 및 허용된 HAL 인터페이스를 제공 | [모드 구현·설정·의존성](modes/concurrent.md) |
+| **Exclusive Mode** | Host Framework 중지·복원, 물리 HAL 인계, Guest 독점 실행 | [전환·복원 설계](modes/exclusive.md) |
 
-서비스 분리의 선택한 목표와 시작·중지·복구 조건은 [서비스 실행 계약](service-execution-contract.md)에 정의한다. 계약의 형식 검사와 기동 차단은 구현했으며 private property/Binder·HAL 중계·서비스 런처는 아직 구현하지 않았다.
+두 모드는 Core Runtime의 준비·기동·종료 기능을 사용한다. Host 리소스 사용 정책, HAL 구현과 설정은 해당 모드가 소유한다. 현재 `src/guest/prepare.rs`가 Concurrent 프로필을 선택해 공통 마운트 코드에 넘기고, `src/guest/launcher/mod.rs`가 기존 어댑터를 Guest worker에 연결한다. 현 배포물의 `ssal`과 `ssald`는 공통 진입점이다. 현재 Guest worker는 Host Framework를 유지하며, `ssal switch`와 `ssal return`은 차단돼 있다.
 
-FreeSam의 LineageOS hot-switch를 KernelSU 모듈과 CLI 중심으로 재구성한다. 이 문서는 목표 구조와 구현 순서, 기기에서 검증해야 할 경계를 정의한다. 아래 내용은 구현 완료나 기기 호환성을 보장하는 명세가 아니다.
+공통 런타임 상세에는 기존 설계의 제안 사항도 포함된다. 현재 마운트와 기동 제한은 [초기 마운트 프로필](initial-mount-profile.md)과 [서비스 실행 계약](service-execution-contract.md)에 기록돼 있다.
 
 ## 1. 목표와 전제
 
@@ -20,7 +23,7 @@ FreeSam의 LineageOS hot-switch를 KernelSU 모듈과 CLI 중심으로 재구성
 
 이미지 다운로드는 사용자가 외부 도구로 수행한다. 사용자는 압축 해제된 `system.img`를 `/sdcard/Download/` 등 접근 가능한 위치에 준비하고 `ssal add <image_name> <경로>`로 등록한다. ssal은 로컬 파일을 관리 저장소로 복사하며 다운로드·URL 입력·압축 해제 기능은 구현 범위에 포함하지 않는다.
 
-여기서 부팅은 커널 재부팅이나 부팅 슬롯 전환이 아니다. 호스트 커널을 유지한 상태에서 OneUI 프레임워크를 중지하고 LineageOS 프레임워크를 시작하는 hot-switch다. OneUI 복귀 시에도 기존 앱 프로세스가 그대로 재개되는 것은 아니며, 프레임워크와 앱을 다시 시작할 수 있다.
+두 모드는 실행 중인 커널과 부팅 슬롯을 유지한다. Concurrent Mode에서는 One UI와 Guest가 함께 실행된다. Exclusive Mode는 One UI 프레임워크 중지 후 LineageOS에 독점 실행권을 넘기고, 복귀 시 One UI 프레임워크를 다시 시작한다.
 
 데이터 독립은 호스트 데이터 디렉터리를 게스트에 연결하지 않는다는 의미다. 커널, 물리 저장장치, 일부 하드웨어 서비스는 공유한다. 게스트 root를 적대적인 주체로 가정하는 보안 격리는 mount namespace만으로 달성하지 못한다.
 
@@ -85,7 +88,7 @@ CLI는 전환 스크립트를 직접 실행하지 않는다. 데몬에 작업을
 ├─ guests/
 │  └─ <profile-name>/
 │     ├─ profile.json
-│     └─ userdata/
+│     └─ userdata.img
 ├─ mnt/
 │  └─ <session-id>/
 │     ├─ system/
@@ -104,10 +107,10 @@ CLI는 전환 스크립트를 직접 실행하지 않는다. 데몬에 작업을
 
 ## 4. 게스트 `/data` 독립
 
-초기 구현은 프로필별 userdata 디렉터리를 게스트 `/data`에 bind mount한다.
+현재 구현은 프로필별 ext4 `userdata.img`를 마운트하고 해당 파일시스템을 게스트 `/data`에 bind mount한다.
 
 ```text
-호스트 /data/local/ssal/guests/<profile-name>/userdata/
+호스트 /data/local/ssal/guests/<profile-name>/userdata.img (ext4)
                        │ bind mount
                        ▼
 게스트 /data
@@ -127,7 +130,7 @@ CLI는 전환 스크립트를 직접 실행하지 않는다. 데몬에 작업을
 - 호스트 `/data/apex`의 가변 상태도 공유하지 않는다. 게스트 APEX 구성과 활성화 방식은 별도로 설계한다.
 - 호스트 `/mnt`를 재귀 bind하지 않는다. 호스트 저장소 마운트가 함께 유입될 수 있다.
 
-이 구성은 호스트 `/data` 파일시스템과 여유 공간을 공유하며 독립 파일시스템이나 용량 제한을 제공하지 않는다. 게스트 서비스에 필요한 SELinux 라벨, 접근 권한과 용량 관리 정책은 별도로 검증해야 한다.
+userdata 이미지는 자체 ext4 파일시스템을 사용하고, 이미지 파일은 호스트 저장 공간을 사용한다. 게스트 서비스에 필요한 SELinux 라벨, 접근 권한과 용량 관리 정책은 별도로 검증해야 한다.
 
 호스트 저장소의 암호화에 더해 게스트 자체 FBE, 잠금 화면, KeyMint 연동까지 제공할지는 별도 결정 사항이다. 새 ext4 이미지를 만드는 것만으로 일반 Android의 CE/DE 암호화 동작이 완성되지는 않는다.
 
@@ -157,7 +160,7 @@ GuestSession
 
 권장 순서는 다음과 같다.
 
-1. Zygote를 중지하기 전에 호스트 namespace와 root FD를 확보한다. KernelSU에서 상속한 namespace가 기대한 호스트 서비스의 뷰인지 검증한다.
+1. Guest 환경을 구성하기 전에 호스트 namespace와 root FD를 확보한다. KernelSU에서 상속한 namespace가 기대한 호스트 서비스의 뷰인지 검증한다.
 2. guest worker에서 `unshare(CLONE_NEWNS)`를 실행한다.
 3. 상속한 mount 전파를 끊도록 `/`를 재귀적으로 private으로 변경한다.
 4. 이 namespace 안에서 시스템 이미지, userdata, 게스트 rootfs를 구성한다.
@@ -191,60 +194,13 @@ KernelSU 모듈 설치와 기동은 호스트가 담당한다. 게스트 `/data/
 
 ## 7. Binder, property와 HAL 경계
 
-mount namespace 분리는 Android 시스템 서비스의 자동 분리를 의미하지 않는다. 다음 항목은 hot-switch 구현 전에 확정해야 한다.
+공통 런타임은 Guest Framework에 private Binder 컨텍스트와 Guest 전용 property 영역을 구성한다. Guest init의 트리거와 서비스 제어는 Guest 환경에서 처리한다. 동일 커널에서 SELinux 정책은 공유되며 Guest 도메인과 권한은 기존 Host 정책에 가산한다.
 
-- 게스트와 호스트 Binder 서비스 이름 충돌 방지 방식
-- 게스트 framework Binder 컨텍스트 분리 여부
-- 분리한 framework와 호스트 vendor HAL 사이의 연결 방식
-- property 메모리 영역과 property service의 공유 범위
-- 호스트 `init`에 전달하는 `ctl.*` 요청의 통제 방식
-- 호스트 `init`의 서비스 재시작 및 `onrestart` 연쇄 동작
-
-장기적으로는 게스트 framework Binder를 분리하고 필요한 HAL 연결을 명시하는 구성이 경계를 설명하기 좋다. 하지만 Binder 장치를 따로 만드는 것만으로 호스트 HAL 접근이 해결되지는 않는다. 서비스 검색과 Binder 객체 전달까지 고려한 연결 방식이 필요하며 기기별 구현과 검증이 선행되어야 한다.
-
-초기 호환성 검증에서 FreeSam처럼 공유 Binder를 사용한다면, 충돌하는 호스트 서비스를 중지하고 게스트 서비스가 독점 등록하는 전환 절차가 필요하다. 이는 완전한 서비스 격리가 아니며, 호스트 `installd`로 우회하는 식으로 데이터 독립 요구사항을 완화해서는 안 된다.
-
-property도 같은 원칙을 적용한다. 게스트 전용 property 환경을 구현하지 않은 상태에서 `setprop`을 호출하면 호스트 상태를 바꿀 수 있다. 필요한 전역 변경은 `ssald`가 허용 목록과 복원 기록을 통해 수행한다. 일반 Android `init`을 게스트에서 실행하면 이 문제가 자동 해결된다고 가정하지 않는다.
-
-SELinux는 커널 전역 정책을 공유한다. 기기 프로파일에 필요한 정책과 라벨을 정의하고, 전역 permissive 전환이나 재귀 `chmod 777`을 정상 운영 방식으로 삼지 않는다.
+HAL의 연결과 소유권은 각 모드가 결정한다. Concurrent Mode는 [가상 구현과 인터페이스별 중개](modes/concurrent.md)를 다루고, Exclusive Mode는 [물리 HAL 인계와 Host 서비스 상태 복원](modes/exclusive.md)을 다룬다.
 
 ## 8. 전환 상태 머신과 복구
 
-```text
-HOST_ACTIVE
-    ↓
-PREPARING          이미지 검증, userdata mount, guest namespace 구성
-    ↓
-GUEST_READY        마운트와 서비스 사전 검사
-    ↓
-SWITCHING          호스트 서비스 정지, 게스트 서비스 시작
-    ↓
-GUEST_ACTIVE
-    ↓
-RETURNING         게스트 종료, 호스트 서비스 복원
-    ↓
-HOST_ACTIVE
-
-실패 → ROLLING_BACK → HOST_ACTIVE
-                   └→ RECOVERY_REQUIRED
-```
-
-전환 작업은 하나씩 실행하고 각 단계의 완료와 보상 작업을 journal에 기록한다.
-
-1. 이미지 무결성, 기기 프로파일, 저장 공간과 필수 자산을 검증한다.
-2. 호스트 Zygote 중지 전에 게스트 준비를 최대한 끝낸다.
-3. 호스트 서비스 상태와 변경할 전역 상태를 기록한다.
-4. 기기 프로파일의 의존성 순서에 따라 호스트 서비스를 중지한다.
-5. 게스트 서비스를 시작하고 제한 시간 안에 프레임워크와 필수 기능의 정상 동작을 확인한다.
-6. 실패하면 시작한 게스트 서비스와 mount를 정리하고 호스트 상태를 복원한다.
-
-정상 복귀에서도 게스트의 쓰기를 멈추고 프로세스 종료를 확인한 뒤 mount를 의존성 역순으로 해제한다. 이름 기반 `pkill` 대신 세션에서 추적한 프로세스와 프로세스 그룹을 대상으로 한다. pidfd를 지원하지 않는 커널의 대체 경로는 PID 재사용 검사를 포함해야 한다.
-
-사용 중인 mount를 무조건 lazy unmount하여 정리가 끝났다고 처리하지 않는다. mount 참조와 프로세스가 남으면 원인을 기록하고 loop 장치도 성급하게 해제하지 않는다.
-
-호스트 namespace 보존은 서비스와 전역 상태의 자동 복원을 뜻하지 않는다. 서비스·property·장치 상태 복구는 mount 복구와 별도로 구현한다. 복구할 수 없는 실패는 `RECOVERY_REQUIRED`로 보고하며 반복 전환을 막는다.
-
-다음 재부팅은 기본적으로 OneUI로 시작한다. 실패한 게스트 자동 실행은 해제한다. 초기 구현에서는 게스트 자동 실행을 제공하지 않고 수동 전환부터 검증하는 것이 좋다.
+Host Framework 중지·복원과 물리 HAL 인계는 [Exclusive Mode의 전환 설계](modes/exclusive.md)에 정의한다.
 
 ## 9. KernelSU 모듈 수명 주기
 
@@ -319,13 +275,13 @@ FreeSam은 기기 호환성 자료와 동작 참고용으로 활용한다. 기�
 
 ### 단계 2: 독립 userdata와 namespace
 
-`ssal add <image_name> <경로>`로 로컬 이미지를 복사·등록하고 원본 파일 삭제 후에도 등록 이미지가 유효한지 확인한다. 복사 실패와 공간 부족 시 기존 등록 및 userdata가 보존되는지도 확인한다. OneUI를 실행한 채 게스트 rootfs와 userdata를 구성한다. 호스트 mount가 변하지 않는지, 게스트 `/data`가 프로필의 userdata 디렉터리에서 제공되는지 확인한다. 호스트 전용 표식 파일과 게스트 전용 표식 파일로 일반 경로에서 상호 노출과 역방향 쓰기가 없는지 확인한다. 이 검사는 root에 대한 보안 격리 증명과 구분한다.
+`ssal add <image_name> <경로>`로 로컬 이미지를 복사·등록하고 원본 파일 삭제 후에도 등록 이미지가 유효한지 확인한다. 복사 실패와 공간 부족 시 기존 등록 및 userdata가 보존되는지도 확인한다. OneUI를 실행한 채 게스트 rootfs와 userdata를 구성한다. 호스트 mount가 변하지 않는지, 게스트 `/data`가 프로필의 userdata 이미지에서 제공되는지 확인한다. 호스트 전용 표식 파일과 게스트 전용 표식 파일로 일반 경로에서 상호 노출과 역방향 쓰기가 없는지 확인한다. 이 검사는 root에 대한 보안 격리 증명과 구분한다.
 
 ### 단계 3: 게스트 데이터 서비스
 
 Binder·property 방식을 확정하고 게스트 `installd`, `artd`, 저장소 서비스를 연결한다. 앱 설치·삭제·dexopt·재시작과 미디어 저장이 게스트 userdata에만 기록되는지 확인한다. 호스트 `/data` 변경 여부를 함께 관찰한다.
 
-### 단계 4: 기기별 hot-switch와 복귀
+### 단계 4. Exclusive Mode의 기기별 hot-switch와 복귀
 
 디스플레이, 입력, 오디오, 네트워크, HAL 의존성을 프로파일로 정의한다. 정상 전환과 복귀, 게스트 부팅 실패, supervisor 종료, CLI 연결 종료, 데몬 재시작, 전환 중 재부팅을 검증한다. 지원하지 않는 복구 경로는 상태와 제한을 명시한다.
 

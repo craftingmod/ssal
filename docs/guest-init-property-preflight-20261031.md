@@ -8,7 +8,7 @@
 
 참고 vendor 구현인 `vendor/freesam/app/src/main/assets/switch_to_lineage.sh:571–574`는 mount namespace만 지정하고 `master_inner.sh:6–16`은 pivot_root와 proc mount를 수행하며 Guest init을 실행하지 않는다. `vendor/freesam/docs/engineering/HANDOFF.md:206–208`은 servicemanager 공유와 Host 기준의 stale property를 기록한다. 이는 SSAL의 격리 증거가 아니다. `vendor/LineageOS_gsi/patches/trebledroid-staging/platform_system_core/0004-init-tolerate-EROFS-on-restorecon-of-system-bin-init.patch:6–19,38–47`는 read-only init restorecon의 EROFS와 fatal reboot 위험을 다루지만, 이 패치가 등록 이미지에 적용됐는지는 미확인이다.
 
-기존 [실행 환경 결과](servicemanager-execution-environment.md), [SELinux 결과](selinux-check-device-20261031.md), [초기 mount 구성](initial-mount-profile.md), [서비스 계약](../module/profiles/services/initial.json)을 재사용했다. 기존 실제 기기 결과는 KernelSU가 적용된 실효 정책에 대한 관측이지 변경 전 순정 정책의 증명이 아니다. 이번에는 기기 접근, Guest init/서비스/인증 호출, 정책 적용 또는 설치 모듈 변경을 하지 않았다.
+기존 [실행 환경 결과](servicemanager-execution-environment.md), [SELinux 결과](selinux-check-device-20261031.md), [초기 mount 구성](initial-mount-profile.md), [서비스 계약](../module/profiles/concurrent/services/initial.json)을 재사용했다. 기존 실제 기기 결과는 KernelSU가 적용된 실효 정책에 대한 관측이지 변경 전 순정 정책의 증명이 아니다. 이번에는 기기 접근, Guest init/서비스/인증 호출, 정책 적용 또는 설치 모듈 변경을 하지 않았다.
 
 ## 서비스 의존성 표
 

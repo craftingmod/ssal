@@ -2,7 +2,7 @@
 
 `initial-shared-dev`는 기존 profile metadata와의 호환성을 위해 유지한 식별자다. 현재 구성은 `ssal prepare PROFILE_NAME`에서 마운트를 조립하지만, 검증되지 않은 Host proc/root, exec-FD, signal/ptrace 경계 때문에 Guest GSI 바이너리 실행 직전에 fail-closed로 중단하고 마운트를 해제한다. 따라서 현재 `prepare`는 성공하지 않으며 chroot·pivot_root 검사도 실행하지 않는다. 게스트 Android 서비스 시작과 hot-switch는 수행하지 않는다.
 
-정의는 [`initial.json`](../module/profiles/mounts/initial.json), 구현은 [`guest_mounts.rs`](../src/guest_mounts.rs)에 있다. JSON은 빌드 시 바이너리에 포함하고 모듈에도 참고용으로 배포한다. 설치된 JSON만 바꾸면 실행 설정이 변경되는 구조는 아니며 재빌드가 필요하다. 새 게스트 `profile.json`에는 `mount_profile` 이름을 기록한다. userdata는 버전 3 프로필의 `userdata.img`만 지원하며 이전 프로필은 삭제 후 재생성한다.
+이 프로필은 [Concurrent Mode](modes/concurrent.md)의 Guest worker가 사용한다. 정의는 [`initial.json`](../module/profiles/concurrent/mounts/initial.json), 구현은 [Guest mount](../src/guest/mount/mod.rs)에 있다. JSON은 빌드 시 바이너리에 포함하고 모듈에도 참고용으로 배포한다. 설치된 JSON만 바꾸면 실행 설정이 변경되는 구조는 아니며 재빌드가 필요하다. 새 게스트 `profile.json`에는 `mount_profile` 이름을 기록한다. userdata는 버전 3 프로필의 `userdata.img`만 지원하며 이전 프로필은 삭제 후 재생성한다.
 
 ## 마운트 표
 
