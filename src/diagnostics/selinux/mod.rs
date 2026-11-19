@@ -86,6 +86,15 @@ pub(crate) fn require_enforcing_domain(context: &str) -> io::Result<()> {
     Ok(())
 }
 
+pub(crate) fn access_allowed(
+    source: &str,
+    target: &str,
+    class: &str,
+    permission: &str,
+) -> io::Result<bool> {
+    Ok(query(source, target, class, permission)?.allowed)
+}
+
 fn query(source: &str, target: &str, class: &str, permission: &str) -> io::Result<Decision> {
     let base = format!("/sys/fs/selinux/class/{class}");
     let index: u32 = fs::read_to_string(format!("{base}/index"))?

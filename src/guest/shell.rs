@@ -63,6 +63,12 @@ pub(crate) fn session(name: &str, words: &[String]) -> io::Result<i32> {
         .map_err(|_| io::Error::other("Shell session already configured"))?;
     if let Some(attached) = environment::attach(&profile_dir)? {
         attached.enter()?;
+        use crate::guest::concurrent::graphics;
+        if attached.root.join("dev").join(graphics::KGSL).exists() != graphics::requested() {
+            return Err(io::Error::other(
+                "SSAL_Y702_GRAPHICS must match the active Guest shell session",
+            ));
+        }
         drop(admission);
         return isolated(&attached.root);
     }

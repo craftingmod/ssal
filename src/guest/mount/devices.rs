@@ -1,4 +1,5 @@
 use super::{cpath, directory};
+use crate::guest::concurrent::graphics;
 use ssal::namespace_mounts::Mounts;
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -21,6 +22,8 @@ fn bind_guest_device(
     name: &str,
     major: u32,
     minor: u32,
+    owner: (u32, u32),
+    label: Option<&str>,
 ) -> io::Result<()> {
     let source = Path::new("/dev").join(name);
     let source_entry = fs::symlink_metadata(&source)?;
@@ -30,13 +33,19 @@ fn bind_guest_device(
             source_entry.uid(),
             source_entry.gid(),
             source_entry.mode() & 0o7777,
-        ) != (0, 0, 0o666)
+        ) != (owner.0, owner.1, 0o666)
     {
         return Err(io::Error::other(format!(
-            "unsafe Host /dev/{name}: expected char {major}:{minor}, root:root 0666"
+            "unsafe Host /dev/{name}: expected char {major}:{minor}, {}:{} 0666",
+            owner.0, owner.1
         )));
     }
     let source_file = File::open(&source)?;
+    if let Some(label) = label {
+        if ssal::unix::image_context(&source_file)? != label {
+            return Err(io::Error::other(format!("unexpected Host /dev/{name} label")));
+        }
+    }
     let source_mount = ssal::unix::fd_mount_id(&source_file)?;
     let target = dev.join(name);
     OpenOptions::new()
@@ -81,7 +90,11 @@ fn bind_guest_device(
     Ok(())
 }
 
-pub(super) fn prepare_guest_dev(mounts: &mut Mounts, root: &Path) -> io::Result<()> {
+pub(super) fn prepare_guest_dev(
+    mounts: &mut Mounts,
+    root: &Path,
+    y702_graphics: bool,
+) -> io::Result<()> {
     let dev = root.join("dev");
     mounts.attach(
         Path::new("tmpfs"),
@@ -94,12 +107,30 @@ pub(super) fn prepare_guest_dev(mounts: &mut Mounts, root: &Path) -> io::Result<
         directory(&dev, path, 0o755)?;
     }
     for (name, major, minor) in GUEST_DEVICE_NODES {
-        bind_guest_device(mounts, &dev, name, major, minor)?;
+        bind_guest_device(mounts, &dev, name, major, minor, (0, 0), None)?;
+    }
+    let mut expected: std::collections::BTreeSet<_> =
+        GUEST_DEV_ENTRIES.into_iter().map(str::to_owned).collect();
+    if y702_graphics {
+        let identity = fs::read_to_string("/sys/class/kgsl/kgsl-3d0/dev")?;
+        let (major, minor) = identity
+            .trim()
+            .split_once(':')
+            .ok_or_else(|| io::Error::other("invalid Y702 KGSL device identity"))?;
+        bind_guest_device(
+            mounts,
+            &dev,
+            graphics::KGSL,
+            major.parse().map_err(io::Error::other)?,
+            minor.parse().map_err(io::Error::other)?,
+            (1000, 1000),
+            Some("u:object_r:gpu_device:s0"),
+        )?;
+        expected.insert(graphics::KGSL.to_owned());
     }
     let actual: std::collections::BTreeSet<String> = fs::read_dir(&dev)?
         .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
         .collect::<io::Result<_>>()?;
-    let expected = GUEST_DEV_ENTRIES.into_iter().map(str::to_owned).collect();
     if actual != expected
         || fs::read_dir(dev.join("socket"))?.next().is_some()
         || dev.join("__properties__").exists()
@@ -110,7 +141,7 @@ pub(super) fn prepare_guest_dev(mounts: &mut Mounts, root: &Path) -> io::Result<
             "Guest /dev contains an unapproved entry or Host property endpoint",
         ));
     }
-    println!("Guest /dev allowlist verified: null, zero, random, urandom; Host Binder/property/Binder-control/HAL nodes absent");
+    println!("Guest /dev allowlist verified: {expected:?}");
     Ok(())
 }
 

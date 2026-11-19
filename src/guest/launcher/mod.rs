@@ -55,6 +55,7 @@ fn mapped_exec_domain(executable: &str, exec_context: Option<&[u8]>) -> &'static
         match executable {
             "/system/bin/app_process64" => "zygote",
             "/system/bin/servicemanager" => "servicemanager",
+            "/system/bin/surfaceflinger" => "surfaceflinger",
             "/run/ssal/ssal-apexservice" => crate::guest::init::binder_service::APEX.domain,
             "/run/ssal/ssal-system-suspend" => system_suspend::SERVICE.domain,
             "/apex/com.android.sdkext/bin/derive_classpath" => "derive_classpath",
@@ -63,6 +64,89 @@ fn mapped_exec_domain(executable: &str, exec_context: Option<&[u8]>) -> &'static
             }
             _ => "shell",
         }
+    }
+}
+
+fn retest_surfaceflinger(root: &Path, guest_binder: u64) -> io::Result<()> {
+    let plan = ssal::guest_policy::runtime::load(root)?
+        .ok_or_else(|| io::Error::other("Guest SELinux plan missing for SurfaceFlinger"))?;
+    let sid = plan.context("surfaceflinger", true)?;
+    let gpu = fs::metadata(root.join("dev").join(crate::guest::concurrent::graphics::KGSL))?;
+    let binder = fs::metadata(root.join("dev/binder"))?;
+    if binder.rdev() != guest_binder || root.join("dev/hwbinder").exists() {
+        return Err(io::Error::other("Y702 Guest graphics/Binder device isolation mismatch"));
+    }
+    println!(
+        "SF_RETEST_BEGIN uid=1000 sid={sid} gpu_rdev={} binder_rdev={} host_hwbinder=absent",
+        gpu.rdev(),
+        binder.rdev()
+    );
+    let mut service = match Service::start(
+        root,
+        "/system/bin/surfaceflinger",
+        &[],
+        "sf-retest",
+        1000,
+        None,
+        &[],
+    ) {
+        Ok(service) => Some(service),
+        Err(error) => {
+            println!("SF_RETEST_START_FAILED={error}");
+            None
+        }
+    };
+    if let Some(service) = &service {
+        let pid = service.pid();
+        let actual_sid = fs::read_to_string(format!("/proc/{pid}/attr/current"))
+            .map(|sid| sid.trim_matches(['\0', '\n']).to_owned())
+            .unwrap_or_else(|error| format!("unavailable:{error}"));
+        let actual_uid = fs::read_to_string(format!("/proc/{pid}/status"))
+            .ok()
+            .and_then(|status| {
+                status
+                    .lines()
+                    .find(|line| line.starts_with("Uid:"))
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| "uid=unavailable".into());
+        println!("SF_RETEST_PROCESS pid={pid} {actual_uid} sid={actual_sid}");
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let shell = plan.context("shell", true)?;
+    for name in ["SurfaceFlinger", "SurfaceFlingerAIDL"] {
+        let result = (|| {
+            let mut command = command(root, "/system/bin/service", 1000, Some(shell.as_bytes()))?;
+            command.args(["check", name]);
+            crate::guest::process::command::run_with_timeout(
+                &mut command,
+                "Guest SurfaceFlinger Binder lookup",
+                Duration::from_secs(3),
+            )
+        })();
+        match result {
+            Ok(output) => println!(
+                "SF_RETEST_BINDER {name}: status={} stdout={} stderr={}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout).trim(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+            Err(error) => println!("SF_RETEST_BINDER {name}: not run: {error}"),
+        }
+    }
+    let alive = service
+        .as_ref()
+        .map(Service::exited)
+        .transpose()?
+        .is_some_and(|exited| !exited);
+    println!("SF_RETEST_ALIVE_AFTER_LOOKUPS={alive}");
+    if let Some(mut service) = service.take() {
+        service.stop()?;
+    }
+    if alive {
+        Ok(())
+    } else {
+        Err(io::Error::other("Guest SurfaceFlinger exited before observation completed"))
     }
 }
 
@@ -1156,6 +1240,9 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
         }
         println!("GUEST_SERVICEMANAGER_READINESS=PASS property=servicemanager.ready:true context_manager=Guest_handle_0 service_lookup=aidl_lazy_test_1 private_binder={major}:{minor}");
         println!("PHASE5B=PASS shell=PASS private_aidl=PASS properties=PASS host_control_socket=ABSENT private_binder={major}:{minor}");
+        if std::env::var("SSAL_Y702_SURFACEFLINGER_RETEST").as_deref() == Ok("1") {
+            retest_surfaceflinger(root, guest_binder)?;
+        }
         let mut apexservice = if apex_enabled {
             let apex = &crate::guest::init::binder_service::APEX;
             if let Some(queue) = &mut boot {
@@ -1844,6 +1931,7 @@ mod tests {
         for (executable, domain) in [
             ("/system/bin/app_process64", "zygote"),
             ("/system/bin/servicemanager", "servicemanager"),
+            ("/system/bin/surfaceflinger", "surfaceflinger"),
             ("/run/ssal/ssal-apexservice", "apexd"),
             ("/run/ssal/ssal-system-suspend", "system_suspend"),
             ("/system/bin/sh", "shell"),

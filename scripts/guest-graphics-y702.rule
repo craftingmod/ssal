@@ -1,0 +1,5 @@
+# Y702 p0001 graphics probe. Apply only after the Guest domain exists.
+allow ssal_p0001_shell vendor_file dir { search getattr }
+allow ssal_p0001_shell vendor_hal_file dir { search getattr }
+allow ssal_p0001_shell same_process_hal_file dir { search getattr }
+allow ssal_p0001_shell same_process_hal_file file { read open }

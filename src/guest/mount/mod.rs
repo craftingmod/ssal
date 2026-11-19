@@ -115,6 +115,24 @@ pub(super) fn verify(
     );
     let installd_probe =
         mode == "--guest-zygote-7a-worker" && crate::guest::launcher::installd_probe_requested();
+    let surfaceflinger_retest =
+        std::env::var("SSAL_Y702_SURFACEFLINGER_RETEST").as_deref() == Ok("1");
+    if surfaceflinger_retest && mode != "--guest-service-worker" {
+        return Err(io::Error::other(
+            "Y702 SurfaceFlinger retest requires --guest-service-worker",
+        ));
+    }
+    if surfaceflinger_retest && !crate::guest::concurrent::graphics::requested() {
+        return Err(io::Error::other(
+            "Y702 SurfaceFlinger retest requires SSAL_Y702_GRAPHICS=1",
+        ));
+    }
+    let y702_graphics =
+        (mode == "--shell-worker" && crate::guest::concurrent::graphics::requested())
+            || surfaceflinger_retest;
+    if y702_graphics {
+        crate::guest::concurrent::graphics::require_y702()?;
+    }
     let shell_applied_policy_only = mode == "--shell-worker"
         && std::env::var("SSAL_SHELL_APPLIED_POLICY_ONLY").as_deref() == Ok("1");
     let policy = if installd_probe || shell_applied_policy_only {
@@ -205,7 +223,7 @@ pub(super) fn verify(
                 ));
             }
         }
-        devices::prepare_guest_dev(&mut mounts, &root)?;
+        devices::prepare_guest_dev(&mut mounts, &root, y702_graphics)?;
         if let Some(plan) = &policy {
             if mapped_launch {
                 devices::prepare_guest_ashmem(&root, plan)?;
@@ -448,6 +466,15 @@ pub(super) fn verify(
             }
         }
         seal_system(&root)?;
+        if y702_graphics {
+            let plan = policy
+                .as_ref()
+                .ok_or_else(|| io::Error::other("Y702 graphics requires a Guest SELinux plan"))?;
+            crate::guest::concurrent::graphics::apply_vendor_access(
+                plan,
+                shell_applied_policy_only,
+            )?;
+        }
         if mode == "--shell-worker" {
             return crate::guest::shell::standalone(
                 &mut mounts,

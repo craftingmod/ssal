@@ -13,7 +13,7 @@ pub mod native;
 pub mod runtime;
 mod symbols;
 
-const VERSION: u32 = 34;
+const VERSION: u32 = 35;
 
 type Names = BTreeMap<String, String>;
 
@@ -1128,7 +1128,7 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
             plan.rules.insert(rule);
         }
     }
-    // Launcher stdio stays KSU-owned across exec and SystemServer specialization.
+    // Guest processes are execed by KSU and retain KSU-owned inherited FDs.
     if let Some(shell) = plan.types.get("shell") {
         // mksh queries inherited stdin pipes before reading beyond the first line.
         for permission in ["read", "getattr", "ioctl"] {
@@ -1155,6 +1155,7 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
         "zygote",
         "system_server_startup",
         "system_server",
+        "surfaceflinger",
     ] {
         if let Some(domain) = plan.types.get(original) {
             for (class, permission) in [("fd", "use"), ("fifo_file", "write")] {
@@ -1595,6 +1596,10 @@ mod tests {
             .get_mut("system/etc/selinux/plat_sepolicy.cil")
             .unwrap()
             .push_str(" (type init) (type shell) (type derive_classpath) (type linkerconfig) (type servicemanager) (type aidl_lazy_test_server) (type apexd) (type properties_device) (type system_server_startup)");
+        inputs
+            .get_mut("system/etc/selinux/plat_sepolicy.cil")
+            .unwrap()
+            .push_str(" (type surfaceflinger)");
         let plan = generate("p0001", &inputs)?;
         let rules: Vec<_> = plan
             .rules
@@ -1602,7 +1607,7 @@ mod tests {
             .filter(|r| r.contains(" ksu "))
             .cloned()
             .collect();
-        assert_eq!(rules.len(), 23);
+        assert_eq!(rules.len(), 25);
         assert!(rules.contains(&"allow ssal_p0001_shell ksu fifo_file { read }".to_owned()));
         for permission in ["getattr", "ioctl"] {
             let rule = format!("allow ssal_p0001_shell ksu fifo_file {{ {permission} }}");
@@ -1629,6 +1634,7 @@ mod tests {
             "zygote",
             "system_server_startup",
             "system_server",
+            "surfaceflinger",
         ] {
             for (class, permission) in [("fd", "use"), ("fifo_file", "write")] {
                 let rule = format!("allow ssal_p0001_{source} ksu {class} {{ {permission} }}");
