@@ -36,7 +36,12 @@ fn peer_root(s: &UnixStream) -> io::Result<bool> {
     }
     Ok(cred.uid == 0)
 }
-fn handle(mut stream: UnixStream, root: PathBuf, busy: Arc<Mutex<bool>>) -> io::Result<()> {
+fn handle(
+    mut stream: UnixStream,
+    root: PathBuf,
+    busy: Arc<Mutex<bool>>,
+    relay: super::presenter_relay::RelayHandle,
+) -> io::Result<()> {
     stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
     if !peer_root(&stream)? {
         return reply(&mut stream, false, "root peer required");
@@ -80,6 +85,18 @@ fn handle(mut stream: UnixStream, root: PathBuf, busy: Arc<Mutex<bool>>) -> io::
             std::process::exit(0);
         }
         "logs" => reply(&mut stream, true, fs::read_to_string(root.join("logs/ssald.log")).unwrap_or_default()),
+        "allow" => {
+            let Some(pkg) = req.profile_name.as_deref() else {
+                return reply(&mut stream, false, "package name required");
+            };
+            match super::presenter_relay::allow_package(&root, pkg, &relay) {
+                Ok(message) => {
+                    log(&root, &message);
+                    reply(&mut stream, true, message)
+                }
+                Err(e) => reply(&mut stream, false, format!("allow failed: {e}")),
+            }
+        }
         "switch" if !req.image_name.as_deref().is_some_and(valid_image_name) => reply(&mut stream, false, "invalid image name"),
         "switch" | "return" => reply(&mut stream, false, crate::service_contract::blocked_summary()?),
         "create" => {
@@ -285,14 +302,16 @@ pub(crate) fn run() -> io::Result<()> {
     let listener = UnixListener::bind(&socket)?;
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
     let busy = Arc::new(Mutex::new(false));
+    let relay = super::presenter_relay::start(&root);
     log(&root, "ssald started");
     for stream in listener.incoming() {
         match stream {
             Ok(s) => {
                 let r = root.clone();
                 let b = busy.clone();
+                let rel = relay.clone();
                 std::thread::spawn(move || {
-                    if let Err(e) = handle(s, r.clone(), b) {
+                    if let Err(e) = handle(s, r.clone(), b, rel) {
                         log(&r, &format!("request error: {e}"));
                     }
                 });

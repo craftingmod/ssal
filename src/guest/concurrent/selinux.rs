@@ -124,6 +124,7 @@ pub(super) fn add_health_rules(
             &["read", "open", "getattr"],
         ),
         ("properties_device", "dir", &["search", "getattr"]),
+        ("device", "dir", &["search"]),
         ("build_prop", "file", &["read", "open", "getattr", "map"]),
         ("property_info", "file", &["read", "open", "getattr", "map"]),
         (

@@ -27,7 +27,11 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
     private val destination = Rect()
     private var resumed = false
     private var surfaceReady = false
+    private var surfaceWidth = 0
+    private var surfaceHeight = 0
     private var inbox: File? = null
+    private var presenterSocket: String? = null
+    private var nativePresenter: NativePresenter? = null
     private var receiver: HandlerThread? = null
     private var observer: FileObserver? = null
     private var hasFrame = true
@@ -49,6 +53,12 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
         ) {
             inbox = File(cacheDir, "ssal-frame-$session")
             hasFrame = false
+        } else {
+            val socketExtra = intent.getStringExtra("presenter_socket")
+            if (socketExtra != "none") {
+                presenterSocket = socketExtra?.takeIf { it.isNotEmpty() }
+                    ?: File(cacheDir, "ssal-presenter.sock").absolutePath
+            }
         }
     }
 
@@ -56,11 +66,21 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
         super.onResume()
         resumed = true
         inbox?.let(::watchFrames)
+        presenterSocket?.let { addr ->
+            if (nativePresenter == null) {
+                nativePresenter = NativePresenter(addr)
+                if (surfaceReady && surfaceHolder.surface.isValid) {
+                    nativePresenter?.setSurface(surfaceHolder.surface, surfaceWidth, surfaceHeight)
+                }
+            }
+        }
         present()
     }
 
     override fun onPause() {
         resumed = false
+        nativePresenter?.close()
+        nativePresenter = null
         observer?.stopWatching()
         observer = null
         receiver?.quitSafely()
@@ -81,13 +101,21 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
     }
 
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
+        surfaceWidth = width
+        surfaceHeight = height
         surfaceReady = width > 0 && height > 0
         Log.i("SsalPresenter", "Surface changed: ${width}x${height}")
+        if (surfaceReady) {
+            nativePresenter?.setSurface(holder.surface, width, height)
+        }
         present()
     }
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
         surfaceReady = false
+        surfaceWidth = 0
+        surfaceHeight = 0
+        nativePresenter?.setSurface(null, 0, 0)
         Log.i("SsalPresenter", "Surface destroyed")
     }
 

@@ -1,6 +1,8 @@
 #![allow(non_snake_case, dead_code, unused_imports)]
 rsbinder::include_aidl!("composer3");
 
+mod presenter;
+
 use android::hardware::common::NativeHandle::NativeHandle;
 use android::hardware::graphics::common::{
     Dataspace::Dataspace, DisplayDecorationSupport::DisplayDecorationSupport, Hdr::Hdr,
@@ -46,7 +48,7 @@ use android::hardware::graphics::composer3::{
 use rsbinder::{BinderResult, Interface, ParcelFileDescriptor, Status, Strong};
 use ssal_binder_service::Result;
 use std::collections::BTreeMap;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Condvar, Mutex,
@@ -109,6 +111,9 @@ struct DisplayState {
     color_mode: ColorMode,
     client_target_slot_count: i32,
     present_count: u64,
+    current_slot: Option<i32>,
+    current_dataspace: i32,
+    current_acquire_fence: Option<OwnedFd>,
 }
 
 impl Default for DisplayState {
@@ -120,6 +125,9 @@ impl Default for DisplayState {
             color_mode: ColorMode::NATIVE,
             client_target_slot_count: 3,
             present_count: 0,
+            current_slot: None,
+            current_dataspace: 0,
+            current_acquire_fence: None,
         }
     }
 }
@@ -128,10 +136,11 @@ struct VirtualComposerClient {
     state: Mutex<DisplayState>,
     vsync: Arc<(Mutex<VsyncState>, Condvar)>,
     vsync_thread_started: AtomicBool,
+    presenter: Arc<presenter::PresenterBridge>,
 }
 
 impl VirtualComposerClient {
-    fn new() -> Self {
+    fn new(presenter: Arc<presenter::PresenterBridge>) -> Self {
         Self {
             state: Mutex::new(DisplayState::default()),
             vsync: Arc::new((
@@ -143,6 +152,7 @@ impl VirtualComposerClient {
                 Condvar::new(),
             )),
             vsync_thread_started: AtomicBool::new(false),
+            presenter,
         }
     }
 
@@ -255,7 +265,26 @@ impl IComposerClient for VirtualComposerClient {
             }
 
             if let Some(client_target) = &cmd.r#clientTarget {
-                wait_sync_fence(&client_target.r#buffer.r#fence);
+                let slot = client_target.r#buffer.r#slot;
+                state.current_slot = Some(slot);
+                state.current_dataspace = client_target.r#dataspace.0;
+                if let Some(handle) = &client_target.r#buffer.r#handle {
+                    let fds: Vec<OwnedFd> = handle
+                        .r#fds
+                        .iter()
+                        .filter_map(|pfd| presenter::dup_fd(pfd.as_raw_fd()))
+                        .collect();
+                    self.presenter
+                        .cache_handle(slot, fds, handle.r#ints.clone());
+                }
+                state.current_acquire_fence = client_target
+                    .r#buffer
+                    .r#fence
+                    .as_ref()
+                    .and_then(|pfd| presenter::dup_fd(pfd.as_raw_fd()));
+                if !self.presenter.has_peer() {
+                    wait_sync_fence(&client_target.r#buffer.r#fence);
+                }
             }
 
             if cmd.r#validateDisplay || cmd.r#presentOrValidateDisplay {
@@ -295,12 +324,26 @@ impl IComposerClient for VirtualComposerClient {
             if cmd.r#presentDisplay {
                 state.present_count += 1;
                 let count = state.present_count;
+                let fence = state.current_acquire_fence.take();
+                let presented = if let Some(slot) = state.current_slot {
+                    self.presenter.present_slot(
+                        slot,
+                        WIDTH as u32,
+                        HEIGHT as u32,
+                        1, // AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM
+                        state.current_dataspace,
+                        fence,
+                    )
+                } else {
+                    false
+                };
                 if count <= 5 || count % 60 == 0 {
                     println!(
-                        "virtual_composer_present display={} frame={} layers={}",
+                        "virtual_composer_present display={} frame={} layers={} presenter={}",
                         DISPLAY_ID,
                         count,
-                        state.layers.len()
+                        state.layers.len(),
+                        presented
                     );
                 }
                 results.push(CommandResultPayload::r#PresentFence(PresentFence {
@@ -617,6 +660,7 @@ impl IComposerClient for VirtualComposerClient {
 
 struct VirtualComposer {
     clients_created: AtomicU64,
+    presenter: Arc<presenter::PresenterBridge>,
 }
 
 impl Interface for VirtualComposer {}
@@ -625,7 +669,9 @@ impl IComposer for VirtualComposer {
     fn r#createClient(&self) -> BinderResult<Strong<dyn IComposerClient>> {
         let count = self.clients_created.fetch_add(1, Ordering::AcqRel) + 1;
         println!("virtual_composer_create_client count={count}");
-        Ok(BnComposerClient::new_binder(VirtualComposerClient::new()))
+        Ok(BnComposerClient::new_binder(VirtualComposerClient::new(
+            Arc::clone(&self.presenter),
+        )))
     }
 
     fn r#getCapabilities(&self) -> BinderResult<Vec<Capability>> {
@@ -651,8 +697,10 @@ fn main() -> Result<()> {
             return Err("usage: ssal-virtual-composer serve <binder_rdev> [hwbinder_rdev|none] <context>".into());
         }
     }
+    let presenter = Arc::new(presenter::PresenterBridge::start_from_env());
     let service = BnComposer::new_binder(VirtualComposer {
         clients_created: AtomicU64::new(0),
+        presenter,
     });
     ssal_binder_service::register(HAL_SERVICE, service)?;
     ssal_binder_service::join()

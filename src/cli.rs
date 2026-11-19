@@ -24,6 +24,11 @@ const COMMANDS: &[(&str, &str, &str)] = &[
         "Copy and register a raw ext4 system image",
     ),
     (
+        "allow",
+        "PACKAGE_NAME",
+        "Allow a Host package UID for presenter socket access",
+    ),
+    (
         "create",
         "IMAGE_NAME [PROFILE_NAME]",
         "Create a profile with independent userdata",
@@ -214,12 +219,28 @@ pub fn parse(args: &[String]) -> Result<Action, String> {
             }
         ));
     }
-    for name in operands
-        .iter()
-        .take(if *command == "add" { 1 } else { operands.len() })
-    {
-        if !valid_image_name(name) {
-            return Err(format!("{command}: invalid name '{name}' (expected 1-64 ASCII letters, digits, '_' or '-')"));
+    if *command == "allow" {
+        let name = &operands[0];
+        if name.is_empty()
+            || name.len() > 128
+            || !name.contains('.')
+            || name.starts_with('.')
+            || name.ends_with('.')
+            || name.contains("..")
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b'-')
+        {
+            return Err(format!("allow: invalid package name '{name}'"));
+        }
+    } else {
+        for name in operands
+            .iter()
+            .take(if *command == "add" { 1 } else { operands.len() })
+        {
+            if !valid_image_name(name) {
+                return Err(format!("{command}: invalid name '{name}' (expected 1-64 ASCII letters, digits, '_' or '-')"));
+            }
         }
     }
     let mut request = Request {
@@ -355,6 +376,7 @@ mod tests {
         {
             let args = match *command {
                 "add" => vec![*command, "image", "/tmp/image.img"],
+                "allow" => vec![*command, "alyac.android.ssalsurface"],
                 "create" | "switch" => vec![*command, "image"],
                 "status" | "logs" | "return" | "stop-for-restart" => vec![*command],
                 _ => vec![*command, "profile1"],

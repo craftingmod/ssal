@@ -5,6 +5,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 mod images;
+mod presenter_relay;
 mod profiles;
 mod session;
 

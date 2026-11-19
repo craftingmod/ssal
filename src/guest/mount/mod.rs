@@ -235,6 +235,17 @@ pub(super) fn verify(
             if mapped_launch || hwbinder {
                 devices::prepare_guest_ashmem(&root, plan)?;
             }
+            let dev = root.join("dev");
+            let dev_expected = plan.context("device", false)?;
+            ssal::guest_policy::runtime::set_label(&dev, &dev_expected)
+                .map_err(|error| io::Error::other(format!("label Guest /dev: {error}")))?;
+            let dev_actual = ssal::unix::image_context(&File::open(&dev)?)?;
+            if dev_actual != dev_expected {
+                return Err(io::Error::other(format!(
+                    "Guest /dev label mismatch: expected {dev_expected}, got {dev_actual}"
+                )));
+            }
+            println!("Guest /dev label verified as {dev_actual}");
             let socket = root.join("dev/socket");
             let expected = plan.context("socket_device", false)?;
             ssal::guest_policy::runtime::set_label(&socket, &expected)

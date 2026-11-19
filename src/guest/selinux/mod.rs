@@ -13,7 +13,7 @@ pub mod native;
 pub mod runtime;
 mod symbols;
 
-const VERSION: u32 = 46;
+const VERSION: u32 = 48;
 
 type Names = BTreeMap<String, String>;
 
@@ -1328,6 +1328,17 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
             1,
             1,
             &[init, directory, "file", "relabelfrom"],
+        );
+        plan.rules.insert(rule);
+    }
+    if let (Some(init), Some(device)) = (plan.types.get("init"), plan.types.get("device")) {
+        let rule = format!("allow {init} {device} dir {{ relabelfrom }}");
+        native::record(
+            &mut native_rules,
+            rule.clone(),
+            1,
+            1,
+            &[init, device, "dir", "relabelfrom"],
         );
         plan.rules.insert(rule);
     }
