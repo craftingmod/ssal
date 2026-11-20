@@ -60,7 +60,7 @@ USAP pool은 기본 disabled이고 enable 요청을 보내지 않았다. Guest A
 | `native/fork-probe/dev/ssal/probe/ForkProbe.java` | 서비스 접근 없이 proc 진단, ready/completed marker, 최대 10초 대기 후 exit 0 |
 | `native/binder-probe/zygote-fd-reopen.c` | Guest 전용 FD 재연결 및 stdio clone 처리, assert self-check |
 | `native/binder-probe/zygote-diagnostics.c` | 실제 open/readlink 및 setcontext/getcon/context 질의 반환값 계측 |
-| `scripts/build-fork-probe.ps1`, `scripts/build-guest-launcher.sh` | javac/D8 및 Android native adapter 빌드 |
+| `scripts/build-rust/build-fork-probe.ps1`, `scripts/build-guest-launcher.sh` | javac/D8 및 Android native adapter 빌드 |
 
 1. **FD 경로/allowlist:** 최초에는 `/dev/ssal-common-launcher/.../system/framework/telephony-common.jar`가 native allowlist에 거부됐다. Guest Zygote만 기존 `pivot_root` 경로로 옮겼다. Android root mount가 64층으로 겹쳐 있어 기존 단일 detach 후 rmdir가 EBUSY였고, private child namespace에서 mountinfo에 기록된 층을 모두 detach하도록 수정했다. `old_root_layers_detached=64 old_root_absent=true`를 기록한 뒤 실행한다.
 2. **Preload 후 FD:** 직접 Guest 경로에서 연 FD는 정상이나 남아 있는 FD 일부는 `/framework/...`, `/javalib/...`, `/`로 관측됐다. Native adapter가 알려진 Guest JAR/resource/device와 **dev/inode, read-only 상태, device ID**를 비교한 뒤 같은 파일을 Guest 경로로 다시 연다. FD 번호·offset·descriptor flags를 유지한다. `readlink` 결과를 위조하거나 stock allowlist를 확장하지 않는다. 정확히 어느 upstream 코드가 해당 mount ancestry의 FD를 남기는지는 미해결이다.
@@ -96,7 +96,7 @@ WSLc는 저장소 규칙대로 sandbox 밖에서 실행했다.
 - FD adapter의 `cc -Wall -Wextra -Werror -DSSAL_FD_TEST ...` assert self-check 통과: 다른 inode·writable FD 거부, read offset/FD_CLOEXEC 보존, stdio clone 분리 후 원래 pipe 유지.
 - `python3 scripts/test-zygote-diagnostics.py`: SIGABRT/SIGSEGV marker 및 fatal semantics 회귀 통과. [최종 로그](../out/phase7fb/final-native-tests.log).
 - `scripts/build-guest-launcher.sh`: Android AArch64 release 빌드 성공. 기존 memory-probe unused 경고 10개가 남는다. [최종 로그](../out/phase7fb/final-android-build.log).
-- `scripts/build-fork-probe.ps1`: javac `--release 8`, SDK D8 `--min-api 30`, `classes.dex` 포함 JAR 생성 성공. Java 8 target obsolete 경고가 있었다. JAR SHA-256 `6f2a34f4b5ac846fe78afeac0cf09e8aa2fd37481344cdc078f9a5c4f3c3ba77`.
+- `scripts/build-rust/build-fork-probe.ps1`: javac `--release 8`, SDK D8 `--min-api 30`, `classes.dex` 포함 JAR 생성 성공. Java 8 target obsolete 경고가 있었다. JAR SHA-256 `6f2a34f4b5ac846fe78afeac0cf09e8aa2fd37481344cdc078f9a5c4f3c3ba77`.
 
 Gate는 기존 `--guest-zygote-7a-worker`에 `SSAL_PHASE7FB_FORK=1`이다. 이 환경변수 없이 기존 readiness 경로를 유지한다. JAR 및 native adapter는 실행 바이너리 옆에 staging해야 한다. 실제 사용한 setup/run/extract 스크립트는 `out/phase7fb/`에 남겼다.
 

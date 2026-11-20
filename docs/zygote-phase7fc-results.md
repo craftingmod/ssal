@@ -66,7 +66,7 @@ Zygote의 UID 0 상태에서 SELinuxFS `context` endpoint가 retained Guest SID�
 - `scripts/build-guest-launcher.sh`: Android arm64 build **PASS**.
 - `cargo test --locked --bin ssald`: **50 passed, 0 failed, 4 ignored**.
 - `scripts/test-zygote-diagnostics.py`: fallback gate 및 fatal diagnostics self-check **PASS**.
-- `scripts/build-fork-probe.ps1`: Java 8 + D8 **PASS**, JAR SHA-256 `02718a2f1b2724a4c0c211435e11d33a084dcfe07abae73606163246a977877a`.
+- `scripts/build-rust/build-fork-probe.ps1`: Java 8 + D8 **PASS**, JAR SHA-256 `02718a2f1b2724a4c0c211435e11d33a084dcfe07abae73606163246a977877a`.
 - `bun scripts/package-module.ts`: module ZIP **PASS**, SHA-256 `c70d588638ede4352d0fda64d62ba89ebe11c823f1ce665f5d62e2be21072592`.
 
 **판정:** Phase 7I의 PoC 완료 기준(Java child entrypoint, Property/Binder/data 통합 및 Host 경계 유지)은 충족했다. Guest app-specific SELinux domain 전환과 Guest 전용 production authorization은 보류한다. `system_server`는 이 Phase에서 실행하지 않았다.

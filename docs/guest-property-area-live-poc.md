@@ -186,7 +186,7 @@ AV 조회 결과와 syscall 실패 시 최초 syscall/errno를 보고한다. 이
 - `cargo test --locked`: 51개 통과, Linux capability/root가 필요한 테스트 3개는 ignored.
 - `cargo check --locked --target aarch64-linux-android`: 통과.
 - `bun run build:windows`: 성공. Android AArch64 Rust release와 `out/ssal-module.zip`을 생성했다.
-- `scripts/build-property-area-live-poc.sh`: 빌드 컨테이너의 Android NDK로 성공. Android API 29, 고정된 Android 16 r2 Bionic 소스를 사용했다. ELF는 AArch64 static executable이며 `PT_INTERP`와 동적 `NEEDED` 항목이 없다.
+- `scripts/build-rust/build-property-area-live-poc.sh`: 빌드 컨테이너의 Android NDK로 성공. Android API 29, 고정된 Android 16 r2 Bionic 소스를 사용했다. ELF는 AArch64 static executable이며 `PT_INTERP`와 동적 `NEEDED` 항목이 없다.
 - 새 Native Helper SHA-256: `0cc7954ee328fa35ecc8527ece611b2153d34c241da61146228bf158072cdd85`.
 - 이번 `--dry-run`은 Linux host target에서 실행했고 `exec=not_run`, `policy=unchanged`를 출력했다. 기기에는 새 바이너리를 올리지 않아 기기 dry-run은 실행하지 않았다.
 - 읽기 전용 SM-S937N 확인: SELinux `Enforcing`, kernel `6.6.127-android15-8-p87b1ce1-abogkiS937NKSSBDZJ2-4k`; adb shell의 현재 context는 `u:r:ksu:s0`이고 `/proc/thread-self/attr/current` 및 `/proc/thread-self` 조회가 성공했다. 이는 KSU self 경로만 확인하며 Guest 권한이나 Guest EACCES 원인을 증명하지 않는다. `/data/local/tmp`에는 새 런처/헬퍼가 없었다.
@@ -231,7 +231,7 @@ Proc-Only 경로는 Property Area Live와 독립적이다.
 - `cargo fmt --all -- --check`: 통과.
 - `cargo test --locked`: 24개 통과 (lib 4, 런처 20).
 - `bun run build:windows`: Android AArch64 release와 모듈 패키징 성공.
-- `scripts/build-property-area-live-poc.sh`: AArch64 static helper 성공. `PT_INTERP`와 동적 `NEEDED` 항목이 없는지 빌드 스크립트가 확인했다.
+- `scripts/build-rust/build-property-area-live-poc.sh`: AArch64 static helper 성공. `PT_INTERP`와 동적 `NEEDED` 항목이 없는지 빌드 스크립트가 확인했다.
 - 로컬 `cargo run --locked --bin ssal-guest-domain-poc -- --dry-run`: `exec=not_run`, `policy=unchanged`.
 - 현재 런처 SHA-256: `52f971a73919a0a4895e0b9a8b53d759e49c4abe22f4381d2c7c9a05f857602a`.
 - 현재 Helper SHA-256: `f19b8b416c30060f0f058418503365a1ac09fe7befeefe0167ef9b642d97ff08`.

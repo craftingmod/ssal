@@ -9,7 +9,9 @@ import android.os.Bundle
 import android.os.FileObserver
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.SystemClock
 import android.util.Log
+import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import androidx.activity.enableEdgeToEdge
@@ -50,13 +52,21 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
     private var receiver: HandlerThread? = null
     private var observer: FileObserver? = null
     private var hasFrame = false
+    private val touchIds = IntArray(10)
+    private val touchXs = FloatArray(10)
+    private val touchYs = FloatArray(10)
+    private val touchPressures = FloatArray(10)
+    private var activeTouch = false
+    private var lastTouchDownTime = 0L
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         setContentView(R.layout.activity_main)
         hideSystemBars()
-        surfaceHolder = findViewById<SurfaceView>(R.id.presenter_surface).holder
+        val surfaceView = findViewById<SurfaceView>(R.id.presenter_surface)
+        surfaceView.setOnTouchListener { _, event -> handleTouch(event) }
+        surfaceHolder = surfaceView.holder
         surfaceHolder.addCallback(this)
         val session = intent.getStringExtra("presenter_session")
         if (applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0 &&
@@ -105,6 +115,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
     }
 
     override fun onPause() {
+        cancelActiveTouch()
         resumed = false
         val closing = nativePresenter
         nativePresenter = null
@@ -143,6 +154,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
     }
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
+        cancelActiveTouch()
         surfaceReady = false
         surfaceWidth = 0
         surfaceHeight = 0
@@ -209,5 +221,49 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
             val source = if (inbox == null) "local" else "bridge"
             Log.i("SsalPresenter", "Posted $source 4x4 frame")
         }
+    }
+
+    private fun handleTouch(event: MotionEvent): Boolean {
+        val presenter = nativePresenter ?: return false
+        if (!resumed || !surfaceReady) return false
+        val count = event.pointerCount.coerceAtMost(touchIds.size)
+        if (count <= 0) return false
+        for (i in 0 until count) {
+            touchIds[i] = event.getPointerId(i)
+            touchXs[i] = event.getX(i)
+            touchYs[i] = event.getY(i)
+            touchPressures[i] = event.getPressure(i)
+        }
+        val masked = event.actionMasked
+        activeTouch = masked != MotionEvent.ACTION_UP && masked != MotionEvent.ACTION_CANCEL
+        lastTouchDownTime = event.downTime
+        presenter.sendTouch(
+            event.action,
+            count,
+            event.downTime,
+            event.eventTime,
+            touchIds,
+            touchXs,
+            touchYs,
+            touchPressures,
+        )
+        return true
+    }
+
+    private fun cancelActiveTouch() {
+        if (!activeTouch) return
+        activeTouch = false
+        val presenter = nativePresenter ?: return
+        val now = SystemClock.uptimeMillis()
+        presenter.sendTouch(
+            MotionEvent.ACTION_CANCEL,
+            1,
+            lastTouchDownTime,
+            now,
+            touchIds,
+            touchXs,
+            touchYs,
+            touchPressures,
+        )
     }
 }

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 if [[ $# != 1 ]]; then
-    echo 'Usage: bash scripts/build-hwbinder-probe.sh GUEST_ANDROID16_LIB_DIR' >&2
+    echo 'Usage: bash scripts/build-rust/build-hwbinder-probe.sh GUEST_ANDROID16_LIB_DIR' >&2
     exit 2
 fi
 ssal_guest_libs=$(realpath "$1")
@@ -27,6 +27,7 @@ fetch_headers() {
 fetch_headers system/libhidl base/include
 fetch_headers system/libhidl transport/include
 fetch_headers system/libhwbinder include
+fetch_headers system/libfmq base
 fetch_headers system/core libutils/include
 fetch_headers system/core libcutils/include
 fetch_headers system/core libsystem/include

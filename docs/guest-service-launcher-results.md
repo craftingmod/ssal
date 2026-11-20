@@ -170,11 +170,11 @@ Host 전후 snapshot은 다음을 포함하며 byte-identical이었다: system/v
 2. [r2 로그](phase5b-processgroup-device-run-r2.log): `createProcessGroup(1000,3257,false)=0`, errno 2, controller `/sys/fs/cgroup`. 이후 helper의 libc++ ABI 2 문자열 처리에서 SIGSEGV가 났고 profile 호출에는 도달하지 못했다. 해당 Guest libc++의 ABI 1/namespace `__1`로 수정했다. child의 자체 종료를 확인하고 빈 `/apps/ssal_guest/system/uid_1000/pid_3257` 및 세션 전용 부모만 rmdir했다. signal/reboot/Host cgroup 수정은 하지 않았다. 이 실패 시 worker는 남은 Guest 자원을 성공으로 숨기지 않고 정리 실패를 보고했다.
 3. [r3 최종 로그](phase5b-processgroup-device-run-r3.log): 위 전체 호출·membership·정리·Host 전후 비교 PASS, worker exit 0. 새 helper 재빌드 후에도 SHA-256은 같은 값이다.
 
-빌드/테스트: sandbox 밖 `wslc`에서 Android AArch64 release 빌드, `scripts/build-processgroup-probe.sh`, `cargo fmt --check`, `cargo test --locked` 통과(80 PASS, 특권 테스트 3 ignored). 새 단위 테스트는 memory action 제거 시 기존 profile/aggregate 보존과 Host 경로·traversal 거부를 검증한다. helper의 런타임 self-check는 반환값만 보지 않고 실제 child membership과 정상 종료·정리를 확인한다.
+빌드/테스트: sandbox 밖 `wslc`에서 Android AArch64 release 빌드, `scripts/build-rust/build-processgroup-probe.sh`, `cargo fmt --check`, `cargo test --locked` 통과(80 PASS, 특권 테스트 3 ignored). 새 단위 테스트는 memory action 제거 시 기존 profile/aggregate 보존과 Host 경로·traversal 거부를 검증한다. helper의 런타임 self-check는 반환값만 보지 않고 실제 child membership과 정상 종료·정리를 확인한다.
 
 최종 SHA-256: ssald `7a8e43bcc544d86d046d257eec8783fbe1c236e5b49f012f0362c6e06d3a241e`, helper `edd927f42b18d24e39b5a35b521fcc0a2b90f093b7f245bebc6f5ca23eb0b402`, 원본 Guest libprocessgroup `f658b27758c992515c375cb406f718d62613567bb58ec36a15aad179292415ee`.
 
-재현: `bash scripts/build-processgroup-probe.sh`로 기본 LineageOS 23.2 이미지에서 링크용 원본 라이브러리를 읽기 전용 추출하고 helper를 빌드한다. 기기에서는 새 session 디렉터리의 `system`, `data`를 준비한 뒤 다음과 같이 호출한다.
+재현: `bash scripts/build-rust/build-processgroup-probe.sh`로 기본 LineageOS 23.2 이미지에서 링크용 원본 라이브러리를 읽기 전용 추출하고 helper를 빌드한다. 기기에서는 새 session 디렉터리의 `system`, `data`를 준비한 뒤 다음과 같이 호출한다.
 
 ```sh
 SSAL_PROCESSGROUP_PROBE=/data/local/tmp/ssal-phase5b-processgroup-probe \

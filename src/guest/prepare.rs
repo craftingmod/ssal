@@ -6,6 +6,42 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
+const BOOT_BINARIES: &[&str] = &[
+    "ssal-property-service",
+    "ssal-apexservice",
+    "ssal-system-suspend",
+    "ssal-health",
+    "ssal-gatekeeper",
+    "ssal-keymint",
+    "ssal-virtual-composer",
+    "ssal-lmkd",
+    "ssal-vold",
+    "ssal-netd",
+    "ssal-virtual-audio",
+    "ssal-audio-host",
+];
+
+pub(crate) fn check_boot_binaries(bin: &Path) -> io::Result<()> {
+    let unavailable: Vec<_> = BOOT_BINARIES
+        .iter()
+        .filter(|name| {
+            fs::metadata(bin.join(name)).map_or(true, |meta| {
+                !meta.is_file() || meta.mode() & 0o111 == 0
+            })
+        })
+        .copied()
+        .collect();
+    if unavailable.is_empty() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "required Guest boot binaries missing or not executable in {}: {}; rebuild and reinstall the module",
+            bin.display(),
+            unavailable.join(", ")
+        )))
+    }
+}
+
 #[derive(Debug)]
 pub struct CheckedProfile {
     pub system: PathBuf,
@@ -383,6 +419,31 @@ pub(crate) fn worker_admitted(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn boot_binaries_require_executable_files() -> io::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let bin =
+            std::env::temp_dir().join(format!("ssal-boot-binaries-{}", std::process::id()));
+        fs::create_dir(&bin)?;
+        let error = check_boot_binaries(&bin).unwrap_err().to_string();
+        for name in BOOT_BINARIES {
+            assert!(error.contains(name));
+            fs::write(bin.join(name), b"test")?;
+            fs::set_permissions(bin.join(name), fs::Permissions::from_mode(0o755))?;
+        }
+        check_boot_binaries(&bin)?;
+        let lmkd = bin.join("ssal-lmkd");
+        fs::set_permissions(&lmkd, fs::Permissions::from_mode(0o644))?;
+        assert!(check_boot_binaries(&bin)
+            .unwrap_err()
+            .to_string()
+            .contains("ssal-lmkd"));
+        fs::remove_file(&lmkd)?;
+        fs::create_dir(&lmkd)?;
+        assert!(check_boot_binaries(&bin).is_err());
+        fs::remove_dir_all(bin)
+    }
 
     #[test]
     fn checks_profile_and_rejects_modified_image() -> io::Result<()> {

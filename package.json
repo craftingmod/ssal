@@ -3,11 +3,16 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "build": "bun run build:src && bun run build:services && bun run build:native && bun run build:web && bun run package",
+    "build:clean": "bun scripts/build-rust/build-android.ts clean",
+    "build:services": "bun scripts/build-rust/build-android.ts services",
+    "build:src": "bun scripts/build-rust/build-android.ts src",
+    "build:native": "bun scripts/build-rust/build-android.ts native",
     "build:web": "bun scripts/build-web.ts",
     "package": "bun scripts/package-module.ts",
     "setup:windows": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File ./scripts/dev.ps1 setup",
     "update:windows": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File ./scripts/dev.ps1 update",
-    "build:windows": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File ./scripts/dev.ps1 build",
+    "build:windows": "bun run build",
     "selinux:check": "bun scripts/check-selinux.ts",
     "selinux:plan": "bun scripts/plan-selinux.ts",
     "fmt:frontend": "bun fmt"

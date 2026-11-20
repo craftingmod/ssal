@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-cd /src
+cd "$(dirname "$0")/../.."
 # Link to the actual image library; never rebuild or replace libprocessgroup.
 image="${1:-out/LineageOS-23.2-20260524-VANILLA-EXT4-GSI.img}"
 test -s "$image"

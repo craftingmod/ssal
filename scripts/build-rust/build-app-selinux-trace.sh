@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 mkdir -p out/phase8b3d/bin
 cc="${ANDROID_NDK_HOME:-/opt/android-ndk}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android30-clang"
 "$cc" -Wall -Wextra -Werror -Os -shared -fPIC native/binder-probe/app-selinux-trace.c -ldl -o out/phase8b3d/bin/ssal-zygote-selinux-noop.so

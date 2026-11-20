@@ -18,7 +18,7 @@ Y702의 Android 15 Host는 Qualcomm Adreno 730, Gralloc4 HIDL allocator와 QTI M
 WSL에서 NDK로 빌드한다. 기존 Y702 실험 환경의 ADB 셸 UID·GID·SID가 예시와 일치하는지 먼저 확인한다.
 
 ```sh
-ANDROID_NDK_HOME=/path/to/android-ndk bash scripts/build-graphics-buffer-probe.sh
+ANDROID_NDK_HOME=/path/to/android-ndk bash scripts/build-rust/build-graphics-buffer-probe.sh
 adb shell id
 stage=$(adb shell mktemp -d /data/local/tmp/ssal-native-graphics.XXXXXXXX)
 adb push out/bin/ssal-graphics-buffer-probe "$stage/probe"

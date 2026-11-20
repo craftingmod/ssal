@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
-cd /src
+cd "$(dirname "$0")/../.."
 if [[ $# != 1 ]]; then
-    echo 'Usage: bash scripts/build-binder-probe.sh GUEST_ANDROID16_LIB_DIR' >&2
+    echo 'Usage: bash scripts/build-rust/build-binder-probe.sh GUEST_ANDROID16_LIB_DIR' >&2
     exit 2
 fi
 ssal_guest_libs=$(realpath "$1")
-ssal_headers=/src/.cache/android16-binder
+ssal_headers="$PWD/.cache/android16-binder"
 ssal_revision=android-16.0.0_r2
 ssal_ndk=${ANDROID_NDK_HOME:-/opt/android-ndk}
 for library in libbinder.so libutils.so libc++.so; do
@@ -71,7 +71,7 @@ metadata = {
     'phase2_log_source_sha256': hashlib.sha256(pathlib.Path('native/binder-probe/log-to-stderr.c').read_bytes()).hexdigest(),
     'phase2_apk_source_sha256': hashlib.sha256(pathlib.Path('scripts/make-phase2-apk.py').read_bytes()).hexdigest(),
     'artd_aidl_revision': '1690c6912a7972c9e62c39b48c706de9b8b18b4a',
-    'build_script_sha256': hashlib.sha256(pathlib.Path('scripts/build-binder-probe.sh').read_bytes()).hexdigest(),
+    'build_script_sha256': hashlib.sha256(pathlib.Path('scripts/build-rust/build-binder-probe.sh').read_bytes()).hexdigest(),
     'guest_library_sha256': {name: hashlib.sha256((libs / name).read_bytes()).hexdigest()
                              for name in ('libbinder.so', 'libutils.so', 'libc++.so')},
     'abi_scope': 'Android 16 platform C++ ABI; runtime private IPC test still required',

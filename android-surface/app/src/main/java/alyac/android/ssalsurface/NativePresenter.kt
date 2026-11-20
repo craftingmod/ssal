@@ -11,6 +11,31 @@ internal class NativePresenter(socketAddr: String) {
         }
     }
 
+    fun sendTouch(
+        action: Int,
+        pointerCount: Int,
+        downTimeMs: Long,
+        eventTimeMs: Long,
+        ids: IntArray,
+        xs: FloatArray,
+        ys: FloatArray,
+        pressures: FloatArray,
+    ) {
+        if (handle != 0L) {
+            nativeSendTouch(
+                handle,
+                action,
+                pointerCount,
+                downTimeMs,
+                eventTimeMs,
+                ids,
+                xs,
+                ys,
+                pressures,
+            )
+        }
+    }
+
     fun close() {
         if (handle != 0L) {
             nativeDestroy(handle)
@@ -20,6 +45,17 @@ internal class NativePresenter(socketAddr: String) {
 
     private external fun nativeCreate(socketAddr: String): Long
     private external fun nativeSetSurface(handle: Long, surface: Surface?, width: Int, height: Int)
+    private external fun nativeSendTouch(
+        handle: Long,
+        action: Int,
+        pointerCount: Int,
+        downTimeMs: Long,
+        eventTimeMs: Long,
+        ids: IntArray,
+        xs: FloatArray,
+        ys: FloatArray,
+        pressures: FloatArray,
+    )
     private external fun nativeDestroy(handle: Long)
 
     companion object {

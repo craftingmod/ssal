@@ -90,13 +90,25 @@ SystemServer worker는 Zygote 시작 전에 `ssal-health`를 Guest private Binde
 
 ## 빌드
 
-WSLc, Bun과 네트워크가 필요합니다. PowerShell에서 실행합니다.
+Windows에서는 WSLc와 Bun을 사용합니다. PowerShell에서 개발 컨테이너를 준비합니다.
 
 ```powershell
 bun run setup:windows
 ./scripts/dev.ps1 check
-./scripts/dev.ps1 build
+bun run build
 ```
+
+`bun run build:src`는 Rust 본체와 진단 바이너리, `bun run build:services`는 `services/` Cargo workspace, `bun run build:native`는 기존 Android 빌드의 C/C++ 라이브러리와 HwBinder·오디오 helper를 빌드합니다. 결과는 모두 `out/bin/`에 설치합니다. Java probe와 Android Surface 앱은 별도 빌드입니다.
+
+native 빌드에는 Android 16 Guest 시스템의 `lib64`에서 추출한 `libhidlbase.so`, `libutils.so`, `libcutils.so`, `libc++.so`가 필요합니다. `.cache/android16-hwbinder-libs/`에 준비하거나 `SSAL_GUEST_LIB_DIR`로 디렉터리를 지정하세요. Windows에서는 컨테이너 내부 경로(예: `/src/guest-libs`)를 사용합니다. 누락 시 native 빌드와 clean은 산출물을 변경하기 전에 중단합니다. Host One UI 라이브러리는 사용하지 않습니다.
+
+세 명령은 Windows에서 `wslc exec --workdir /src ssal-dev`로 실행하고 Linux에서는 로컬 `bash`로 실행합니다. 일반 WSL로 자동 전환하지 않습니다. Linux에서는 Bun, Cargo, `aarch64-linux-android` Rust target과 Linux x86_64 Android NDK가 필요하며 `ANDROID_NDK_HOME`의 기본값은 `/opt/android-ndk`입니다. 그 외 빌드 의존성은 `containers/builder/Containerfile`을 참고하세요.
+
+`bun run build`는 src → services → native → WebUI → 모듈 패키징 순서로 실행합니다. 기존 `bun run build:windows`와 `./scripts/dev.ps1 build`도 같은 전체 빌드를 실행합니다.
+
+`bun run build:clean`은 Android release 대상의 src/services Cargo 캐시와 세 빌드가 설치하는 바이너리를 지운 뒤 src → services → native를 다시 빌드합니다. 다른 probe·Java 산출물, Guest 이미지·userdata와 다운로드한 헤더는 보존합니다. WebUI와 패키징은 실행하지 않으며, 별도 빌드인 Binder probe의 stale 오류는 해당 helper를 재빌드해야 합니다.
+
+대상별 빌드 진입점과 native C/C++·Java probe 빌드 스크립트는 `scripts/build-rust/`에 있으며, WSLc/Linux 명령 분기는 같은 디렉터리의 `common.ts`에 있는 `buildCommand`를 공유합니다.
 
 개별 Cargo 명령은 실행 중인 개발 컨테이너에서 사용할 수 있습니다.
 

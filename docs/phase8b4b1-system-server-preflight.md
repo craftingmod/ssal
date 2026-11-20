@@ -12,7 +12,7 @@
 - [`system-server-boundary.c`](../native/binder-probe/system-server-boundary.c): Guest chroot 밖의 disposable Host-root canary와 Guest 안의 probe를 같은 UID/GID 1000, groups 없음, stock final SID, capability 0으로 만든다. credential 변경을 final SID 설정보다 먼저 수행한다. 대상은 supervisor가 생성하고 pidfd로 유지하는 canary PID뿐이다. `kill(pid,0)`, `/proc` open 및 ptrace attach를 검사하고, attach 성공 시 detach하도록 구현했다. 실제 Host 서비스는 검사 대상으로 삼지 않는다.
 - [`system_server_preflight.rs`](../src/guest_launcher/system_server_preflight.rs): `SSAL_PHASE8B4B1_ONCE=1`만 허용한다. 7I 경로를 요구하고 8B-3B/3D 진단 및 library overlay와의 혼용을 거부한다. flag를 소비하고 `phase8b4b1/consumed`를 배타적으로 생성한다. 재시도나 실제 system-server launch 옵션은 없다. 직접 소유한 child의 PID/starttime, pidfd open/wait/signal, deadline, reap와 Drop 정리를 담당한다.
 - [`guest_launcher.rs`](../src/guest_launcher.rs): opt-in일 때만 helper들을 Guest에 read-only bind하고 Zygote 시작 전에 진단한다. Gate를 실제 Zygote에 preload하지 않는다. flag가 없을 때 기존 경로와 app fork 요청을 유지한다. Binder/Property/Guest cgroup/mount/loop 정리는 기존 supervisor를 재사용한다.
-- 빌드: [`build-system-server-preflight.sh`](../scripts/build-system-server-preflight.sh). 실행/회귀: [`run-system-server-preflight.sh`](../scripts/run-system-server-preflight.sh). 설치 모듈과 기본 빌드/패키징 경로는 바꾸지 않는다.
+- 빌드: [`build-system-server-preflight.sh`](../scripts/build-rust/build-system-server-preflight.sh). 실행/회귀: [`run-system-server-preflight.sh`](../scripts/run-system-server-preflight.sh). 설치 모듈과 기본 빌드/패키징 경로는 바꾸지 않는다.
 
 **8B-4A 독립 Gate와의 차이:** 이번 library는 setter **진입 시 종료하는 preflight용 구현**이다. 원래 final setter 성공 직후의 binary 제어 흐름에 설치한 Gate가 아니다. 실제 GSI의 hook 누락/오적용에도 Java 진입이 불가능하다는 binary 증거는 아직 없다. 따라서 harness 통과만으로 실제 fork를 허가할 수 없다. 외부 supervisor timeout 역시 `SystemServer.main()` 진입 방지 수단이 될 수 없다.
 
@@ -111,7 +111,7 @@ SSAL_SS_BOUNDARY=FAIL credential_model=uid1000-groups0-caps0-stock_sid
 기존 `ssal-dev` 컨테이너/NDK와 고정 GSI 라이브러리를 사용한다. WSLc는 저장소 규칙에 따라 sandbox 밖에서 실행했다.
 
 ```text
-wslc exec ssal-dev bash -c 'bash scripts/build-system-server-preflight.sh'
+wslc exec ssal-dev bash -c 'bash scripts/build-rust/build-system-server-preflight.sh'
 # 기존 Android build-android.sh 경로로 ssald를 빌드해 out/phase8b4b1/bin에 배치
 # 기존 7I helper들과 신규 bin을 /dev/ssal-phase8b4b1에 staging 후 chmod 755
 adb shell su -c 'sh /dev/ssal-phase8b4b1/run.sh baseline'

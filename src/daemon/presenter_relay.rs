@@ -9,6 +9,9 @@ use std::time::Duration;
 const PRESENTER_ALLOW_FILE: &str = "state/presenter-allow.json";
 const MAX_SCM_FDS: usize = 32;
 const MAX_PAYLOAD_BYTES: usize = 4096;
+const TOUCH_MAGIC_LE: [u8; 4] = 0x53544348u32.to_le_bytes();
+const TOUCH_HEADER_BYTES: usize = 32;
+const MAX_TOUCH_PACKET_BYTES: usize = 512;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AllowedApp {
@@ -21,7 +24,8 @@ pub(crate) struct AllowedApp {
 pub(crate) struct RelayHandle {
     allowlist: Arc<Mutex<Vec<AllowedApp>>>,
     composer_fd: Arc<Mutex<Option<Arc<OwnedFd>>>>,
-    app_fd: Arc<Mutex<Option<OwnedFd>>>,
+    input_fd: Arc<Mutex<Option<Arc<OwnedFd>>>>,
+    app_fd: Arc<Mutex<Option<Arc<OwnedFd>>>>,
 }
 
 pub(crate) fn valid_package_name(name: &str) -> bool {
@@ -122,11 +126,16 @@ pub(crate) fn set_composer_fd(relay: &RelayHandle, fd: OwnedFd) {
     }
 }
 
+pub(crate) fn set_input_fd(relay: &RelayHandle, fd: OwnedFd) {
+    *relay.input_fd.lock().unwrap() = Some(Arc::new(fd));
+}
+
 pub(crate) fn start(root: &Path) -> RelayHandle {
     let initial = load_allowlist(root);
     let handle = RelayHandle {
         allowlist: Arc::new(Mutex::new(initial)),
         composer_fd: Arc::new(Mutex::new(None)),
+        input_fd: Arc::new(Mutex::new(None)),
         app_fd: Arc::new(Mutex::new(None)),
     };
     let connector_handle = handle.clone();
@@ -139,6 +148,11 @@ pub(crate) fn start(root: &Path) -> RelayHandle {
         .name("ssal-presenter-pump".into())
         .spawn(move || composer_pump_loop(pump_handle))
         .expect("spawn presenter composer pump thread");
+    let input_handle = handle.clone();
+    std::thread::Builder::new()
+        .name("ssal-input-pump".into())
+        .spawn(move || input_pump_loop(input_handle))
+        .expect("spawn presenter input pump thread");
     handle
 }
 
@@ -259,7 +273,7 @@ fn app_connector_loop(relay: RelayHandle) {
                 );
                 continue;
             }
-            *relay.app_fd.lock().unwrap() = Some(new_app_fd);
+            *relay.app_fd.lock().unwrap() = Some(Arc::new(new_app_fd));
             if let Some(ref vc_fd) = *relay.composer_fd.lock().unwrap() {
                 send_resync(vc_fd);
             }
@@ -413,16 +427,124 @@ fn composer_pump_loop(relay: RelayHandle) {
             }
 
             let raw_fds: Vec<RawFd> = received_fds.iter().map(AsRawFd::as_raw_fd).collect();
-            let mut app_guard = relay.app_fd.lock().unwrap();
-            if let Some(ref app_fd) = *app_guard {
+            let app_fd = relay.app_fd.lock().unwrap().clone();
+            if let Some(ref app_fd) = app_fd {
                 let send_ok = send_packet(app_fd.as_raw_fd(), &payload[..n as usize], &raw_fds);
                 if !send_ok {
-                    *app_guard = None;
+                    let mut guard = relay.app_fd.lock().unwrap();
+                    if guard.as_ref().is_some_and(|cur| Arc::ptr_eq(cur, app_fd)) {
+                        *guard = None;
+                    }
                     eprintln!("ssald_presenter_relay_app_disconnected");
                 }
             }
-            drop(app_guard);
             drop(received_fds);
+        }
+    }
+}
+
+fn input_pump_loop(relay: RelayHandle) {
+    let mut buf = [0u8; MAX_TOUCH_PACKET_BYTES];
+
+    loop {
+        let Some(app_fd) = relay.app_fd.lock().unwrap().clone() else {
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
+        };
+
+        loop {
+            let mut pfd = libc::pollfd {
+                fd: app_fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let prc = unsafe { libc::poll(&mut pfd, 1, 200) };
+            if prc < 0 {
+                let err = io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                break;
+            }
+            if prc == 0 {
+                let replaced = relay
+                    .app_fd
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_none_or(|cur| !Arc::ptr_eq(cur, &app_fd));
+                if replaced {
+                    break;
+                }
+                continue;
+            }
+            if (pfd.revents & libc::POLLIN) == 0 {
+                if (pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)) != 0 {
+                    let mut guard = relay.app_fd.lock().unwrap();
+                    if guard.as_ref().is_some_and(|cur| Arc::ptr_eq(cur, &app_fd)) {
+                        *guard = None;
+                    }
+                    eprintln!("ssald_presenter_relay_app_disconnected");
+                    break;
+                }
+                continue;
+            }
+
+            let n = unsafe {
+                libc::recv(
+                    app_fd.as_raw_fd(),
+                    buf.as_mut_ptr().cast(),
+                    buf.len(),
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            if n < 0 {
+                let err = io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO);
+                if err == libc::EAGAIN || err == libc::EWOULDBLOCK || err == libc::EINTR {
+                    continue;
+                }
+                let mut guard = relay.app_fd.lock().unwrap();
+                if guard.as_ref().is_some_and(|cur| Arc::ptr_eq(cur, &app_fd)) {
+                    *guard = None;
+                }
+                eprintln!("ssald_presenter_relay_app_disconnected");
+                break;
+            }
+            if n == 0 {
+                let mut guard = relay.app_fd.lock().unwrap();
+                if guard.as_ref().is_some_and(|cur| Arc::ptr_eq(cur, &app_fd)) {
+                    *guard = None;
+                }
+                eprintln!("ssald_presenter_relay_app_disconnected");
+                break;
+            }
+
+            let len = n as usize;
+            if len < TOUCH_HEADER_BYTES || buf[..4] != TOUCH_MAGIC_LE {
+                continue;
+            }
+
+            let input_fd = relay.input_fd.lock().unwrap().clone();
+            if let Some(ref in_fd) = input_fd {
+                let sent = unsafe {
+                    libc::send(
+                        in_fd.as_raw_fd(),
+                        buf.as_ptr().cast(),
+                        len,
+                        libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT,
+                    )
+                };
+                if sent < 0 {
+                    let err = io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO);
+                    if err != libc::EAGAIN && err != libc::EWOULDBLOCK {
+                        let mut guard = relay.input_fd.lock().unwrap();
+                        if guard.as_ref().is_some_and(|cur| Arc::ptr_eq(cur, in_fd)) {
+                            *guard = None;
+                        }
+                        eprintln!("ssald_presenter_relay_input_disconnected");
+                    }
+                }
+            }
         }
     }
 }

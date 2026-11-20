@@ -1,5 +1,5 @@
 $ErrorActionPreference = 'Stop'
-$repo = Split-Path $PSScriptRoot -Parent
+$repo = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 $sdk = if ($env:ANDROID_HOME) { $env:ANDROID_HOME } else { "$env:LOCALAPPDATA/Android/Sdk" }
 $tools = Get-ChildItem "$sdk/build-tools" -Directory | Where-Object { Test-Path "$($_.FullName)/lib/d8.jar" } | Sort-Object Name -Descending | Select-Object -First 1
 if (!$tools) { throw 'Android SDK build-tools/d8.jar missing' }

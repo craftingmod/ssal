@@ -15,7 +15,7 @@ ssal probe-guest-data NEW_PROFILE
 
 프로브는 스스로 `setenforce`하거나 정책을 로드하지 않는다. 실제 시험에서는 EXIT trap으로 Enforcing 복원을 수행했다. 사용한 프로필은 데이터와 소유권이 변경되므로 재시험은 다른 새 프로필로 실행한다. 기존 Host 데이터 복사·migration은 지원하지 않는다.
 
-`scripts/build-binder-probe.sh GUEST_LIB_DIR`가 IPC helper, 재현 가능한 작은 DEX APK, 컴파일 namespace 보조기 및 stderr 로거를 함께 빌드한다. 패키징은 바이너리·소스·fixture 해시를 검사한다. 이 시험의 ART AIDL은 Android 16 QPR2 [고정 소스](https://android.googlesource.com/platform/art/+/1690c6912a7972c9e62c39b48c706de9b8b18b4a/artd/binder/com/android/server/art/IArtd.aidl)를 따른다. 다른 Guest ABI는 다시 확인해야 한다.
+`scripts/build-rust/build-binder-probe.sh GUEST_LIB_DIR`가 IPC helper, 재현 가능한 작은 DEX APK, 컴파일 namespace 보조기 및 stderr 로거를 함께 빌드한다. 패키징은 바이너리·소스·fixture 해시를 검사한다. 이 시험의 ART AIDL은 Android 16 QPR2 [고정 소스](https://android.googlesource.com/platform/art/+/1690c6912a7972c9e62c39b48c706de9b8b18b4a/artd/binder/com/android/server/art/IArtd.aidl)를 따른다. 다른 Guest ABI는 다시 확인해야 한다.
 
 ## 통과 조건
 

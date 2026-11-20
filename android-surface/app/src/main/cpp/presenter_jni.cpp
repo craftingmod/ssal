@@ -13,6 +13,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
@@ -32,10 +33,32 @@ namespace {
 
 constexpr uint32_t kPacketMagic = 0x5353414C; // 'SSAL'
 constexpr uint32_t kPacketVersion = 1;
+constexpr uint32_t kTouchMagic = 0x53544348; // 'STCH'
+constexpr uint32_t kTouchVersion = 1;
+constexpr uint32_t kMaxTouchPointers = 10;
 constexpr size_t kMaxScmFds = 32;
 constexpr size_t kMaxInts = 256;
 constexpr int32_t kCreateFromHandleMethodRegister = 1;
 constexpr int32_t kCreateFromHandleMethodClone = 2;
+
+struct TouchPointer {
+    int32_t id;
+    float x;
+    float y;
+    float pressure;
+};
+
+struct TouchPacketHeader {
+    uint32_t magic;
+    uint32_t version;
+    int32_t action;
+    uint32_t pointer_count;
+    int64_t down_time_ms;
+    int64_t event_time_ms;
+};
+
+static_assert(sizeof(TouchPointer) == 16, "TouchPointer size mismatch");
+static_assert(sizeof(TouchPacketHeader) == 32, "TouchPacketHeader size mismatch");
 
 struct PresenterPacketHeader {
     uint32_t magic;
@@ -164,6 +187,14 @@ struct NativePresenter {
     int32_t surface_width = 0;
     int32_t surface_height = 0;
 
+    std::mutex geom_mutex;
+    uint32_t guest_width = 0;
+    uint32_t guest_height = 0;
+    int32_t dst_x = 0;
+    int32_t dst_y = 0;
+    int32_t dst_w = 0;
+    int32_t dst_h = 0;
+
     uint32_t probed_width = 0;
     uint32_t probed_height = 0;
     uint32_t probed_format = 0;
@@ -217,6 +248,13 @@ struct NativePresenter {
             }
             surface_width = 0;
             surface_height = 0;
+            {
+                std::lock_guard<std::mutex> geom_lock(geom_mutex);
+                dst_x = 0;
+                dst_y = 0;
+                dst_w = 0;
+                dst_h = 0;
+            }
             if (new_window) {
                 ANativeWindow_release(new_window);
             }
@@ -435,31 +473,100 @@ struct NativePresenter {
             ? static_cast<ADataSpace>(hdr.dataspace)
             : ADATASPACE_SRGB;
 
-        int32_t dst_w = surface_width;
-        int32_t dst_h = surface_height;
+        int32_t cur_dst_w = surface_width;
+        int32_t cur_dst_h = surface_height;
         if (hdr.width > 0 && hdr.height > 0) {
             const int64_t lhs = static_cast<int64_t>(surface_width) * hdr.height;
             const int64_t rhs = static_cast<int64_t>(surface_height) * hdr.width;
             if (lhs > rhs) {
-                dst_w = static_cast<int32_t>(rhs / hdr.height);
+                cur_dst_w = static_cast<int32_t>(rhs / hdr.height);
             } else if (lhs < rhs) {
-                dst_h = static_cast<int32_t>(lhs / hdr.width);
+                cur_dst_h = static_cast<int32_t>(lhs / hdr.width);
             }
         }
-        const int32_t dst_x = (surface_width - dst_w) / 2;
-        const int32_t dst_y = (surface_height - dst_h) / 2;
+        const int32_t cur_dst_x = (surface_width - cur_dst_w) / 2;
+        const int32_t cur_dst_y = (surface_height - cur_dst_h) / 2;
+        {
+            std::lock_guard<std::mutex> geom_lock(geom_mutex);
+            guest_width = hdr.width;
+            guest_height = hdr.height;
+            dst_x = cur_dst_x;
+            dst_y = cur_dst_y;
+            dst_w = cur_dst_w;
+            dst_h = cur_dst_h;
+        }
 
         ASurfaceTransaction* tx = ASurfaceTransaction_create();
         ASurfaceTransaction_setVisibility(
             tx, surface_control, ASURFACE_TRANSACTION_VISIBILITY_SHOW);
         ASurfaceTransaction_setZOrder(tx, surface_control, 1);
         ARect src{0, 0, static_cast<int32_t>(hdr.width), static_cast<int32_t>(hdr.height)};
-        ARect dst{dst_x, dst_y, dst_x + dst_w, dst_y + dst_h};
+        ARect dst{cur_dst_x, cur_dst_y, cur_dst_x + cur_dst_w, cur_dst_y + cur_dst_h};
         ASurfaceTransaction_setGeometry(tx, surface_control, src, dst, 0);
         ASurfaceTransaction_setBuffer(tx, surface_control, ahb, -1);
         ASurfaceTransaction_setBufferDataSpace(tx, surface_control, ds);
         ASurfaceTransaction_apply(tx);
         ASurfaceTransaction_delete(tx);
+    }
+
+    void send_touch(int32_t action,
+                    int32_t pointer_count,
+                    int64_t down_time_ms,
+                    int64_t event_time_ms,
+                    const int32_t* ids,
+                    const float* xs,
+                    const float* ys,
+                    const float* pressures) {
+        int peer = active_peer_fd.load(std::memory_order_acquire);
+        if (peer < 0 || pointer_count <= 0) {
+            return;
+        }
+        const uint32_t count = std::min(static_cast<uint32_t>(pointer_count), kMaxTouchPointers);
+
+        uint32_t gw = 0;
+        uint32_t gh = 0;
+        int32_t dx = 0;
+        int32_t dy = 0;
+        int32_t dw = 0;
+        int32_t dh = 0;
+        {
+            std::lock_guard<std::mutex> geom_lock(geom_mutex);
+            gw = guest_width;
+            gh = guest_height;
+            dx = dst_x;
+            dy = dst_y;
+            dw = dst_w;
+            dh = dst_h;
+        }
+        if (gw == 0 || gh == 0 || dw <= 0 || dh <= 0) {
+            return;
+        }
+
+        uint8_t buf[sizeof(TouchPacketHeader) + kMaxTouchPointers * sizeof(TouchPointer)]{};
+        TouchPacketHeader hdr{
+            kTouchMagic,
+            kTouchVersion,
+            action,
+            count,
+            down_time_ms,
+            event_time_ms,
+        };
+        std::memcpy(buf, &hdr, sizeof(hdr));
+
+        const float fw = static_cast<float>(gw);
+        const float fh = static_cast<float>(gh);
+        const float scale_x = fw / static_cast<float>(dw);
+        const float scale_y = fh / static_cast<float>(dh);
+
+        for (uint32_t i = 0; i < count; ++i) {
+            float gx = std::clamp((xs[i] - static_cast<float>(dx)) * scale_x, 0.0f, fw);
+            float gy = std::clamp((ys[i] - static_cast<float>(dy)) * scale_y, 0.0f, fh);
+            TouchPointer ptr{ids[i], gx, gy, pressures[i]};
+            std::memcpy(buf + sizeof(hdr) + i * sizeof(TouchPointer), &ptr, sizeof(ptr));
+        }
+
+        const size_t total_bytes = sizeof(hdr) + count * sizeof(TouchPointer);
+        send(peer, buf, total_bytes, MSG_DONTWAIT | MSG_NOSIGNAL);
     }
 
     void receive_from_peer(int sock) {
@@ -605,6 +712,44 @@ Java_alyac_android_ssalsurface_NativePresenter_nativeSetSurface(
     }
     ANativeWindow* window = surface ? ANativeWindow_fromSurface(env, surface) : nullptr;
     presenter->set_surface(window, width, height);
+}
+
+JNIEXPORT void JNICALL
+Java_alyac_android_ssalsurface_NativePresenter_nativeSendTouch(
+    JNIEnv* env,
+    jobject /* thiz */,
+    jlong handle,
+    jint action,
+    jint pointer_count,
+    jlong down_time_ms,
+    jlong event_time_ms,
+    jintArray ids_arr,
+    jfloatArray xs_arr,
+    jfloatArray ys_arr,
+    jfloatArray pressures_arr) {
+    auto* presenter = reinterpret_cast<NativePresenter*>(handle);
+    if (!presenter || pointer_count <= 0) {
+        return;
+    }
+    const jsize count = std::min(
+        static_cast<jsize>(pointer_count),
+        static_cast<jsize>(kMaxTouchPointers));
+    if (env->GetArrayLength(ids_arr) < count ||
+        env->GetArrayLength(xs_arr) < count ||
+        env->GetArrayLength(ys_arr) < count ||
+        env->GetArrayLength(pressures_arr) < count) {
+        return;
+    }
+    jint ids[kMaxTouchPointers];
+    jfloat xs[kMaxTouchPointers];
+    jfloat ys[kMaxTouchPointers];
+    jfloat pressures[kMaxTouchPointers];
+    env->GetIntArrayRegion(ids_arr, 0, count, ids);
+    env->GetFloatArrayRegion(xs_arr, 0, count, xs);
+    env->GetFloatArrayRegion(ys_arr, 0, count, ys);
+    env->GetFloatArrayRegion(pressures_arr, 0, count, pressures);
+    presenter->send_touch(
+        action, count, down_time_ms, event_time_ms, ids, xs, ys, pressures);
 }
 
 JNIEXPORT void JNICALL

@@ -44,7 +44,7 @@ Zygote 시작 시 UID 0의 `u:r:ssal_guest_probe:s0` context query가 23 bytes w
 - `scripts/build-guest-launcher.sh`: Android arm64 release build **PASS**.
 - `cargo test --locked --bin ssald`: **50 passed, 0 failed, 4 ignored**.
 - `scripts/test-zygote-diagnostics.py`: Guest 전용 EINVAL fallback gate 및 fatal diagnostics self-check **PASS**.
-- `scripts/build-fork-probe.ps1`: Java 8 + D8 JAR **PASS**, SHA-256 `02718a2f1b2724a4c0c211435e11d33a084dcfe07abae73606163246a977877a`.
+- `scripts/build-rust/build-fork-probe.ps1`: Java 8 + D8 JAR **PASS**, SHA-256 `02718a2f1b2724a4c0c211435e11d33a084dcfe07abae73606163246a977877a`.
 - `bun scripts/package-module.ts`: module ZIP **PASS**, SHA-256 `c70d588638ede4352d0fda64d62ba89ebe11c823f1ce665f5d62e2be21072592`.
 
 모듈 ZIP은 로컬 산출물이다. 실기기 실행에는 동일 launcher/probe 산출물을 `/dev/ssal-phase7i`에 임시 staging했으며 모듈을 설치하거나 Host `/data`를 수정하지 않았다. `system_server`는 이번에도 시작하지 않았다.

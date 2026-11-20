@@ -34,6 +34,10 @@ const entries: { name: string; path: string; mode: number }[] = [
     "ssal-enforcing-binder",
     "ssal-property-service",
     "ssal-lmkd",
+    "ssal-vold",
+    "ssal-netd",
+    "ssal-virtual-audio",
+    "ssal-audio-host",
     "ssal-hwbinder-probe.sh",
     "ssal-apexservice",
     "ssal-system-suspend",
@@ -49,6 +53,7 @@ const entries: { name: string; path: string; mode: number }[] = [
     "ssal-zygote-selinux-noop.so",
     "ssal-selinux-startup-probe",
     "fork-probe.jar",
+    "input-injector.jar",
   ].map((name) => ({
     name: `bin/${name}`,
     path: `out/bin/${name}`,
@@ -60,7 +65,7 @@ if (existsSync("out/bin/ssal-binder-probe") || existsSync("out/bin/ssal-binder-p
   for (const [key, path] of [
     ["helper_sha256", "out/bin/ssal-binder-probe"],
     ["source_sha256", "native/binder-probe/main.cpp"],
-    ["build_script_sha256", "scripts/build-binder-probe.sh"],
+    ["build_script_sha256", "scripts/build-rust/build-binder-probe.sh"],
     ["phase2_apk_sha256", "out/bin/ssal-phase2.apk"],
     ["art_exec_proc_sha256", "out/bin/ssal-art-exec-proc"],
     ["art_exec_proc_source_sha256", "src/bin/ssal-art-exec-proc.rs"],

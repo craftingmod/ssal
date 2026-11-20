@@ -13,8 +13,8 @@ use crate::guest::runtime::classpath::{
 };
 use ssal::namespace_mounts::Mounts;
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
-use std::os::fd::AsRawFd;
+use std::io::{self, BufRead, Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
@@ -27,6 +27,7 @@ pub(crate) use crate::diagnostics::launcher::fork_probe::client as fork_client;
 pub(crate) const GUEST_PROBE_CONTEXT: &[u8] = b"u:r:ssal_guest_probe:s0\0";
 const PROPERTY_SERVICE_CONTEXT: &[u8] = b"u:r:ssal_property:s0\0";
 const AIDL_SERVER_CONTEXT: &[u8] = b"u:r:aidl_lazy_test_server:s0\0";
+const INPUT_INJECTOR_CONTEXT: &[u8] = b"u:r:ssal_input_injector:s0\0";
 const INSTALLD: &str = "/system/bin/installd";
 const ARTD: &str = "/apex/com.android.art/bin/artd";
 const INSTALLD_CAPS: u32 = 0xff;
@@ -67,6 +68,8 @@ fn mapped_exec_domain(executable: &str, exec_context: Option<&[u8]>) -> &'static
         "aidl_lazy_test_server"
     } else if exec_context == Some(DERIVE_CLASSPATH_CONTEXT) {
         "derive_classpath"
+    } else if exec_context == Some(INPUT_INJECTOR_CONTEXT) {
+        "shell"
     } else {
         match executable {
             "/system/bin/app_process64" => "zygote",
@@ -98,6 +101,103 @@ fn mapped_exec_domain(executable: &str, exec_context: Option<&[u8]>) -> &'static
             _ => "shell",
         }
     }
+}
+
+fn start_input_listener(socket_path: &Path) -> Option<OwnedFd> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(socket_path.as_os_str().as_bytes()).ok()?;
+    let bytes = c_path.as_bytes_with_nul();
+    let mut sun: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    sun.sun_family = libc::AF_UNIX as _;
+    if bytes.len() > sun.sun_path.len() {
+        eprintln!("GUEST_INPUT_INJECTOR=WARN socket path too long");
+        return None;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            bytes.as_ptr(),
+            sun.sun_path.as_mut_ptr().cast::<u8>(),
+            bytes.len(),
+        );
+    }
+    let _ = fs::remove_file(socket_path);
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        eprintln!("GUEST_INPUT_INJECTOR=WARN socket_err={}", io::Error::last_os_error());
+        return None;
+    }
+    let listener = unsafe { OwnedFd::from_raw_fd(fd) };
+    let addr_len = (std::mem::size_of::<libc::sa_family_t>() + bytes.len()) as libc::socklen_t;
+    if unsafe {
+        libc::bind(
+            listener.as_raw_fd(),
+            (&sun as *const libc::sockaddr_un).cast(),
+            addr_len,
+        )
+    } != 0
+        || unsafe { libc::listen(listener.as_raw_fd(), 4) } != 0
+    {
+        eprintln!("GUEST_INPUT_INJECTOR=WARN bind_listen_err={}", io::Error::last_os_error());
+        return None;
+    }
+    let _ = fs::set_permissions(socket_path, fs::Permissions::from_mode(0o666));
+    Some(listener)
+}
+
+fn spawn_input_accept_relay(listener: OwnedFd) {
+    std::thread::Builder::new()
+        .name("ssal-input-accept".into())
+        .spawn(move || {
+            loop {
+                let peer = unsafe {
+                    libc::accept4(
+                        listener.as_raw_fd(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        libc::SOCK_CLOEXEC,
+                    )
+                };
+                if peer < 0 {
+                    let err = io::Error::last_os_error();
+                    if err.raw_os_error() == Some(libc::EINTR) {
+                        continue;
+                    }
+                    eprintln!("GUEST_INPUT_INJECTOR=WARN accept_err={err}");
+                    break;
+                }
+                let peer_fd = unsafe { OwnedFd::from_raw_fd(peer) };
+                let mut stream =
+                    match UnixStream::connect(format!("{}/run/ssald.sock", ssal::unix::ROOT)) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("GUEST_INPUT_INJECTOR=WARN ssald_connect_err={e}");
+                            continue;
+                        }
+                    };
+                let req = ssal::unix::Request {
+                    version: ssal::unix::VERSION,
+                    command: "register-input".into(),
+                    image_name: None,
+                    profile_name: None,
+                    force_regen: false,
+                    native_sepolicy: false,
+                };
+                if let Err(e) = ssal::unix::send(&mut stream, &req, Some(peer_fd.as_raw_fd())) {
+                    eprintln!("GUEST_INPUT_INJECTOR=WARN ssald_send_err={e}");
+                    continue;
+                }
+                let mut line = String::new();
+                if io::BufReader::new(stream).read_line(&mut line).is_ok() {
+                    if let Ok(resp) = serde_json::from_str::<ssal::unix::Response>(&line) {
+                        if resp.ok {
+                            println!("GUEST_INPUT_INJECTOR=PASS {}", resp.message);
+                            break;
+                        }
+                    }
+                }
+            }
+        })
+        .ok();
 }
 
 pub(crate) fn retest_surfaceflinger(
@@ -224,6 +324,7 @@ pub(crate) fn command(
     let suspend = executable == system_suspend::SERVICE.executable;
     let pivot = suspend
         || (executable == "/system/bin/app_process64"
+            && exec_context != Some(INPUT_INJECTOR_CONTEXT)
             && (std::env::var_os("SSAL_PHASE7FB_FORK").is_some()
                 || crate::guest::system_server_enabled()));
     let derive_classpath_linker = executable == "/system/bin/bootstrap/linker64"
@@ -1450,6 +1551,20 @@ pub(crate) fn verify(
             &bin.join("ssal-virtual-composer"),
             &target,
         )?;
+        if bin.join("input-injector.jar").is_file() {
+            let jar_target = root.join("run/ssal/input-injector.jar");
+            File::create(&jar_target)?;
+            ssal::guest_policy::runtime::set_label(
+                &jar_target,
+                &plan.context("system_file", false)?,
+            )?;
+            ssal::guest_policy::runtime::bind_file(
+                mounts,
+                root,
+                &bin.join("input-injector.jar"),
+                &jar_target,
+            )?;
+        }
     }
     ssal::guest_policy::runtime::set_label(
         &aidl_server,
@@ -2090,6 +2205,48 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
                     &artd_env,
                 )?);
             }
+            let mut input_injector: Option<Service> = None;
+            if system_server_graphics && bin.join("input-injector.jar").is_file() {
+                let shell_domain = &plan.types["shell"];
+                let sock_dir_ctx = plan.context("socket_device", false)?;
+                let sock_dir_type = sock_dir_ctx.split(':').nth(2).unwrap_or("socket_device");
+                for rule in [
+                    format!("allow {shell_domain} ksu unix_stream_socket {{ read write getattr connectto }}"),
+                    format!("allow {shell_domain} {sock_dir_type} dir {{ search getattr }}"),
+                    format!("allow {shell_domain} {sock_dir_type} sock_file {{ read write getattr }}"),
+                ] {
+                    let _ = Command::new("/data/adb/ksu/bin/ksud")
+                        .args(["sepolicy", "patch", &rule])
+                        .status();
+                }
+                if let Some(listener) = start_input_listener(&root.join("dev/socket/ssal-input.sock")) {
+                    spawn_input_accept_relay(listener);
+                    let mut injector_env = vec![
+                        ("BOOTCLASSPATH", classpaths.boot.as_str()),
+                        ("SYSTEMSERVERCLASSPATH", classpaths.system_server.as_str()),
+                        ("CLASSPATH", "/run/ssal/input-injector.jar"),
+                        (
+                            "LD_LIBRARY_PATH",
+                            "/run/ssal:/apex/com.android.adbd/lib64:/system/lib64:/apex/com.android.os.statsd/lib64:/apex/com.android.i18n/lib64",
+                        ),
+                    ];
+                    if let Some(classpath) = classpaths.dex2oat.as_deref() {
+                        injector_env.push(("DEX2OATBOOTCLASSPATH", classpath));
+                    }
+                    input_injector = Some(Service::start(
+                        root,
+                        "/system/bin/sh",
+                        &[
+                            "-c",
+                            "exec /system/bin/app_process64 /system/bin --nice-name=ssal-input-injector dev.ssal.input.InputInjector",
+                        ],
+                        "input-injector",
+                        2000,
+                        None,
+                        &injector_env,
+                    )?);
+                }
+            }
             zygote_env.push(("SSAL_PHASE7I_PROPERTIES", "1"));
             if controlled_fork && std::env::var_os("SSAL_PHASE7FC_BYPASS_SETCONTEXT").is_some() {
                 zygote_env.push(("SSAL_PHASE7FC_BYPASS_SETCONTEXT", "1"));
@@ -2269,6 +2426,17 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
                     ));
                 }
                 check_boot_services(&mut boot_services)?;
+                if let Some(service) = input_injector.as_mut() {
+                    let _ = service.drain_output();
+                    if service.exited().unwrap_or(false) {
+                        let status = service.exit_status().ok().flatten();
+                        let log = fs::read_to_string(&service.log).unwrap_or_default();
+                        eprintln!(
+                            "GUEST_INPUT_INJECTOR=EXITED status={status:?} log={log:?}"
+                        );
+                        input_injector = None;
+                    }
+                }
                 if use_initrc {
                     if let Some(service) = &mut property_service {
                         service.drain_output()?;

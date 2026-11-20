@@ -182,6 +182,14 @@ fn handle(
             log(&root, "registered virtual-composer presenter fd");
             reply(&mut stream, true, "presenter fd registered")
         }
+        "register-input" => {
+            let Some(fd) = fd else {
+                return reply(&mut stream, false, "input socket fd required");
+            };
+            super::presenter_relay::set_input_fd(&relay, fd);
+            log(&root, "registered guest input injector fd");
+            reply(&mut stream, true, "input fd registered")
+        }
         "switch" if !req.image_name.as_deref().is_some_and(valid_image_name) => reply(&mut stream, false, "invalid image name"),
         "switch" | "return" => reply(&mut stream, false, crate::service_contract::blocked_summary()?),
         "create" => {
@@ -220,6 +228,9 @@ fn prepare_session(
     force_regen: bool,
     native_sepolicy: bool,
 ) -> io::Result<String> {
+    if mode == "prepare" {
+        crate::guest::prepare::check_boot_binaries(std::env::current_exe()?.parent().unwrap())?;
+    }
     crate::diagnostics::selinux::servicemanager::check_recovery()?;
     let profile = crate::guest::prepare::check(root, name)?;
     let base = root
@@ -352,6 +363,7 @@ fn start_session(root: &Path, name: &str, active_guest: &ActiveGuest) -> io::Res
             )));
         }
     }
+    crate::guest::prepare::check_boot_binaries(std::env::current_exe()?.parent().unwrap())?;
     crate::diagnostics::selinux::servicemanager::check_recovery()?;
     let profile = crate::guest::prepare::check(root, name)?;
     if !root.join("guests").join(name).join("selinux/plan.json").is_file() {

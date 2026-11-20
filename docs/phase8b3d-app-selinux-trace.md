@@ -126,7 +126,7 @@ WSLc는 저장소 규칙에 따라 sandbox 밖에서 실행했다. 기존 컨테
 
 ```sh
 wslc exec ssal-dev bash scripts/build-guest-launcher.sh
-wslc exec ssal-dev bash scripts/build-app-selinux-trace.sh
+wslc exec ssal-dev bash scripts/build-rust/build-app-selinux-trace.sh
 wslc exec ssal-dev python3 scripts/test-app-selinux-trace.py
 ```
 

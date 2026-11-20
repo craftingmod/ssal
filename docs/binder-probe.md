@@ -43,7 +43,7 @@ hw/vnd 장치의 통신·격리는 시험하지 않는다. 전체 게스트 Bind
 기본 Rust 빌드는 IPC 헬퍼를 생성하지 않는다. IPC 헬퍼를 함께 배포하려면 실제 게스트 이미지의 arm64 `libbinder.so`, `libutils.so`, `libc++.so`를 준비한다. 호스트 One UI의 라이브러리를 대신 사용하지 않는다.
 
 ```sh
-bash scripts/build-binder-probe.sh /src/PATH_TO_GUEST_LIBRARIES
+bash scripts/build-rust/build-binder-probe.sh /src/PATH_TO_GUEST_LIBRARIES
 ```
 
 스크립트는 공식 AOSP `android-16.0.0_r2` 플랫폼 헤더를 `.cache/android16-binder`에 받아 실제 게스트 라이브러리와 링크한다. 플랫폼 C++ 라이브러리를 사용하므로 공개 NDK ABI만 사용하는 프로그램이 아니다. 플랫폼용 libc++를 링크하며 앱용 libc++_shared.so를 요구하지 않는다. Android 플랫폼 트리에서 빌드할 수 있는 Android.bp도 제공한다.
