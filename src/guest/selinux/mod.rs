@@ -695,6 +695,7 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
         "property_info",
         "properties_serial",
         "property_socket",
+        "lmkd_socket",
     ] {
         plan.shared_types.remove(private);
     }

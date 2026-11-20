@@ -287,7 +287,7 @@ pub(super) fn verify(
             &root.join("proc"),
             Some("proc"),
             libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
-            "",
+            "hidepid=2",
         )?;
         mounts.attach(
             Path::new("sysfs"),

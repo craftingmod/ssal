@@ -33,6 +33,7 @@ const entries: { name: string; path: string; mode: number }[] = [
     "ssal-selinux-identity",
     "ssal-enforcing-binder",
     "ssal-property-service",
+    "ssal-lmkd",
     "ssal-hwbinder-probe.sh",
     "ssal-apexservice",
     "ssal-system-suspend",

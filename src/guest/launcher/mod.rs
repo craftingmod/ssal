@@ -47,6 +47,7 @@ pub(in crate::guest) fn uses_own_diagnostics(executable: &str) -> bool {
         crate::guest::init::binder_service::VOLD.executable,
         crate::guest::init::binder_service::NETD.executable,
         "/run/ssal/ssal-virtual-audio",
+        "/run/ssal/ssal-lmkd",
         system_suspend::SERVICE.executable,
         health::SERVICE.executable,
         gatekeeper::SERVICE.executable,
@@ -80,6 +81,7 @@ fn mapped_exec_domain(executable: &str, exec_context: Option<&[u8]>) -> &'static
             "/run/ssal/ssal-vold" => crate::guest::init::binder_service::VOLD.domain,
             "/run/ssal/ssal-netd" => crate::guest::init::binder_service::NETD.domain,
             "/run/ssal/ssal-virtual-audio" => "audioserver",
+            "/run/ssal/ssal-lmkd" => "lmkd",
             "/system/bin/audioserver" => "audioserver",
             "/run/ssal/ssal-system-suspend" => system_suspend::SERVICE.domain,
             "/run/ssal/ssal-health" => health::SERVICE.domain,
@@ -1060,6 +1062,124 @@ fn system_server_display_progress(stderr: &str, pid: u32) -> (bool, bool) {
     )
 }
 
+fn preopt_system_apps(
+    root: &Path,
+    profile_dir: &Path,
+    classpaths: &crate::guest::runtime::classpath::GuestClasspaths,
+) -> io::Result<()> {
+    let dalvik_arm64 = crate::guest::mount::directory(root, "data/dalvik-cache/arm64", 0o771)?;
+    let label = ssal::guest_policy::runtime::load(root)?
+        .map(|plan| plan.context("dalvikcache_data_file", false))
+        .transpose()?;
+    if let Some(ref ctx) = label {
+        ssal::guest_policy::runtime::set_label(&dalvik_arm64, ctx)?;
+    }
+
+    let apk_rel = "system/system_ext/priv-app/SystemUI/SystemUI.apk";
+    let apk_host = root.join(apk_rel);
+    if !apk_host.is_file() {
+        return Ok(());
+    }
+    let apk_len = fs::metadata(&apk_host)?.len();
+    let stamp = format!("boot={}\napk_len={apk_len}\n", classpaths.boot);
+    let cache_dir = profile_dir.join("dalvik-cache/arm64");
+    let stamp_path = cache_dir.join("systemui.stamp");
+    let base = "system@system_ext@priv-app@SystemUI@SystemUI.apk@classes";
+    let required_exts = ["dex", "vdex"];
+    let all_exts = ["dex", "vdex", "art"];
+
+    if fs::read_to_string(&stamp_path).ok().as_deref() == Some(stamp.as_str())
+        && required_exts
+            .iter()
+            .all(|ext| cache_dir.join(format!("{base}.{ext}")).is_file())
+    {
+        for ext in all_exts {
+            let name = format!("{base}.{ext}");
+            let src = cache_dir.join(&name);
+            if !src.is_file() {
+                continue;
+            }
+            let dst = dalvik_arm64.join(&name);
+            fs::copy(&src, &dst)?;
+            fs::set_permissions(&dst, fs::Permissions::from_mode(0o644))?;
+            if let Some(ref ctx) = label {
+                ssal::guest_policy::runtime::set_label(&dst, ctx)?;
+            }
+        }
+        println!("GUEST_PREOPT_SYSTEMUI=CACHE_HIT dir={}", dalvik_arm64.display());
+        return Ok(());
+    }
+
+    let guest_apk = "/system/system_ext/priv-app/SystemUI/SystemUI.apk";
+    let oat_file = format!("/data/dalvik-cache/arm64/{base}.dex");
+    let vdex_file = format!("/data/dalvik-cache/arm64/{base}.vdex");
+    let art_file = format!("/data/dalvik-cache/arm64/{base}.art");
+    if let Some(shell_data) = ssal::guest_policy::runtime::load(root)?
+        .map(|plan| plan.context("shell_data_file", false))
+        .transpose()?
+    {
+        ssal::guest_policy::runtime::set_label(&dalvik_arm64, &shell_data)?;
+    }
+    let mut cmd = command(root, "/system/bin/bootstrap/linker64", 0, None)?;
+    cmd.args([
+        "/apex/com.android.art/bin/dex2oat64",
+        &format!("--dex-file={guest_apk}"),
+        &format!("--oat-file={oat_file}"),
+        &format!("--output-vdex={vdex_file}"),
+        &format!("--app-image-file={art_file}"),
+        "--instruction-set=arm64",
+        "--instruction-set-features=default",
+        "--compiler-filter=speed",
+        "--boot-image=/apex/com.android.art/javalib/boot.art:/system/framework/boot-framework.art",
+        "--class-loader-context=PCL[]{PCL[/system_ext/framework/androidx.window.extensions.jar]#PCL[/system_ext/framework/androidx.window.sidecar.jar]}",
+        "-j4",
+    ])
+    .env("BOOTCLASSPATH", &classpaths.boot)
+    .env(
+        "LD_LIBRARY_PATH",
+        "/run/ssal:/apex/com.android.art/lib64:/system/lib64:/apex/com.android.os.statsd/lib64:/apex/com.android.i18n/lib64",
+    );
+    if let Some(ref d2o) = classpaths.dex2oat {
+        cmd.env("DEX2OATBOOTCLASSPATH", d2o);
+    }
+    match crate::guest::process::command::run_with_timeout(
+        &mut cmd,
+        "/system/bin/bootstrap/linker64",
+        Duration::from_secs(60),
+    ) {
+        Ok(out) if out.status.success() => {
+            if let Some(ref ctx) = label {
+                ssal::guest_policy::runtime::set_label(&dalvik_arm64, ctx)?;
+            }
+            fs::create_dir_all(&cache_dir)?;
+            for ext in all_exts {
+                let name = format!("{base}.{ext}");
+                let dst = dalvik_arm64.join(&name);
+                if dst.is_file() {
+                    fs::set_permissions(&dst, fs::Permissions::from_mode(0o644))?;
+                    if let Some(ref ctx) = label {
+                        ssal::guest_policy::runtime::set_label(&dst, ctx)?;
+                    }
+                    let _ = fs::copy(&dst, cache_dir.join(&name));
+                }
+            }
+            let _ = fs::write(&stamp_path, &stamp);
+            println!("GUEST_PREOPT_SYSTEMUI=PASS compiled=true");
+        }
+        Ok(out) => {
+            println!(
+                "GUEST_PREOPT_SYSTEMUI=SKIP status={} stderr={}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Err(e) => {
+            println!("GUEST_PREOPT_SYSTEMUI=SKIP error={e}");
+        }
+    }
+    Ok(())
+}
+
 fn system_server_boot_completed(stderr: &str, pid: u32) -> bool {
     let pid = pid.to_string();
     stderr.lines().any(|line| {
@@ -1196,6 +1316,14 @@ pub(crate) fn verify(
         }
         if bin.join("ssal-netd").is_file() {
             crate::guest::init::binder_service::NETD.install(mounts, root, &bin)?;
+        }
+        if bin.join("ssal-lmkd").is_file() {
+            let plan = ssal::guest_policy::runtime::load(root)?
+                .ok_or_else(|| io::Error::other("Guest LMKD requires Guest SELinux policy"))?;
+            let target = root.join("run/ssal/ssal-lmkd");
+            File::create(&target)?;
+            ssal::guest_policy::runtime::set_label(&target, &plan.context("lmkd_exec", false)?)?;
+            ssal::guest_policy::runtime::bind_file(mounts, root, &bin.join("ssal-lmkd"), &target)?;
         }
         if bin.join("ssal-virtual-audio").is_file() {
             let plan = ssal::guest_policy::runtime::load(root)?
@@ -1690,6 +1818,9 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
                     )?,
                 );
             }
+            if bin.join("ssal-lmkd").is_file() {
+                boot_services.push(start_lmkd(root)?);
+            }
             struct ChildGuard(Option<std::process::Child>);
             impl Drop for ChildGuard {
                 fn drop(&mut self) {
@@ -1842,6 +1973,9 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
             )?;
             println!("Guest Zygote binary preflight:\n{binary}");
             let classpaths = derive_guest_classpath(root)?;
+            if system_server_graphics && !runtime_sid {
+                preopt_system_apps(root, profile_dir, &classpaths)?;
+            }
             let boot_classpath = if controlled_fork {
                 format!("{}:/system/framework/am.jar", classpaths.boot)
             } else {
@@ -2340,6 +2474,86 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
         (Err(error), _) | (_, Err(error)) => Err(error),
         _ => Ok(()),
     }
+}
+
+fn start_lmkd(root: &Path) -> io::Result<Service> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+
+    let contexts = ssal::guest_policy::runtime::load(root)?
+        .map(|plan| -> io::Result<_> {
+            Ok((
+                plan.context("lmkd", true)?,
+                plan.context("lmkd_socket", false)?,
+            ))
+        })
+        .transpose()?;
+
+    let raw = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0) };
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let socket = unsafe { OwnedFd::from_raw_fd(raw) };
+    let fd = socket.as_raw_fd();
+
+    let log = root.join("run/ssal/lmkd.log");
+    File::create(&log)?;
+    let mut cmd = command(root, "/run/ssal/ssal-lmkd", 0, None)?;
+    cmd.env("ANDROID_SOCKET_lmkd", fd.to_string())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    unsafe {
+        cmd.pre_exec(move || {
+            if let Some((sock_ctx, file_ctx)) = &contexts {
+                fs::write("/proc/thread-self/attr/sockcreate", format!("{sock_ctx}\0"))?;
+                fs::write("/proc/thread-self/attr/fscreate", format!("{file_ctx}\0"))?;
+            }
+            let bound = libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0);
+            if bound < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let bound_guard = OwnedFd::from_raw_fd(bound);
+            let sock_path = c"/dev/socket/lmkd";
+            let _ = libc::unlink(sock_path.as_ptr());
+            let mut addr: libc::sockaddr_un = std::mem::zeroed();
+            addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+            let bytes = sock_path.to_bytes_with_nul();
+            for (dst, &src) in addr.sun_path.iter_mut().zip(bytes.iter()) {
+                *dst = src as libc::c_char;
+            }
+            let addr_len = (std::mem::size_of::<libc::sa_family_t>() + bytes.len()) as libc::socklen_t;
+            let bind_rc = libc::bind(bound_guard.as_raw_fd(), (&raw const addr).cast(), addr_len);
+            if contexts.is_some() {
+                fs::write("/proc/thread-self/attr/sockcreate", b"\0")?;
+                fs::write("/proc/thread-self/attr/fscreate", b"\0")?;
+            }
+            if bind_rc != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::chown(sock_path.as_ptr(), 0, 1000) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            fs::set_permissions(Path::new("/dev/socket/lmkd"), fs::Permissions::from_mode(0o660))?;
+            if libc::dup2(bound_guard.as_raw_fd(), fd) < 0 || libc::fcntl(fd, libc::F_SETFD, 0) != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    let mut service = Service::from_child(cmd.spawn()?, log);
+    drop(socket);
+    service.output.push(crate::diagnostics::zygote::Stream::new(
+        service.child.stdout.take().unwrap(),
+        File::options().append(true).open(&service.log)?,
+    )?);
+    service.output.push(crate::diagnostics::zygote::Stream::new(
+        service.child.stderr.take().unwrap(),
+        File::options().append(true).open(&service.log)?,
+    )?);
+    service.wait_text("guest_lmkd_ready=1")?;
+    Ok(service)
 }
 
 #[cfg(test)]
