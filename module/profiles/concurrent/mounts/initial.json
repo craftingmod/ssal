@@ -14,7 +14,7 @@
   "runtime_tmpfs": [
     {"path": "tmp", "mode": "1777", "uid": 0, "gid": 0, "readonly": false},
     {"path": "cache", "mode": "0770", "uid": 1000, "gid": 2001, "readonly": false},
-    {"path": "metadata", "mode": "0700", "uid": 0, "gid": 0, "readonly": true},
+    {"path": "metadata", "mode": "0755", "uid": 0, "gid": 0, "readonly": true},
     {"path": "config", "mode": "0755", "uid": 0, "gid": 0, "readonly": true}
   ],
   "host_readonly": ["vendor", "odm", "vendor_dlkm"],

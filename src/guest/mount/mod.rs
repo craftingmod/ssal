@@ -267,6 +267,11 @@ pub(super) fn verify(
             let target = directory(&root, &entry.path, mode)?;
             mounts.tmpfs(&target, mode)?;
             owned_directory(&root, &entry.path, mode, entry.uid, entry.gid)?;
+            if entry.path == "metadata" {
+                let aconfig = directory(&root, "metadata/aconfig", 0o775)?;
+                mounts.tmpfs(&aconfig, 0o775)?;
+                owned_directory(&root, "metadata/aconfig", 0o775, 0, 1000)?;
+            }
             if entry.readonly {
                 mount(
                     Path::new("tmpfs"),

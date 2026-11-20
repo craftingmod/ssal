@@ -87,6 +87,7 @@ fn mapped_exec_domain(executable: &str, exec_context: Option<&[u8]>) -> &'static
             "/run/ssal/ssal-keymint" => keymint::SERVICE.domain,
             "/system/bin/gatekeeperd" => "gatekeeperd",
             "/system/bin/keystore2" => "keystore",
+            "/system/bin/aconfigd-system" => "aconfigd",
             "/apex/com.android.sdkext/bin/derive_classpath" => "derive_classpath",
             "/apex/com.android.runtime/bin/linkerconfig" | "/system/bin/linkerconfig" => {
                 "linkerconfig"
@@ -394,8 +395,12 @@ pub(in crate::guest) fn run_as(
         "/apex/com.android.sdkext/bin/derive_classpath"
             | "/apex/com.android.runtime/bin/linkerconfig"
             | "/system/bin/linkerconfig"
+            | "/system/bin/aconfigd-system"
     ) {
         child_command.env("LD_PRELOAD", "/run/ssal/ssal-phase2-log.so");
+    }
+    if exe == "/system/bin/aconfigd-system" {
+        child_command.env("ANDROID_FILE__dev_kmsg", "2");
     }
     if std::env::var_os("SSAL_TRACE_GUEST_SIGABRT").is_some()
         && (exe == "/apex/com.android.runtime/bin/linkerconfig"
@@ -822,6 +827,54 @@ fn isolated(root: &Path, userdata: &Path) -> io::Result<()> {
         return Err(io::Error::other(
             "Guest control socket directory is not empty",
         ));
+    }
+    Ok(())
+}
+
+fn prepare_aconfig_storage(root: &Path) -> io::Result<()> {
+    let plan = ssal::guest_policy::runtime::load(root)?;
+    for (rel, mode, label_type) in [
+        ("metadata/aconfig", 0o775, "aconfig_storage_metadata_file"),
+        (
+            "metadata/aconfig/flags",
+            0o770,
+            "aconfig_storage_flags_metadata_file",
+        ),
+        (
+            "metadata/aconfig/maps",
+            0o775,
+            "aconfig_storage_metadata_file",
+        ),
+        (
+            "metadata/aconfig/boot",
+            0o775,
+            "aconfig_storage_metadata_file",
+        ),
+    ] {
+        let dir = crate::guest::mount::directory(root, rel, mode)?;
+        std::os::unix::fs::chown(&dir, Some(0), Some(1000))?;
+        fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(mode))?;
+        if let Some(plan) = &plan {
+            if plan.types.contains_key(label_type) {
+                ssal::guest_policy::runtime::set_label(&dir, &plan.context(label_type, false)?)?;
+            }
+        }
+    }
+    if root.join("system/bin/aconfigd-system").is_file() {
+        for subcmd in ["early-platform-init", "platform-init"] {
+            match run(root, "/system/bin/aconfigd-system", &[subcmd], 1000) {
+                Ok(out) => {
+                    println!("GUEST_ACONFIGD_INIT subcmd={subcmd} output_len={}", out.len());
+                }
+                Err(err)
+                    if subcmd == "platform-init"
+                        && root.join("metadata/aconfig/maps/system.package.map").is_file() =>
+                {
+                    eprintln!("GUEST_ACONFIGD_INIT subcmd={subcmd} partial (vendor absent): {err}");
+                }
+                Err(err) => return Err(err),
+            }
+        }
     }
     Ok(())
 }
@@ -1480,6 +1533,7 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
             .transpose()?;
         let mut boot_services = Vec::new();
         if start_system_server {
+            prepare_aconfig_storage(root)?;
             health::start(root, &bin, guest_binder, &mut boot_services)?;
             let auth_token_key = keymint::random_bytes::<32>()?;
             keymint::start(root, guest_binder, &auth_token_key, &mut boot_services)?;
@@ -2354,6 +2408,7 @@ mod tests {
             ("/run/ssal/ssal-keymint", "ssal_keymint"),
             ("/system/bin/gatekeeperd", "gatekeeperd"),
             ("/system/bin/keystore2", "keystore"),
+            ("/system/bin/aconfigd-system", "aconfigd"),
             ("/system/bin/sh", "shell"),
         ] {
             assert_eq!(
