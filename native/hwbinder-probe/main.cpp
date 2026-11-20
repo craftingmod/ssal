@@ -1,10 +1,6 @@
-// Guest Private HwBinder / HIDL verification client using AOSP libhidlbase.
+// Guest Private HwBinder / HIDL verification client using the NDK-only ssal HwBinder transport.
+#include "../hwbinder/hwbinder.h"
 #include <fcntl.h>
-#include <hidl/HidlSupport.h>
-#include <hidl/Status.h>
-#include <hwbinder/IBinder.h>
-#include <hwbinder/Parcel.h>
-#include <hwbinder/ProcessState.h>
 #include <linux/android/binder.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -18,29 +14,19 @@
 #include <cstdlib>
 #include <cstring>
 
-namespace android::hardware {
-status_t readFromParcel(Status* status, const Parcel& parcel);
-status_t writeEmbeddedToParcel(const hidl_string& string, Parcel* parcel, size_t parentHandle,
-                               size_t parentOffset);
-status_t readEmbeddedFromParcel(const hidl_string& string, const Parcel& parcel,
-                                size_t parentHandle, size_t parentOffset);
-status_t readEmbeddedFromParcel(const hidl_memory& memory, const Parcel& parcel,
-                                size_t parentHandle, size_t parentOffset);
-}  // namespace android::hardware
-
-using android::OK;
-using android::DEAD_OBJECT;
-using android::sp;
-using android::status_t;
-using android::hardware::hidl_memory;
-using android::hardware::hidl_string;
-using android::hardware::IBinder;
-using android::hardware::Parcel;
-using android::hardware::ProcessState;
-using android::hardware::readEmbeddedFromParcel;
-using android::hardware::readFromParcel;
-using android::hardware::Status;
-using android::hardware::writeEmbeddedToParcel;
+using ssal::OK;
+using ssal::DEAD_OBJECT;
+using ssal::sp;
+using ssal::status_t;
+using ssal::hardware::hidl_memory;
+using ssal::hardware::hidl_string;
+using ssal::hardware::IBinder;
+using ssal::hardware::Parcel;
+using ssal::hardware::ProcessState;
+using ssal::hardware::readEmbeddedFromParcel;
+using ssal::hardware::readFromParcel;
+using ssal::hardware::Status;
+using ssal::hardware::writeEmbeddedToParcel;
 
 static bool parseMajorMinor(const char* arg, unsigned* majorOut, unsigned* minorOut) {
     const char* colon = strchr(arg, ':');
@@ -115,7 +101,7 @@ static bool verifyProcessStateFd(const struct stat& expected, unsigned expectedM
         }
     }
     if (!found || unexpected) {
-        fprintf(stderr, "libhidlbase opened unexpected binder fd (found=%d unexpected=%d)\n",
+        fprintf(stderr, "ssal HwBinder opened unexpected binder fd (found=%d unexpected=%d)\n",
                 found ? 1 : 0, unexpected ? 1 : 0);
         return false;
     }
@@ -142,7 +128,7 @@ static status_t lookupService(const sp<IBinder>& sm, const char* fqNameStr, cons
     if (rc != OK) return rc;
     if (!status.isOk()) {
         fprintf(stderr, "IServiceManager::get status error: %s\n", status.description().c_str());
-        return android::UNKNOWN_ERROR;
+        return ssal::UNKNOWN_ERROR;
     }
     return rep.readNullableStrongBinder(serviceOut);
 }
@@ -156,7 +142,7 @@ static status_t pingHidl(const sp<IBinder>& target) {
     Status status;
     rc = readFromParcel(&status, rep);
     if (rc != OK) return rc;
-    return status.isOk() ? OK : android::UNKNOWN_ERROR;
+    return status.isOk() ? OK : ssal::UNKNOWN_ERROR;
 }
 
 static bool testAllocatorTransactions(const sp<IBinder>& svc) {
@@ -190,7 +176,7 @@ static bool testAllocatorTransactions(const sp<IBinder>& svc) {
         if (rc != OK || !status.isOk() || !desc ||
             strcmp(desc->c_str(), "android.hidl.allocator@1.0::IAllocator") != 0) {
             fprintf(stderr, "IBase::interfaceDescriptor failed: rc=%d desc=%s\n", rc,
-                    desc ? desc->c_str() : "(null)");
+                    rc == OK && desc ? desc->c_str() : "(invalid)");
             return false;
         }
         printf("guest_hwbinder_hidl=PASS service=android.hidl.allocator@1.0::IAllocator/ashmem transaction=IBase::interfaceDescriptor descriptor=%s\n",
@@ -212,7 +198,7 @@ static bool testAllocatorTransactions(const sp<IBinder>& svc) {
             rc = rep.readBuffer(sizeof(hidl_memory), &memHandle,
                                 reinterpret_cast<const void**>(&mem));
         }
-        if (rc == OK) rc = readEmbeddedFromParcel(*mem, rep, memHandle, 0);
+        if (rc == OK && mem) rc = readEmbeddedFromParcel(*mem, rep, memHandle, 0);
         if (rc != OK || !status.isOk() || !success || !mem || mem->size() != 4096 ||
             strcmp(mem->name().c_str(), "ashmem") != 0 || !mem->handle() ||
             mem->handle()->numFds != 1 || mem->handle()->data[0] < 0) {
@@ -220,7 +206,7 @@ static bool testAllocatorTransactions(const sp<IBinder>& svc) {
                     "IAllocator::allocate failed: rc=%d status=%s success=%d size=%llu name=%s\n",
                     rc, status.description().c_str(), success ? 1 : 0,
                     mem ? static_cast<unsigned long long>(mem->size()) : 0ULL,
-                    mem ? mem->name().c_str() : "(null)");
+                    rc == OK && mem ? mem->name().c_str() : "(invalid)");
             return false;
         }
         int shmFd = mem->handle()->data[0];

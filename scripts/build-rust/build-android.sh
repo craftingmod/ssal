@@ -15,16 +15,6 @@ if [[ ! -x "$android_linker" ]]; then
     exit 1
 fi
 export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$android_linker"
-guest_libs="${SSAL_GUEST_LIB_DIR:-.cache/android16-hwbinder-libs}"
-if [[ "$build_target" == all || "$build_target" == native || "$build_target" == clean ]]; then
-    for library in libhidlbase.so libutils.so libcutils.so libc++.so; do
-        if [[ ! -s "$guest_libs/$library" ]]; then
-            echo "Missing Android 16 Guest library: $guest_libs/$library" >&2
-            echo 'Extract libhidlbase.so, libutils.so, libcutils.so and libc++.so from the Guest system/lib64 into .cache/android16-hwbinder-libs, or set SSAL_GUEST_LIB_DIR to their directory.' >&2
-            exit 1
-        fi
-    done
-fi
 if [[ "$build_target" == clean ]]; then
     cargo clean --release --target aarch64-linux-android
     cargo clean --release --manifest-path services/Cargo.toml --target aarch64-linux-android
@@ -69,8 +59,8 @@ if [[ "$build_target" == all || "$build_target" == services ]]; then
 fi
 if [[ "$build_target" == all || "$build_target" == native ]]; then
     install -m 755 scripts/ssal-hwbinder-probe.sh out/bin/ssal-hwbinder-probe.sh
-    bash scripts/build-rust/build-hwbinder-probe.sh "$guest_libs"
-    bash scripts/build-rust/build-virtual-audio.sh "$guest_libs"
+    bash scripts/build-rust/build-hwbinder-probe.sh
+    bash scripts/build-rust/build-virtual-audio.sh
     "$android_linker" -shared -fPIC -O2 -Wall -Wextra -Werror native/binder-probe/context-map.c -ldl -o out/bin/ssal-context-map.so
     "$android_ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android30-clang" \
         -shared -fPIC -Os -Wall -Wextra -Werror native/binder-probe/log-to-stderr.c \

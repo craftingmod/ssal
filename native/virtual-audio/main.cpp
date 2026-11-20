@@ -1,13 +1,7 @@
 // Guest Silent Virtual HIDL 7.0 Audio HAL (IDevicesFactory + IEffectsFactory).
+#include "../hwbinder/hwbinder.h"
+#include "fmq.h"
 #include <fcntl.h>
-#include <hidl/HidlSupport.h>
-#include <hidl/MQDescriptor.h>
-#include <hidl/Status.h>
-#include <hwbinder/IBinder.h>
-#include <hwbinder/IInterface.h>
-#include <hwbinder/IPCThreadState.h>
-#include <hwbinder/Parcel.h>
-#include <hwbinder/ProcessState.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -17,6 +11,8 @@
 #include <unistd.h>
 
 #include <pthread.h>
+#include <sched.h>
+#include <time.h>
 #include <atomic>
 #include <cerrno>
 #include <cstdint>
@@ -24,79 +20,38 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <mutex>
+#include <type_traits>
 #include <vector>
 
-namespace android::hardware {
-status_t writeToParcel(const Status& status, Parcel* parcel);
-status_t readFromParcel(Status* status, const Parcel& parcel);
-status_t writeEmbeddedToParcel(const hidl_handle& handle, Parcel* parcel, size_t parentHandle,
-                               size_t parentOffset);
-status_t writeEmbeddedToParcel(const hidl_string& string, Parcel* parcel, size_t parentHandle,
-                               size_t parentOffset);
-status_t readEmbeddedFromParcel(const hidl_string& string, const Parcel& parcel,
-                                size_t parentHandle, size_t parentOffset);
+using ssal::OK;
+using ssal::sp;
+using ssal::status_t;
+using ssal::hardware::BHwBinder;
+
+using ssal::hardware::hidl_string;
+using ssal::hardware::hidl_vec;
+using ssal::hardware::IBinder;
+using ssal::hardware::IPCThreadState;
+
+using ssal::hardware::Parcel;
+using ssal::hardware::ProcessState;
+using ssal::hardware::Status;
+using ssal::hardware::writeEmbeddedToParcel;
+using ssal::hardware::writeToParcel;
+
 template <typename T>
-status_t writeEmbeddedToParcel(const hidl_vec<T>& vec, Parcel* parcel, size_t parentHandle,
-                               size_t parentOffset) {
-    size_t childHandle = 0;
-    return parcel->writeEmbeddedBuffer(vec.data(), vec.size() * sizeof(T), &childHandle,
-                                       parentHandle, parentOffset + hidl_vec<T>::kOffsetOfBuffer);
-}
-template <>
-status_t writeEmbeddedToParcel(const hidl_vec<hidl_string>& vec, Parcel* parcel,
-                               size_t parentHandle, size_t parentOffset) {
-    size_t childHandle = 0;
-    status_t rc = parcel->writeEmbeddedBuffer(vec.data(), vec.size() * sizeof(hidl_string),
-                                              &childHandle, parentHandle,
-                                              parentOffset + hidl_vec<hidl_string>::kOffsetOfBuffer);
-    if (rc != OK) return rc;
-    for (size_t i = 0; i < vec.size(); ++i) {
-        rc = writeEmbeddedToParcel(vec[i], parcel, childHandle, i * sizeof(hidl_string));
-        if (rc != OK) return rc;
+static status_t writeEmbeddedToParcel(const hidl_vec<T>& vec, Parcel* parcel,
+                                      size_t parent, size_t offset) {
+    size_t child;
+    status_t rc = parcel->writeEmbeddedBuffer(vec.data(), vec.size() * sizeof(T),
+                                              &child, parent, offset);
+    if constexpr (std::is_same_v<T, hidl_string>) {
+        for (size_t i = 0; rc == OK && i < vec.size(); ++i) {
+            rc = writeEmbeddedToParcel(vec[i], parcel, child, i * sizeof(T));
+        }
     }
-    return OK;
-}
-template <typename T, android::hardware::MQFlavor flavor>
-status_t writeEmbeddedToParcel(const MQDescriptor<T, flavor>& obj, Parcel* parcel,
-                               size_t parentHandle, size_t parentOffset) {
-    status_t rc = writeEmbeddedToParcel(
-        obj.grantors(), parcel, parentHandle,
-        parentOffset + MQDescriptor<T, flavor>::kOffsetOfGrantors);
-    if (rc != OK) return rc;
-    return writeEmbeddedToParcel(
-        obj.handle(), parcel, parentHandle,
-        parentOffset + MQDescriptor<T, flavor>::kOffsetOfHandle);
-}
-}  // namespace android::hardware
-
-using android::OK;
-using android::sp;
-using android::status_t;
-using android::hardware::BHwBinder;
-using android::hardware::GrantorDescriptor;
-using android::hardware::hidl_string;
-using android::hardware::hidl_vec;
-using android::hardware::IBinder;
-using android::hardware::IPCThreadState;
-using android::hardware::MQDescriptorSync;
-using android::hardware::Parcel;
-using android::hardware::ProcessState;
-using android::hardware::Status;
-using android::hardware::writeEmbeddedToParcel;
-using android::hardware::writeToParcel;
-
-#ifndef MFD_CLOEXEC
-#define MFD_CLOEXEC 0x0001U
-#endif
-
-static int createMemfd(const char* name, size_t size) {
-    int fd = static_cast<int>(syscall(__NR_memfd_create, name, MFD_CLOEXEC));
-    if (fd < 0) return -1;
-    if (ftruncate(fd, static_cast<off_t>(size)) != 0) {
-        close(fd);
-        return -1;
-    }
-    return fd;
+    return rc;
 }
 
 static status_t writeEmptyVec(Parcel* reply) {
@@ -112,7 +67,7 @@ static status_t handleIBase(uint32_t code, const Parcel& data, Parcel* reply,
                             BHwBinder::TransactCallback cb) {
     if (!data.enforceInterface("android.hidl.base@1.0::IBase")) {
         fprintf(stderr, "handleIBase enforceInterface failed code=0x%x\n", code);
-        return android::BAD_TYPE;
+        return ssal::BAD_TYPE;
     }
     switch (code) {
         case IBinder::HIDL_DESCRIPTOR_CHAIN_TRANSACTION: {
@@ -172,7 +127,7 @@ static status_t handleIBase(uint32_t code, const Parcel& data, Parcel* reply,
             return rc;
         }
         default:
-            return android::UNKNOWN_TRANSACTION;
+            return ssal::UNKNOWN_TRANSACTION;
     }
 }
 
@@ -221,12 +176,15 @@ struct StreamParams {
     uint32_t bytesPerSample = 2;
     uint64_t frameSize() const { return static_cast<uint64_t>(channelCount) * bytesPerSample; }
 };
+static_assert(sizeof(DeviceAddress70) == 40 && offsetof(DeviceAddress70, addressData) == 24);
+static_assert(sizeof(AudioConfigBase70) == 40 && sizeof(AudioOffloadInfo70) == 120);
+static_assert(sizeof(AudioConfig70) == 176 && offsetof(AudioConfig70, frameCount) == 168);
 
 static bool writeExact(int fd, const void* buf, size_t len) {
     const uint8_t* p = static_cast<const uint8_t*>(buf);
     size_t done = 0;
     while (done < len) {
-        ssize_t n = write(fd, p + done, len - done);
+        ssize_t n = send(fd, p + done, len - done, MSG_NOSIGNAL);
         if (n < 0) {
             if (errno == EINTR) continue;
             return false;
@@ -288,6 +246,7 @@ static status_t writeAudioConfig(Parcel* reply, const StreamParams& sp,
 class VirtualStreamOut : public BHwBinder {
 public:
     explicit VirtualStreamOut(StreamParams params) : params_(std::move(params)) {}
+    ~VirtualStreamOut() override { stopWriter(); }
 
     status_t onTransact(uint32_t code, const Parcel& data, Parcel* reply, uint32_t,
                         TransactCallback cb) override {
@@ -300,6 +259,8 @@ public:
         if (code >= IBinder::FIRST_HIDL_TRANSACTION) {
             return handleIBase(code, data, reply, kChain, 3, cb);
         }
+        if (!data.enforceInterface(kChain[code <= 19 ? 1 : 0])) return ssal::BAD_TYPE;
+        std::lock_guard<std::mutex> lock(mutex_);
         writeToParcel(Status::ok(), reply);
         switch (code) {
             case 1:  rc = reply->writeUint64(params_.frameSize()); break;
@@ -309,16 +270,18 @@ public:
             case 5:  reply->writeInt32(0); return writeAudioConfigBase(reply, params_, cb);
             case 9:  // standby
             case 16: // stop
-            case 19: // close
             case 30: // pause
-                paused_.store(true, std::memory_order_release);
+                if (writer_) writer_->pause();
+                rc = reply->writeInt32(0);
+                break;
+            case 19: // close
+                stopWriter();
                 rc = reply->writeInt32(0);
                 break;
             case 10: reply->writeInt32(0); rc = writeEmptyVec(reply); break; // getDevices
             case 13: reply->writeInt32(0); rc = writeEmptyVec(reply); break; // getParameters
             case 15: // start
             case 31: // resume
-                paused_.store(false, std::memory_order_release);
                 rc = reply->writeInt32(0);
                 break;
             case 17: // createMmapBuffer
@@ -327,135 +290,27 @@ public:
                 break;
             case 20: rc = reply->writeUint32(20); break;      // getLatency (20ms)
             case 23: { // prepareForWriting(frameSize, framesCount)
-                uint32_t frameSize = static_cast<uint32_t>(params_.frameSize());
-                uint32_t framesCount = static_cast<uint32_t>(params_.frameCount);
-                data.readUint32(&frameSize);
-                data.readUint32(&framesCount);
-                uint64_t dataBytes = static_cast<uint64_t>(frameSize) * framesCount;
-                if (dataBytes == 0) dataBytes = 4096;
-                size_t totalBytes = (64 + static_cast<size_t>(dataBytes) + 4095) & ~size_t(4095);
-                int dataFd = createMemfd("ssal_audio_data", totalBytes);
-                int statusFd = createMemfd("ssal_audio_status", 4096);
-                if (dataFd < 0 || statusFd < 0) {
-                    if (dataFd >= 0) close(dataFd);
-                    if (statusFd >= 0) close(statusFd);
-                    rc = reply->writeInt32(4 /* INVALID_STATE */);
-                    break;
+                uint32_t frameSize = 0, framesCount = 0;
+                if (data.readUint32(&frameSize) != OK || data.readUint32(&framesCount) != OK) {
+                    return ssal::BAD_VALUE;
                 }
-                std::vector<GrantorDescriptor> dg(4);
-                dg[0] = {0, 0, 0, 8};
-                dg[1] = {0, 0, 8, 8};
-                dg[2] = {0, 0, 64, dataBytes};
-                dg[3] = {0, 0, 16, 4};
-                native_handle_t* dh = native_handle_create(1, 0);
-                dh->data[0] = dataFd;
-                MQDescriptorSync<uint8_t> dataMQ(dg, dh, frameSize);
-
-                std::vector<GrantorDescriptor> sg(4);
-                sg[0] = {0, 0, 0, 8};
-                sg[1] = {0, 0, 8, 8};
-                sg[2] = {0, 0, 64, 32};
-                sg[3] = {0, 0, 16, 4};
-                native_handle_t* sh = native_handle_create(1, 0);
-                sh->data[0] = statusFd;
-                MQDescriptorSync<uint32_t> statusMQ(sg, sh, 32);
-
-                int hostFd = connectHostAudioBridge(
-                    params_.sampleRateHz, params_.channelCount, params_.bytesPerSample);
-                fprintf(stderr, "guest_virtual_audio=prepareForWriting rate=%u ch=%u bps=%u host_bridge=%d\n",
-                        params_.sampleRateHz, params_.channelCount, params_.bytesPerSample, hostFd >= 0 ? 1 : 0);
-
-                struct ConsumerArgs {
-                    int fd;
-                    int hostFd;
-                    size_t totalBytes;
-                    size_t dataBytes;
-                    std::atomic<bool>* paused;
-                };
-                int dupFd = dup(dataFd);
-                if (dupFd >= 0) {
-                    auto* args = new ConsumerArgs{
-                        dupFd, hostFd, totalBytes, static_cast<size_t>(dataBytes), &paused_};
-                    pthread_t tid{};
-                    if (pthread_create(
-                            &tid, nullptr,
-                            [](void* raw) -> void* {
-                                auto* a = static_cast<ConsumerArgs*>(raw);
-                                int fd = a->fd;
-                                int hfd = a->hostFd;
-                                size_t totalSz = a->totalBytes;
-                                size_t ringSz = a->dataBytes;
-                                auto* paused = a->paused;
-                                delete a;
-                                void* mem = mmap(nullptr, totalSz, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-                                close(fd);
-                                if (mem == MAP_FAILED) {
-                                    if (hfd >= 0) close(hfd);
-                                    return nullptr;
-                                }
-                                auto* rd = reinterpret_cast<std::atomic<uint64_t>*>(mem);
-                                auto* wr = reinterpret_cast<std::atomic<uint64_t>*>(static_cast<uint8_t*>(mem) + 8);
-                                const uint8_t* ring = static_cast<const uint8_t*>(mem) + 64;
-                                bool wasPaused = false;
-                                std::vector<uint8_t> tmp;
-                                for (;;) {
-                                    uint64_t r = rd->load(std::memory_order_acquire);
-                                    uint64_t w = wr->load(std::memory_order_acquire);
-                                    if (w > r && (w - r) <= ringSz) {
-                                        paused->store(false, std::memory_order_release);
-                                        wasPaused = false;
-                                        size_t avail = static_cast<size_t>(w - r);
-                                        if (hfd >= 0) {
-                                            tmp.resize(avail);
-                                            size_t start = static_cast<size_t>(r % ringSz);
-                                            size_t first = std::min(avail, ringSz - start);
-                                            memcpy(tmp.data(), ring + start, first);
-                                            if (first < avail) {
-                                                memcpy(tmp.data() + first, ring, avail - first);
-                                            }
-                                            uint32_t len32 = static_cast<uint32_t>(avail);
-                                            if (!writeExact(hfd, &len32, sizeof(len32)) ||
-                                                !writeExact(hfd, tmp.data(), avail)) {
-                                                close(hfd);
-                                                hfd = -1;
-                                            }
-                                        }
-                                        rd->store(w, std::memory_order_release);
-                                    } else {
-                                        if (w > r) rd->store(w, std::memory_order_release);
-                                        if (hfd >= 0 && paused->load(std::memory_order_acquire) && !wasPaused) {
-                                            uint32_t zero = 0;
-                                            if (!writeExact(hfd, &zero, sizeof(zero))) {
-                                                close(hfd);
-                                                hfd = -1;
-                                            }
-                                            wasPaused = true;
-                                        }
-                                        usleep(5000);
-                                    }
-                                }
-                                munmap(mem, totalSz);
-                                if (hfd >= 0) close(hfd);
-                                return nullptr;
-                            },
-                            args) == 0) {
-                        pthread_detach(tid);
-                    } else {
-                        close(dupFd);
-                        if (hostFd >= 0) close(hostFd);
-                        delete args;
-                    }
-                } else if (hostFd >= 0) {
-                    close(hostFd);
+                int32_t result = 0;
+                if (writer_) result = 4; // INVALID_STATE
+                else if (frameSize != params_.frameSize() || !framesCount ||
+                         framesCount > 1024 * 1024 / frameSize) result = 2; // INVALID_ARGUMENTS
+                else {
+                    writer_ = std::make_unique<Writer>(params_, frameSize * framesCount);
+                    if (!writer_->start()) { writer_.reset(); result = 4; }
                 }
-
-                reply->writeInt32(0 /* OK */);
-                size_t dHandle = 0, sHandle = 0;
-                rc = reply->writeBuffer(&dataMQ, sizeof(dataMQ), &dHandle);
-                if (rc == OK) rc = writeEmbeddedToParcel(dataMQ, reply, dHandle, 0);
-                if (rc == OK) rc = reply->writeBuffer(&statusMQ, sizeof(statusMQ), &sHandle);
-                if (rc == OK) rc = writeEmbeddedToParcel(statusMQ, reply, sHandle, 0);
-                if (rc == OK) rc = reply->writeInt32(gettid());
+                reply->writeInt32(result);
+                if (result == 0) {
+                    rc = writer_->command.describe(reply);
+                    if (rc == OK) rc = writer_->data.describe(reply);
+                    if (rc == OK) rc = writer_->status.describe(reply);
+                } else {
+                    for (int i = 0; i < 3 && rc == OK; ++i) rc = ssal::audio::Queue::emptyDescriptor(reply);
+                }
+                if (rc == OK) rc = reply->writeInt32(result == 0 ? writer_->tid.load() : 0);
                 if (rc == OK && cb) cb(*reply);
                 return rc;
             }
@@ -467,8 +322,8 @@ public:
                 reply->writeInt32(5 /* NOT_SUPPORTED */);
                 rc = reply->writeInt64(0);
                 break;
-            case 28: // getPresentationPosition
-                reply->writeInt32(0);
+            case 35: // getPresentationPosition (Host DAC position is not available)
+                reply->writeInt32(5);
                 reply->writeUint64(0);
                 reply->writeUint64(0);
                 rc = reply->writeUint64(0);
@@ -489,8 +344,71 @@ public:
     }
 
 private:
+    struct Writer {
+        ssal::audio::Queue command{4, 4};
+        ssal::audio::Queue data;
+        ssal::audio::Queue status{32, 32};
+        std::atomic<int32_t> tid{0};
+        std::atomic<bool> stopped{false};
+        int hostFd;
+        pthread_t thread{};
+        bool running = false;
+        std::mutex socketMutex;
+        explicit Writer(const StreamParams& params, size_t bytes)
+            : data(bytes, 1, true), hostFd(connectHostAudioBridge(
+                params.sampleRateHz, params.channelCount, params.bytesPerSample)) {}
+        bool start() {
+            if (!command.valid() || !data.valid() || !status.valid()) return false;
+            int rc = pthread_create(&thread, nullptr, [](void* raw) -> void* {
+                static_cast<Writer*>(raw)->run(); return nullptr;
+            }, this);
+            if (rc != 0) return false;
+            running = true;
+            while (!tid.load(std::memory_order_acquire)) sched_yield();
+            fprintf(stderr, "guest_virtual_audio=prepareForWriting host_bridge=%d writer_tid=%d\n",
+                    hostFd >= 0, tid.load());
+            return true;
+        }
+        ~Writer() {
+            stopped.store(true, std::memory_order_release);
+            if (hostFd >= 0) shutdown(hostFd, SHUT_RDWR);
+            if (data.valid()) data.wake(1);
+            if (running) pthread_join(thread, nullptr);
+            if (hostFd >= 0) close(hostFd);
+        }
+        void pause() {
+            std::lock_guard<std::mutex> lock(socketMutex);
+            uint32_t zero = 0;
+            if (hostFd >= 0) writeExact(hostFd, &zero, sizeof(zero));
+        }
+        void run() {
+            tid.store(gettid(), std::memory_order_release);
+            while (!stopped.load(std::memory_order_acquire)) {
+                int32_t op;
+                if (!command.read(&op, sizeof(op))) { data.wait(1); continue; }
+                ssal::audio::WriteStatus response;
+                response.replyTo = op;
+                if (op == 0) { // WRITE
+                    size_t size = data.available();
+                    if (size == SIZE_MAX) break;
+                    std::vector<uint8_t> pcm(size);
+                    if (!data.read(pcm.data(), size)) break;
+                    std::lock_guard<std::mutex> lock(socketMutex);
+                    uint32_t length = static_cast<uint32_t>(size);
+                    if (hostFd >= 0 && writeExact(hostFd, &length, sizeof(length)) &&
+                        writeExact(hostFd, pcm.data(), size)) response.value = size;
+                    else response.result = 4; // INVALID_STATE
+                } else if (op == 2) response.value = 20; // GET_LATENCY, milliseconds
+                else response.result = 5; // NOT_SUPPORTED (including Host presentation position)
+                if (!status.write(&response, sizeof(response))) break;
+                data.wake(2); // audio MessageQueueFlagBits::NOT_FULL
+            }
+        }
+    };
+    void stopWriter() { writer_.reset(); }
     StreamParams params_;
-    std::atomic<bool> paused_{false};
+    std::unique_ptr<Writer> writer_;
+    std::mutex mutex_;
 };
 
 class VirtualPrimaryDevice : public BHwBinder {
@@ -506,6 +424,7 @@ public:
         if (code >= IBinder::FIRST_HIDL_TRANSACTION) {
             return handleIBase(code, data, reply, kChain, 3, cb);
         }
+        if (!data.enforceInterface(kChain[code <= 25 ? 1 : 0])) return ssal::BAD_TYPE;
         writeToParcel(Status::ok(), reply);
         switch (code) {
             case 3:  reply->writeInt32(0); rc = reply->writeFloat(1.0f); break; // getMasterVolume
@@ -516,26 +435,36 @@ public:
                 reply->writeInt32(0); rc = reply->writeUint64(4096); break;
             case 9: { // openOutputStream
                 StreamParams spParams;
-                bool enf = data.enforceInterface("android.hardware.audio@7.0::IDevice");
                 int32_t ioHandle = 0;
                 status_t ioRc = data.readInt32(&ioHandle);
                 const DeviceAddress70* devAddr = nullptr;
                 size_t devH = 0;
                 status_t devRc = data.readBuffer(sizeof(DeviceAddress70), &devH,
                                                  reinterpret_cast<const void**>(&devAddr));
+                if (devRc == OK && devAddr) {
+                    devRc = ssal::hardware::readEmbeddedFromParcel(devAddr->deviceType, data, devH, 0);
+                    if (devRc == OK && devAddr->addressDiscriminator == 0) {
+                        devRc = ssal::hardware::readEmbeddedFromParcel(
+                            *reinterpret_cast<const hidl_string*>(devAddr->addressData), data, devH, 24);
+                    } else if (devAddr->addressDiscriminator > 4) devRc = ssal::BAD_VALUE;
+                }
+                if (devRc != OK) return devRc;
                 const AudioConfig70* reqCfg = nullptr;
                 size_t cfgH = 0;
                 status_t cfgRc = data.readBuffer(sizeof(AudioConfig70), &cfgH,
                                                  reinterpret_cast<const void**>(&reqCfg));
-                fprintf(stderr, "guest_virtual_audio=openOutputStream_parse enf=%d ioRc=%d devRc=%d cfgRc=%d\n",
-                        enf ? 1 : 0, ioRc, devRc, cfgRc);
-                if (enf && cfgRc == OK && reqCfg != nullptr) {
-                    android::hardware::readEmbeddedFromParcel(
+                fprintf(stderr, "guest_virtual_audio=openOutputStream_parse ioRc=%d devRc=%d cfgRc=%d\n",
+                        ioRc, devRc, cfgRc);
+                if (ioRc != OK || devRc != OK || cfgRc != OK || !reqCfg) return ssal::BAD_VALUE;
+                {
+                    status_t configRc = ssal::hardware::readEmbeddedFromParcel(
                         reqCfg->base.format, data, cfgH,
                         offsetof(AudioConfig70, base) + offsetof(AudioConfigBase70, format));
-                    android::hardware::readEmbeddedFromParcel(
+                    if (configRc != OK) return configRc;
+                    configRc = ssal::hardware::readEmbeddedFromParcel(
                         reqCfg->base.channelMask, data, cfgH,
                         offsetof(AudioConfig70, base) + offsetof(AudioConfigBase70, channelMask));
+                    if (configRc != OK || reqCfg->offloadDiscriminator != 0) return ssal::BAD_VALUE;
                     if (reqCfg->base.sampleRateHz > 0) {
                         spParams.sampleRateHz = reqCfg->base.sampleRateHz;
                     }
@@ -555,10 +484,14 @@ public:
                         }
                     }
                 }
+                if (spParams.sampleRateHz < 8000 || spParams.sampleRateHz > 192000 ||
+                    (spParams.format != "AUDIO_FORMAT_PCM_16_BIT" && spParams.format != "AUDIO_FORMAT_PCM_FLOAT") ||
+                    (spParams.channelMask != "AUDIO_CHANNEL_OUT_MONO" && spParams.channelMask != "AUDIO_CHANNEL_OUT_STEREO") ||
+                    spParams.frameCount > 1024 * 1024 / spParams.frameSize()) return ssal::BAD_VALUE;
                 fprintf(stderr, "guest_virtual_audio=openOutputStream rate=%u fmt=%s ch=%s frames=%llu\n",
                         spParams.sampleRateHz, spParams.format.c_str(), spParams.channelMask.c_str(),
                         static_cast<unsigned long long>(spParams.frameCount));
-                sp<IBinder> stream = new VirtualStreamOut(spParams);
+                sp<IBinder> stream = std::make_shared<VirtualStreamOut>(spParams);
                 reply->writeInt32(0 /* OK */);
                 reply->writeStrongBinder(stream);
                 return writeAudioConfig(reply, spParams, cb);
@@ -604,20 +537,20 @@ public:
         if (code >= IBinder::FIRST_HIDL_TRANSACTION) {
             return handleIBase(code, data, reply, kChain, 2, cb);
         }
+        if (!data.enforceInterface(kChain[0])) return ssal::BAD_TYPE;
         writeToParcel(Status::ok(), reply);
         if (code == 1) { // openDevice(string device)
             const hidl_string* dev = nullptr;
             size_t handle = 0;
-            data.enforceInterface("android.hardware.audio@7.0::IDevicesFactory");
             data.readBuffer(sizeof(hidl_string), &handle, reinterpret_cast<const void**>(&dev));
             if (dev) {
-                android::hardware::readEmbeddedFromParcel(*dev, data, handle, 0);
+                if (ssal::hardware::readEmbeddedFromParcel(*dev, data, handle, 0) != OK) return ssal::BAD_VALUE;
             }
             const char* name = dev ? dev->c_str() : "";
             fprintf(stderr, "guest_virtual_audio=openDevice name=%s\n", name);
             if (strcmp(name, "primary") == 0) {
                 reply->writeInt32(0 /* OK */);
-                rc = reply->writeStrongBinder(new VirtualPrimaryDevice());
+                rc = reply->writeStrongBinder(std::make_shared<VirtualPrimaryDevice>());
             } else {
                 reply->writeInt32(2 /* INVALID_ARGUMENTS */);
                 rc = reply->writeStrongBinder(nullptr);
@@ -628,11 +561,11 @@ public:
         if (code == 2) { // openPrimaryDevice()
             fprintf(stderr, "guest_virtual_audio=openPrimaryDevice\n");
             reply->writeInt32(0 /* OK */);
-            rc = reply->writeStrongBinder(new VirtualPrimaryDevice());
+            rc = reply->writeStrongBinder(std::make_shared<VirtualPrimaryDevice>());
             if (rc == OK && cb) cb(*reply);
             return rc;
         }
-        return android::UNKNOWN_TRANSACTION;
+        return ssal::UNKNOWN_TRANSACTION;
     }
 };
 
@@ -648,6 +581,7 @@ public:
         if (code >= IBinder::FIRST_HIDL_TRANSACTION) {
             return handleIBase(code, data, reply, kChain, 2, cb);
         }
+        if (!data.enforceInterface(kChain[0])) return ssal::BAD_TYPE;
         writeToParcel(Status::ok(), reply);
         if (code == 1) { // getAllDescriptors
             fprintf(stderr, "guest_virtual_audio=getAllDescriptors\n");
@@ -676,7 +610,7 @@ static bool registerHidlService(const sp<IBinder>& sm, const char* instance, con
         return false;
     }
     Status status;
-    status_t src = android::hardware::readFromParcel(&status, rep);
+    status_t src = ssal::hardware::readFromParcel(&status, rep);
     if (src != OK || !status.isOk()) {
         fprintf(stderr, "registerHidlService status failed src=%d desc=%s\n", src,
                 status.description().c_str());
@@ -700,15 +634,20 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    ProcessState::self()->startThreadPool();
-    sp<IBinder> sm = ProcessState::self()->getContextObject(nullptr);
+    auto* process = ProcessState::self();
+    if (!process) {
+        fprintf(stderr, "ssal-virtual-audio: private hwbinder initialization failed\n");
+        return 1;
+    }
+    process->startThreadPool();
+    sp<IBinder> sm = process->getContextObject(nullptr);
     if (!sm) {
         fprintf(stderr, "ssal-virtual-audio: hwservicemanager context null\n");
         return 1;
     }
 
-    sp<IBinder> devices = new VirtualDevicesFactory();
-    sp<IBinder> effects = new VirtualEffectsFactory();
+    sp<IBinder> devices = std::make_shared<VirtualDevicesFactory>();
+    sp<IBinder> effects = std::make_shared<VirtualEffectsFactory>();
     if (!registerHidlService(sm, "default", devices) ||
         !registerHidlService(sm, "default", effects)) {
         fprintf(stderr, "ssal-virtual-audio: failed to register HIDL audio services\n");

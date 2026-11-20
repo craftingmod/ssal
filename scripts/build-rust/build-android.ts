@@ -7,7 +7,6 @@ if (import.meta.main) {
     throw new Error("Usage: bun scripts/build-rust/build-android.ts <src|services|native|clean>")
   }
   const args = ["bash", "scripts/build-rust/build-android.sh", target]
-  if (process.env.SSAL_GUEST_LIB_DIR) args.unshift("env", `SSAL_GUEST_LIB_DIR=${process.env.SSAL_GUEST_LIB_DIR}`)
   const command = buildCommand(process.platform, args)
   const child = Bun.spawn(command, {
     cwd: fileURLToPath(new URL("../../", import.meta.url)),

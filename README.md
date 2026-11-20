@@ -100,7 +100,9 @@ bun run build
 
 `bun run build:src`는 Rust 본체와 진단 바이너리, `bun run build:services`는 `services/` Cargo workspace, `bun run build:native`는 기존 Android 빌드의 C/C++ 라이브러리와 HwBinder·오디오 helper를 빌드합니다. 결과는 모두 `out/bin/`에 설치합니다. Java probe와 Android Surface 앱은 별도 빌드입니다.
 
-native 빌드에는 Android 16 Guest 시스템의 `lib64`에서 추출한 `libhidlbase.so`, `libutils.so`, `libcutils.so`, `libc++.so`가 필요합니다. `.cache/android16-hwbinder-libs/`에 준비하거나 `SSAL_GUEST_LIB_DIR`로 디렉터리를 지정하세요. Windows에서는 컨테이너 내부 경로(예: `/src/guest-libs`)를 사용합니다. 누락 시 native 빌드와 clean은 산출물을 변경하기 전에 중단합니다. Host One UI 라이브러리는 사용하지 않습니다.
+native 빌드는 Android NDK만 사용하며 GSI에서 추출한 `.so`나 AOSP 헤더 다운로드가 필요하지 않습니다. HwBinder probe와 가상 오디오 HAL은 `native/hwbinder/`의 공통 HIDL 전송 코드를 사용하고 C++ 런타임은 정적으로 링크합니다. Host 오디오 출력만 공개 NDK API인 `libaaudio.so`를 사용합니다. GSI 이미지는 Guest 실행 시에만 필요합니다.
+
+`bash scripts/build-rust/test-hwbinder.sh`는 parcel 경계 검사, 오디오 command/data/status FMQ 왕복과 stream 종료를 UBSan으로 검사한 뒤, 세 helper를 NDK로 빌드하고 ELF 의존성 목록을 검사합니다. Windows에서는 `wslc exec --workdir /src ssal-dev bash scripts/build-rust/test-hwbinder.sh`로 실행합니다. 현재 오디오 경로는 HIDL 7.0 PCM 16-bit/float, mono/stereo 출력용이며 입력·offload·Host DAC presentation position은 지원하지 않습니다. Host bridge는 한 번에 한 출력 stream을 처리합니다.
 
 세 명령은 Windows에서 `wslc exec --workdir /src ssal-dev`로 실행하고 Linux에서는 로컬 `bash`로 실행합니다. 일반 WSL로 자동 전환하지 않습니다. Linux에서는 Bun, Cargo, `aarch64-linux-android` Rust target과 Linux x86_64 Android NDK가 필요하며 `ANDROID_NDK_HOME`의 기본값은 `/opt/android-ndk`입니다. 그 외 빌드 의존성은 `containers/builder/Containerfile`을 참고하세요.
 

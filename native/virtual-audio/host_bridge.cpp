@@ -66,6 +66,7 @@ int main(int argc, char** argv) {
     printf("host_audio_bridge_ready=%s\n", sockPath);
     fflush(stdout);
 
+    // shortcut: one active PCM output stream; add mixing when concurrent outputs are needed.
     for (;;) {
         int client = accept4(srv, nullptr, nullptr, SOCK_CLOEXEC);
         if (client < 0) {
@@ -74,8 +75,9 @@ int main(int argc, char** argv) {
         }
 
         AudioHeader hdr{};
-        if (!readExact(client, &hdr, sizeof(hdr)) || hdr.sampleRateHz == 0 ||
-            hdr.channelCount == 0 || hdr.bytesPerSample == 0) {
+        if (!readExact(client, &hdr, sizeof(hdr)) || hdr.sampleRateHz < 8000 ||
+            hdr.sampleRateHz > 192000 || (hdr.channelCount != 1 && hdr.channelCount != 2) ||
+            (hdr.bytesPerSample != 2 && hdr.bytesPerSample != 4)) {
             close(client);
             continue;
         }
@@ -102,6 +104,14 @@ int main(int argc, char** argv) {
             close(client);
             continue;
         }
+        if (AAudioStream_getSampleRate(stream) != static_cast<int32_t>(hdr.sampleRateHz) ||
+            AAudioStream_getChannelCount(stream) != static_cast<int32_t>(hdr.channelCount) ||
+            AAudioStream_getFormat(stream) != (hdr.bytesPerSample == 4 ? AAUDIO_FORMAT_PCM_FLOAT : AAUDIO_FORMAT_PCM_I16)) {
+            fprintf(stderr, "ssal-audio-host: negotiated PCM configuration mismatch\n");
+            AAudioStream_close(stream);
+            close(client);
+            continue;
+        }
 
         fprintf(stderr, "ssal-audio-host: opened AAudio stream rate=%u ch=%u bps=%u\n",
                 hdr.sampleRateHz, hdr.channelCount, hdr.bytesPerSample);
@@ -118,20 +128,21 @@ int main(int argc, char** argv) {
                 }
                 continue;
             }
-            if (len > 1024 * 1024) break;
+            if (len > 1024 * 1024 || len % frameBytes) break;
             buf.resize(len);
             if (!readExact(client, buf.data(), len)) break;
             if (!started) {
-                if (AAudioStream_requestStart(stream) == AAUDIO_OK) {
-                    started = true;
-                }
+                if (AAudioStream_requestStart(stream) != AAUDIO_OK) break;
+                started = true;
             }
-            if (started && frameBytes > 0) {
-                int32_t frames = static_cast<int32_t>(len / frameBytes);
-                if (frames > 0) {
-                    AAudioStream_write(stream, buf.data(), frames, 100000000LL /* 100ms */);
-                }
+            uint32_t written = 0;
+            while (written < len) {
+                aaudio_result_t frames = AAudioStream_write(stream, buf.data() + written,
+                    static_cast<int32_t>((len - written) / frameBytes), 100000000LL /* 100ms */);
+                if (frames <= 0) break;
+                written += static_cast<uint32_t>(frames) * frameBytes;
             }
+            if (written != len) break;
         }
 
         AAudioStream_requestStop(stream);
