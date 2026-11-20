@@ -47,6 +47,7 @@ pub(crate) fn root_command_at(
     let old_root_c = CString::new(old_root.as_str()).map_err(io::Error::other)?;
     let zygote = executable == "/system/bin/app_process64";
     let inherited = ssal::unix::inherited_fds()?;
+    let cgroup_ns = crate::guest::cgroup::namespace_fd();
     let expected = fs::metadata(root)?;
     let pivot_log = if pivot && std::env::var_os("SSAL_PHASE7FB_FORK").is_some() {
         let phase = if std::env::var_os("SSAL_PHASE7I_PROPERTIES").is_some() {
@@ -72,7 +73,10 @@ pub(crate) fn root_command_at(
         .env("PATH", "/system/bin:/apex/com.android.runtime/bin");
     unsafe {
         command.pre_exec(move || {
-            ssal::unix::close_inherited_fds(&inherited, &[])?;
+            ssal::unix::close_inherited_fds(
+                &inherited,
+                cgroup_ns.as_ref().map_or(&[][..], std::slice::from_ref),
+            )?;
             ssal::unix::cloexec_unexpected_fds()?;
             isolate_process_group(zygote)?;
             if pivot {
@@ -156,7 +160,10 @@ pub(crate) fn command_for_phase2c(root: &Path, executable: &str) -> io::Result<C
         .env("PATH", "/system/bin:/apex/com.android.runtime/bin");
     unsafe {
         command.pre_exec(move || {
-            ssal::unix::close_inherited_fds(&inherited, &[])?;
+            ssal::unix::close_inherited_fds(
+                &inherited,
+                cgroup_ns.as_ref().map_or(&[][..], std::slice::from_ref),
+            )?;
             ssal::unix::cloexec_unexpected_fds()?;
             if libc::setsid() < 0 {
                 return Err(io::Error::last_os_error());

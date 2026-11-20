@@ -889,10 +889,13 @@ fn prepare_security_daemon_dir(
     root: &Path,
     rel: &str,
     uid: u32,
+    gid: u32,
+    mode: u32,
     label_type: &str,
 ) -> io::Result<()> {
-    let dir = crate::guest::mount::directory(root, rel, 0o700)?;
-    std::os::unix::fs::chown(&dir, Some(uid), Some(uid))?;
+    let dir = crate::guest::mount::directory(root, rel, mode)?;
+    std::os::unix::fs::chown(&dir, Some(uid), Some(gid))?;
+    fs::set_permissions(&dir, fs::Permissions::from_mode(mode))?;
     if let Some(plan) = ssal::guest_policy::runtime::load(root)? {
         ssal::guest_policy::runtime::set_label(&dir, &plan.context(label_type, false)?)?;
     }
@@ -1548,7 +1551,17 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
                 root,
                 "data/misc/gatekeeper",
                 1000,
+                1000,
+                0o700,
                 "gatekeeper_data_file",
+            )?;
+            prepare_security_daemon_dir(
+                root,
+                "data/misc/adb",
+                1000,
+                2000,
+                0o2750,
+                "adb_data_file",
             )?;
             boot_services.push(Service::start(
                 root,
@@ -1579,6 +1592,8 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
                     root,
                     "data/misc/keystore",
                     1017,
+                    1017,
+                    0o700,
                     "keystore_data_file",
                 )?;
                 boot_services.push(Service::start(

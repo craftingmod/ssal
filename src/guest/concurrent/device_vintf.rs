@@ -6,7 +6,7 @@ use std::io;
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::Path;
 
-const HIDDEN_HAL_TOKENS: &[&str] = &["weaver", "usb", "camera", "nfc", "radio"];
+const HIDDEN_HAL_TOKENS: &[&str] = &["weaver", "usb", "camera", "nfc", "radio", "fingerprint"];
 const DEVICE_VINTF_PARTITIONS: &[&str] = &["vendor", "odm"];
 const UNAVAILABLE_FEATURES_XML: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 <permissions>
@@ -50,6 +50,10 @@ const UNAVAILABLE_FEATURES_XML: &str = r#"<?xml version="1.0" encoding="utf-8"?>
     <!-- USB -->
     <unavailable-feature name="android.hardware.usb.host" />
     <unavailable-feature name="android.hardware.usb.accessory" />
+
+    <!-- Biometrics -->
+    <unavailable-feature name="android.hardware.fingerprint" />
+    <unavailable-feature name="android.hardware.biometrics.face" />
 </permissions>
 "#;
 
