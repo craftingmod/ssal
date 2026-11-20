@@ -54,6 +54,13 @@ const UNAVAILABLE_FEATURES_XML: &str = r#"<?xml version="1.0" encoding="utf-8"?>
     <!-- Biometrics -->
     <unavailable-feature name="android.hardware.fingerprint" />
     <unavailable-feature name="android.hardware.biometrics.face" />
+
+    <!-- Wi-Fi -->
+    <unavailable-feature name="android.hardware.wifi" />
+    <unavailable-feature name="android.hardware.wifi.direct" />
+    <unavailable-feature name="android.hardware.wifi.passpoint" />
+    <unavailable-feature name="android.hardware.wifi.aware" />
+    <unavailable-feature name="android.hardware.wifi.rtt" />
 </permissions>
 "#;
 

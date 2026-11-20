@@ -5,6 +5,7 @@ pub(crate) mod memory_cgroup;
 #[allow(dead_code)]
 #[path = "../guest/process/supervision.rs"]
 pub(crate) mod supervision;
+#[allow(dead_code)]
 #[path = "../diagnostics/zygote.rs"]
 pub(crate) mod zygote;
 mod diagnostics {

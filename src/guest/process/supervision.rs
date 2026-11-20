@@ -139,8 +139,17 @@ pub(crate) fn cleanup_descendants(require_guest_cgroup: bool) -> io::Result<()> 
     }
 }
 pub(crate) fn check_interrupted() -> io::Result<()> {
-    require(
-        !INTERRUPTED.load(Ordering::SeqCst),
-        "Guest worker interrupted",
-    )
+    if INTERRUPTED.load(Ordering::SeqCst) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "Guest worker interrupted",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn is_shutdown(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::Interrupted
+        && error.raw_os_error().is_none()
+        && INTERRUPTED.load(Ordering::SeqCst)
 }

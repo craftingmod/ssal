@@ -12,6 +12,20 @@ RUN curl -fsSL https://dl.google.com/android/repository/android-ndk-r30-linux.zi
     && unzip -q /tmp/ndk.zip -d /opt \
     && mv /opt/android-ndk-r30 /opt/android-ndk \
     && rm /tmp/ndk.zip
+# JDK plus the minimal Android SDK pieces (android.jar, d8.jar) used to build the guest helper jars.
+RUN apt-get update && apt-get install -y --no-install-recommends openjdk-17-jdk-headless \
+    && rm -rf /var/lib/apt/lists/*
+RUN mkdir -p /opt/android-sdk/build-tools /opt/android-sdk/platforms \
+    && curl -fsSL https://dl.google.com/android/repository/build-tools_r34-linux.zip -o /tmp/bt.zip \
+    && echo 'd6d58e0c6925a9e4d9a541e84cd1f405c2f9d2a9  /tmp/bt.zip' | sha1sum -c - \
+    && unzip -q /tmp/bt.zip -d /tmp/bt && mv /tmp/bt/android-* /opt/android-sdk/build-tools/34.0.0 \
+    && curl -fsSL https://dl.google.com/android/repository/platform-34-ext7_r03.zip -o /tmp/pf.zip \
+    && echo '1f2e9478d6a7601425ceaa553311dc43191f103d  /tmp/pf.zip' | sha1sum -c - \
+    && unzip -q /tmp/pf.zip -d /tmp/pf && mv /tmp/pf/android-* /opt/android-sdk/platforms/android-34 \
+    && rm -rf /tmp/bt /tmp/pf /tmp/bt.zip /tmp/pf.zip \
+    && test -f /opt/android-sdk/build-tools/34.0.0/lib/d8.jar \
+    && test -f /opt/android-sdk/platforms/android-34/android.jar
+ENV ANDROID_HOME=/opt/android-sdk
 RUN rustup target add aarch64-linux-android && rustup component add rustfmt clippy
 ENV ANDROID_NDK_HOME=/opt/android-ndk \
     CARGO_TARGET_DIR=/build/target \

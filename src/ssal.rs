@@ -42,11 +42,16 @@ fn main() {
                 let mut stream = UnixStream::connect(format!("{ROOT}/run/ssald.sock"))
                     .map_err(|e| format!("cannot connect to ssald: {e}"))?;
                 send(&mut stream, &request, file.as_ref().map(AsRawFd::as_raw_fd))?;
+                let mut stream = io::BufReader::new(stream);
                 let mut line = String::new();
-                io::BufReader::new(stream).read_line(&mut line)?;
+                stream.read_line(&mut line)?;
                 let response: Response = serde_json::from_str(&line)?;
                 if !response.ok {
                     return Err(response.message.into());
+                }
+                if matches!(request.command.as_str(), "logcat" | "logcat-dump") {
+                    io::copy(&mut stream, &mut io::stdout().lock())?;
+                    return Ok(());
                 }
                 response.message
             }

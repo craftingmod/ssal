@@ -15,6 +15,6 @@ fn main() {
 
 #[cfg(not(target_os = "android"))]
 fn main() {
-    eprintln!("phase3-ipc must run on Android");
+    eprintln!("ssal-binder-ipc must run on Android");
     std::process::exit(2);
 }

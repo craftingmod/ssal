@@ -36,6 +36,12 @@ internal class NativePresenter(socketAddr: String) {
         }
     }
 
+    fun sendKey(keyCode: Int, eventTimeMs: Long) {
+        if (handle != 0L) {
+            nativeSendKey(handle, keyCode, eventTimeMs)
+        }
+    }
+
     fun close() {
         if (handle != 0L) {
             nativeDestroy(handle)
@@ -56,6 +62,7 @@ internal class NativePresenter(socketAddr: String) {
         ys: FloatArray,
         pressures: FloatArray,
     )
+    private external fun nativeSendKey(handle: Long, keyCode: Int, eventTimeMs: Long)
     private external fun nativeDestroy(handle: Long)
 
     companion object {

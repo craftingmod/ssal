@@ -424,6 +424,7 @@ pub(in crate::guest) fn apply_graphics_allocator_access(
         (alloc, hwsm, "binder", &["call", "transfer"]),
         (hwsm, alloc, "binder", &["call", "transfer"]),
         (alloc, alloc_hwsvc, "hwservice_manager", &["add", "find"]),
+        (alloc, "hal_graphics_allocator_hwservice", "hwservice_manager", &["add", "find"]),
         (alloc, default_hwsvc, "hwservice_manager", &["add", "find"]),
         (alloc, hidl_base_hwsvc, "hwservice_manager", &["add"]),
         (alloc, hwsm_prop, "file", &["read", "open", "getattr", "map"]),
@@ -433,6 +434,7 @@ pub(in crate::guest) fn apply_graphics_allocator_access(
     let clients: Vec<&str> = [
         "surfaceflinger",
         "bootanim",
+        "mediaswcodec",
         "system_server",
         "system_app",
         "platform_app",
@@ -449,6 +451,7 @@ pub(in crate::guest) fn apply_graphics_allocator_access(
             (alloc.as_str(), *client, "binder", &["call", "transfer"][..]),
             (alloc.as_str(), *client, "fd", &["use"][..]),
             (*client, alloc_hwsvc.as_str(), "hwservice_manager", &["find"][..]),
+            (*client, "hal_graphics_allocator_hwservice", "hwservice_manager", &["find"][..]),
             (*client, default_hwsvc.as_str(), "hwservice_manager", &["find"][..]),
         ]);
     }

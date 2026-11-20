@@ -1,5 +1,9 @@
 package alyac.android.ssalsurface
 
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.Paint
@@ -11,6 +15,7 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.os.SystemClock
 import android.util.Log
+import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
@@ -58,6 +63,23 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
     private val touchPressures = FloatArray(10)
     private var activeTouch = false
     private var lastTouchDownTime = 0L
+    private val screenReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            when (intent?.action) {
+                Intent.ACTION_SCREEN_OFF -> {
+                    nativePresenter?.sendKey(KeyEvent.KEYCODE_SLEEP, SystemClock.uptimeMillis())
+                }
+                Intent.ACTION_SCREEN_ON -> {
+                    if (resumed) {
+                        nativePresenter?.sendKey(
+                            KeyEvent.KEYCODE_WAKEUP,
+                            SystemClock.uptimeMillis(),
+                        )
+                    }
+                }
+            }
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -68,6 +90,11 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
         surfaceView.setOnTouchListener { _, event -> handleTouch(event) }
         surfaceHolder = surfaceView.holder
         surfaceHolder.addCallback(this)
+        val screenFilter = IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_OFF)
+            addAction(Intent.ACTION_SCREEN_ON)
+        }
+        registerReceiver(screenReceiver, screenFilter)
         val session = intent.getStringExtra("presenter_session")
         if (applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0 &&
             session != null && session.matches(Regex("[0-9a-f]{32}"))
@@ -110,6 +137,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
                     nativePresenter?.setSurface(surfaceHolder.surface, surfaceWidth, surfaceHeight)
                 }
             }
+            nativePresenter?.sendKey(KeyEvent.KEYCODE_WAKEUP, SystemClock.uptimeMillis())
         }
         present()
     }
@@ -132,6 +160,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
     }
 
     override fun onDestroy() {
+        unregisterReceiver(screenReceiver)
         surfaceHolder.removeCallback(this)
         frame.recycle()
         Log.i("SsalPresenter", "Activity destroyed, callback removed and bitmap recycled")
@@ -201,6 +230,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
     }
 
     private fun present() {
+        if (nativePresenter != null) return
         if (!resumed || !surfaceReady || !surfaceHolder.surface.isValid) return
         val canvas = surfaceHolder.lockCanvas() ?: return
         try {

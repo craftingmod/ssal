@@ -1,9 +1,10 @@
-#include <android/data_space.h>
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
+#include <GLES2/gl2.h>
+#include <GLES2/gl2ext.h>
 #include <android/hardware_buffer.h>
 #include <android/log.h>
 #include <android/native_window_jni.h>
-#include <android/rect.h>
-#include <android/surface_control.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <jni.h>
@@ -34,6 +35,7 @@ namespace {
 constexpr uint32_t kPacketMagic = 0x5353414C; // 'SSAL'
 constexpr uint32_t kPacketVersion = 1;
 constexpr uint32_t kTouchMagic = 0x53544348; // 'STCH'
+constexpr uint32_t kKeyMagic = 0x534B4559; // 'SKEY'
 constexpr uint32_t kTouchVersion = 1;
 constexpr uint32_t kMaxTouchPointers = 10;
 constexpr size_t kMaxScmFds = 32;
@@ -180,12 +182,27 @@ struct NativePresenter {
     std::atomic<bool> running{true};
     std::atomic<int> active_listener_fd{-1};
     std::atomic<int> active_peer_fd{-1};
+    std::atomic<int32_t> pending_key_code{0};
+    std::atomic<int64_t> pending_key_time_ms{0};
 
     std::mutex surface_mutex;
     ANativeWindow* window = nullptr;
-    ASurfaceControl* surface_control = nullptr;
     int32_t surface_width = 0;
     int32_t surface_height = 0;
+
+    EGLDisplay egl_display = EGL_NO_DISPLAY;
+    EGLConfig egl_config = nullptr;
+    EGLContext egl_context = EGL_NO_CONTEXT;
+    EGLSurface egl_surface = EGL_NO_SURFACE;
+    GLuint gl_program = 0;
+    GLuint gl_texture = 0;
+    GLint gl_pos_loc = -1;
+    GLint gl_uv_loc = -1;
+    GLint gl_tex_loc = -1;
+    PFNEGLGETNATIVECLIENTBUFFERANDROIDPROC pfn_eglGetNativeClientBufferANDROID = nullptr;
+    PFNEGLCREATEIMAGEKHRPROC pfn_eglCreateImageKHR = nullptr;
+    PFNEGLDESTROYIMAGEKHRPROC pfn_eglDestroyImageKHR = nullptr;
+    PFNGLEGLIMAGETARGETTEXTURE2DOESPROC pfn_glEGLImageTargetTexture2DOES = nullptr;
 
     std::mutex geom_mutex;
     uint32_t guest_width = 0;
@@ -224,6 +241,7 @@ struct NativePresenter {
         }
         clear_slot_cache();
         set_surface(nullptr, 0, 0);
+        destroy_egl();
     }
 
     void clear_slot_cache() {
@@ -235,13 +253,154 @@ struct NativePresenter {
         slot_cache.clear();
     }
 
+    static GLuint compile_shader(GLenum type, const char* src) {
+        GLuint shader = glCreateShader(type);
+        if (!shader) {
+            return 0;
+        }
+        glShaderSource(shader, 1, &src, nullptr);
+        glCompileShader(shader);
+        GLint ok = 0;
+        glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
+        if (!ok) {
+            char log[256]{};
+            glGetShaderInfoLog(shader, sizeof(log), nullptr, log);
+            LOGE("Shader compile failed: %s", log);
+            glDeleteShader(shader);
+            return 0;
+        }
+        return shader;
+    }
+
+    bool ensure_egl() {
+        if (egl_display != EGL_NO_DISPLAY && egl_context != EGL_NO_CONTEXT && gl_program != 0) {
+            return true;
+        }
+        egl_display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+        if (egl_display == EGL_NO_DISPLAY || !eglInitialize(egl_display, nullptr, nullptr)) {
+            LOGE("eglInitialize failed: 0x%x", eglGetError());
+            egl_display = EGL_NO_DISPLAY;
+            return false;
+        }
+        const EGLint cfg_attrs[] = {
+            EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+            EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+            EGL_RED_SIZE, 8,
+            EGL_GREEN_SIZE, 8,
+            EGL_BLUE_SIZE, 8,
+            EGL_ALPHA_SIZE, 8,
+            EGL_NONE,
+        };
+        EGLint num_cfg = 0;
+        if (!eglChooseConfig(egl_display, cfg_attrs, &egl_config, 1, &num_cfg) || num_cfg < 1) {
+            LOGE("eglChooseConfig failed: 0x%x", eglGetError());
+            return false;
+        }
+        const EGLint ctx_attrs[] = {EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE};
+        egl_context = eglCreateContext(egl_display, egl_config, EGL_NO_CONTEXT, ctx_attrs);
+        if (egl_context == EGL_NO_CONTEXT) {
+            LOGE("eglCreateContext failed: 0x%x", eglGetError());
+            return false;
+        }
+        pfn_eglGetNativeClientBufferANDROID =
+            reinterpret_cast<PFNEGLGETNATIVECLIENTBUFFERANDROIDPROC>(
+                eglGetProcAddress("eglGetNativeClientBufferANDROID"));
+        pfn_eglCreateImageKHR =
+            reinterpret_cast<PFNEGLCREATEIMAGEKHRPROC>(
+                eglGetProcAddress("eglCreateImageKHR"));
+        pfn_eglDestroyImageKHR =
+            reinterpret_cast<PFNEGLDESTROYIMAGEKHRPROC>(
+                eglGetProcAddress("eglDestroyImageKHR"));
+        pfn_glEGLImageTargetTexture2DOES =
+            reinterpret_cast<PFNGLEGLIMAGETARGETTEXTURE2DOESPROC>(
+                eglGetProcAddress("glEGLImageTargetTexture2DOES"));
+        if (!pfn_eglGetNativeClientBufferANDROID || !pfn_eglCreateImageKHR ||
+            !pfn_eglDestroyImageKHR || !pfn_glEGLImageTargetTexture2DOES) {
+            LOGE("Missing required EGL/GLES OES extension functions");
+            return false;
+        }
+        return true;
+    }
+
+    bool ensure_gl_resources() {
+        if (gl_program != 0 && gl_texture != 0) {
+            return true;
+        }
+        static const char kVertSrc[] =
+            "attribute vec2 aPos;\n"
+            "attribute vec2 aUv;\n"
+            "varying vec2 vUv;\n"
+            "void main() {\n"
+            "  vUv = aUv;\n"
+            "  gl_Position = vec4(aPos, 0.0, 1.0);\n"
+            "}\n";
+        static const char kFragSrc[] =
+            "#extension GL_OES_EGL_image_external : require\n"
+            "precision mediump float;\n"
+            "varying vec2 vUv;\n"
+            "uniform samplerExternalOES uTex;\n"
+            "void main() {\n"
+            "  gl_FragColor = texture2D(uTex, vUv);\n"
+            "}\n";
+        GLuint vs = compile_shader(GL_VERTEX_SHADER, kVertSrc);
+        GLuint fs = compile_shader(GL_FRAGMENT_SHADER, kFragSrc);
+        if (!vs || !fs) {
+            if (vs) glDeleteShader(vs);
+            if (fs) glDeleteShader(fs);
+            return false;
+        }
+        gl_program = glCreateProgram();
+        glAttachShader(gl_program, vs);
+        glAttachShader(gl_program, fs);
+        glLinkProgram(gl_program);
+        glDeleteShader(vs);
+        glDeleteShader(fs);
+        GLint linked = 0;
+        glGetProgramiv(gl_program, GL_LINK_STATUS, &linked);
+        if (!linked) {
+            LOGE("GL program link failed");
+            glDeleteProgram(gl_program);
+            gl_program = 0;
+            return false;
+        }
+        gl_pos_loc = glGetAttribLocation(gl_program, "aPos");
+        gl_uv_loc = glGetAttribLocation(gl_program, "aUv");
+        gl_tex_loc = glGetUniformLocation(gl_program, "uTex");
+        glGenTextures(1, &gl_texture);
+        glBindTexture(GL_TEXTURE_EXTERNAL_OES, gl_texture);
+        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        return true;
+    }
+
+    void destroy_egl_surface() {
+        if (egl_display != EGL_NO_DISPLAY && egl_surface != EGL_NO_SURFACE) {
+            eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+            eglDestroySurface(egl_display, egl_surface);
+            egl_surface = EGL_NO_SURFACE;
+        }
+    }
+
+    void destroy_egl() {
+        destroy_egl_surface();
+        if (egl_display != EGL_NO_DISPLAY) {
+            if (egl_context != EGL_NO_CONTEXT) {
+                eglDestroyContext(egl_display, egl_context);
+                egl_context = EGL_NO_CONTEXT;
+            }
+            eglTerminate(egl_display);
+            egl_display = EGL_NO_DISPLAY;
+        }
+        gl_program = 0;
+        gl_texture = 0;
+    }
+
     void set_surface(ANativeWindow* new_window, int32_t width, int32_t height) {
         std::lock_guard<std::mutex> lock(surface_mutex);
         if (new_window == nullptr || width <= 0 || height <= 0) {
-            if (surface_control) {
-                ASurfaceControl_release(surface_control);
-                surface_control = nullptr;
-            }
+            destroy_egl_surface();
             if (window) {
                 ANativeWindow_release(window);
                 window = nullptr;
@@ -262,17 +421,18 @@ struct NativePresenter {
         }
 
         if (window != new_window) {
-            if (surface_control) {
-                ASurfaceControl_release(surface_control);
-                surface_control = nullptr;
-            }
+            destroy_egl_surface();
             if (window) {
                 ANativeWindow_release(window);
             }
             window = new_window;
-            surface_control = ASurfaceControl_createFromWindow(window, "ssal-guest-presenter");
-            if (!surface_control) {
-                LOGE("ASurfaceControl_createFromWindow failed");
+            if (ensure_egl()) {
+                egl_surface = eglCreateWindowSurface(egl_display, egl_config, window, nullptr);
+                if (egl_surface == EGL_NO_SURFACE) {
+                    LOGE("eglCreateWindowSurface failed: 0x%x", eglGetError());
+                } else {
+                    LOGI("Created EGLWindowSurface %dx%d", width, height);
+                }
             }
         } else {
             ANativeWindow_release(new_window);
@@ -447,7 +607,9 @@ struct NativePresenter {
         AHardwareBuffer* ahb = (it != slot_cache.end()) ? it->second : nullptr;
 
         std::lock_guard<std::mutex> lock(surface_mutex);
-        if (!surface_control || !ahb || surface_width <= 0 || surface_height <= 0) {
+        if (egl_display == EGL_NO_DISPLAY || egl_surface == EGL_NO_SURFACE ||
+            egl_context == EGL_NO_CONTEXT || !ahb ||
+            surface_width <= 0 || surface_height <= 0) {
             if (acquire_fence >= 0) {
                 close(acquire_fence);
             }
@@ -457,7 +619,7 @@ struct NativePresenter {
         static int tx_log_count = 0;
         if (tx_log_count < 5) {
             ++tx_log_count;
-            LOGI("Apply tx #%d slot=%d %ux%u -> %dx%d dataspace=%d has_fence=%u fence_fd=%d",
+            LOGI("Apply egl-blit #%d slot=%d %ux%u -> %dx%d dataspace=%d has_fence=%u fence_fd=%d",
                  tx_log_count, hdr.slot, hdr.width, hdr.height,
                  surface_width, surface_height, hdr.dataspace, hdr.has_fence, acquire_fence);
         }
@@ -468,10 +630,6 @@ struct NativePresenter {
             close(acquire_fence);
             acquire_fence = -1;
         }
-
-        const ADataSpace ds = hdr.dataspace != 0
-            ? static_cast<ADataSpace>(hdr.dataspace)
-            : ADATASPACE_SRGB;
 
         int32_t cur_dst_w = surface_width;
         int32_t cur_dst_h = surface_height;
@@ -496,17 +654,68 @@ struct NativePresenter {
             dst_h = cur_dst_h;
         }
 
-        ASurfaceTransaction* tx = ASurfaceTransaction_create();
-        ASurfaceTransaction_setVisibility(
-            tx, surface_control, ASURFACE_TRANSACTION_VISIBILITY_SHOW);
-        ASurfaceTransaction_setZOrder(tx, surface_control, 1);
-        ARect src{0, 0, static_cast<int32_t>(hdr.width), static_cast<int32_t>(hdr.height)};
-        ARect dst{cur_dst_x, cur_dst_y, cur_dst_x + cur_dst_w, cur_dst_y + cur_dst_h};
-        ASurfaceTransaction_setGeometry(tx, surface_control, src, dst, 0);
-        ASurfaceTransaction_setBuffer(tx, surface_control, ahb, -1);
-        ASurfaceTransaction_setBufferDataSpace(tx, surface_control, ds);
-        ASurfaceTransaction_apply(tx);
-        ASurfaceTransaction_delete(tx);
+        if (!eglMakeCurrent(egl_display, egl_surface, egl_surface, egl_context)) {
+            LOGE("eglMakeCurrent failed: 0x%x", eglGetError());
+            return;
+        }
+        if (!ensure_gl_resources()) {
+            eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+            return;
+        }
+
+        EGLClientBuffer client_buf = pfn_eglGetNativeClientBufferANDROID(ahb);
+        if (!client_buf) {
+            LOGE("eglGetNativeClientBufferANDROID returned null");
+            eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+            return;
+        }
+        const EGLint img_attrs[] = {EGL_IMAGE_PRESERVED_KHR, EGL_TRUE, EGL_NONE};
+        EGLImageKHR image = pfn_eglCreateImageKHR(
+            egl_display, EGL_NO_CONTEXT, EGL_NATIVE_BUFFER_ANDROID, client_buf, img_attrs);
+        if (image == EGL_NO_IMAGE_KHR) {
+            LOGE("eglCreateImageKHR failed: 0x%x", eglGetError());
+            eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+            return;
+        }
+
+        glViewport(0, 0, surface_width, surface_height);
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+
+        const int32_t gl_y = surface_height - cur_dst_y - cur_dst_h;
+        glViewport(cur_dst_x, gl_y, cur_dst_w, cur_dst_h);
+
+        glUseProgram(gl_program);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_EXTERNAL_OES, gl_texture);
+        pfn_glEGLImageTargetTexture2DOES(GL_TEXTURE_EXTERNAL_OES, image);
+        glUniform1i(gl_tex_loc, 0);
+
+        static const GLfloat kPos[] = {
+            -1.0f, -1.0f,
+             1.0f, -1.0f,
+            -1.0f,  1.0f,
+             1.0f,  1.0f,
+        };
+        static const GLfloat kUv[] = {
+            0.0f, 1.0f,
+            1.0f, 1.0f,
+            0.0f, 0.0f,
+            1.0f, 0.0f,
+        };
+        glEnableVertexAttribArray(static_cast<GLuint>(gl_pos_loc));
+        glVertexAttribPointer(static_cast<GLuint>(gl_pos_loc), 2, GL_FLOAT, GL_FALSE, 0, kPos);
+        glEnableVertexAttribArray(static_cast<GLuint>(gl_uv_loc));
+        glVertexAttribPointer(static_cast<GLuint>(gl_uv_loc), 2, GL_FLOAT, GL_FALSE, 0, kUv);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        glDisableVertexAttribArray(static_cast<GLuint>(gl_pos_loc));
+        glDisableVertexAttribArray(static_cast<GLuint>(gl_uv_loc));
+
+        if (!eglSwapBuffers(egl_display, egl_surface)) {
+            LOGE("eglSwapBuffers failed: 0x%x", eglGetError());
+        }
+        pfn_eglDestroyImageKHR(egl_display, image);
+        eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
     }
 
     void send_touch(int32_t action,
@@ -567,6 +776,36 @@ struct NativePresenter {
 
         const size_t total_bytes = sizeof(hdr) + count * sizeof(TouchPointer);
         send(peer, buf, total_bytes, MSG_DONTWAIT | MSG_NOSIGNAL);
+    }
+
+    static void send_key_packets(int peer, int32_t key_code, int64_t event_time_ms) {
+        if (peer < 0 || key_code <= 0) {
+            return;
+        }
+        for (int32_t action : {0, 1}) { // ACTION_DOWN, ACTION_UP
+            TouchPacketHeader hdr{
+                kKeyMagic,
+                kTouchVersion,
+                action,
+                static_cast<uint32_t>(key_code),
+                event_time_ms,
+                event_time_ms,
+            };
+            send(peer, &hdr, sizeof(hdr), MSG_DONTWAIT | MSG_NOSIGNAL);
+        }
+    }
+
+    void send_key(int32_t key_code, int64_t event_time_ms) {
+        if (key_code <= 0) {
+            return;
+        }
+        int peer = active_peer_fd.load(std::memory_order_acquire);
+        if (peer >= 0) {
+            send_key_packets(peer, key_code, event_time_ms);
+        } else {
+            pending_key_time_ms.store(event_time_ms, std::memory_order_release);
+            pending_key_code.store(key_code, std::memory_order_release);
+        }
     }
 
     void receive_from_peer(int sock) {
@@ -675,6 +914,13 @@ struct NativePresenter {
             }
             LOGI("Accepted presenter relay connection");
             active_peer_fd.store(peer, std::memory_order_release);
+            int32_t queued_key = pending_key_code.exchange(0, std::memory_order_acq_rel);
+            if (queued_key > 0) {
+                send_key_packets(
+                    peer,
+                    queued_key,
+                    pending_key_time_ms.load(std::memory_order_acquire));
+            }
             receive_from_peer(peer);
             active_peer_fd.store(-1, std::memory_order_release);
             close(peer);
@@ -750,6 +996,15 @@ Java_alyac_android_ssalsurface_NativePresenter_nativeSendTouch(
     env->GetFloatArrayRegion(pressures_arr, 0, count, pressures);
     presenter->send_touch(
         action, count, down_time_ms, event_time_ms, ids, xs, ys, pressures);
+}
+
+JNIEXPORT void JNICALL
+Java_alyac_android_ssalsurface_NativePresenter_nativeSendKey(
+    JNIEnv* /* env */, jobject /* thiz */, jlong handle, jint key_code, jlong event_time_ms) {
+    auto* presenter = reinterpret_cast<NativePresenter*>(handle);
+    if (presenter) {
+        presenter->send_key(key_code, event_time_ms);
+    }
 }
 
 JNIEXPORT void JNICALL

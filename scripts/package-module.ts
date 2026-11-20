@@ -46,7 +46,7 @@ const entries: { name: string; path: string; mode: number }[] = [
     "ssal-keymint",
     "ssal-virtual-composer",
     "ssal-context-map.so",
-    "phase3-ipc",
+    "ssal-binder-ipc",
     "ssal-phase2-log.so",
     "ssal-zygote-diag.so",
     "ssal-zygote-fd-reopen.so",
@@ -60,6 +60,13 @@ const entries: { name: string; path: string; mode: number }[] = [
     mode: name.endsWith(".so") || name.endsWith(".jar") ? 0o100644 : 0o100755,
   })),
 ]
+// Jars are built on the Windows host (build-fork-probe.ps1 / build-input-injector.ps1), not by `bun run build`.
+for (let i = entries.length - 1; i >= 0; i--) {
+  if (entries[i].name.endsWith(".jar") && !existsSync(entries[i].path)) {
+    console.warn(`Skipping optional ${entries[i].path} (run its scripts/build-rust/*.ps1 to include it)`)
+    entries.splice(i, 1)
+  }
+}
 if (existsSync("out/bin/ssal-binder-probe") || existsSync("out/bin/ssal-binder-probe.json")) {
   const manifest = JSON.parse(await readFile("out/bin/ssal-binder-probe.json", "utf8"))
   for (const [key, path] of [

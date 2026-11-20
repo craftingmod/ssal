@@ -346,10 +346,6 @@ impl IComposerClient for VirtualComposerClient {
                         presented
                     );
                 }
-                results.push(CommandResultPayload::r#PresentFence(PresentFence {
-                    r#display: DISPLAY_ID,
-                    r#fence: None,
-                }));
                 results.push(CommandResultPayload::r#ReleaseFences(ReleaseFences {
                     r#display: DISPLAY_ID,
                     r#layers: Vec::new(),

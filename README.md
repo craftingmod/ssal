@@ -40,8 +40,12 @@ ssal prepare profile1 --regen --native
 ssal add lineage /data/local/tmp/system.img
 ssal add -- -image ./-system.img
 ssal status >status.txt
+ssal logcat
+ssal logcat -d >guest-log.txt
 ssal doctor profile1 2>error.txt
 ```
+
+`ssal logcat`은 현재 `ssal start`로 실행 중인 프로필에서 SSAL이 수집한 Android 서비스 로그를 stdout으로 실시간 출력합니다. Guest가 종료되면 출력도 끝납니다. `-d`는 지금까지 수집한 로그를 출력하고 종료합니다. 출력 범위는 각 서비스의 기존 수집 한도가 적용된 stderr(Guest의 liblog 출력 포함)입니다.
 
 일반 명령의 옵션은 피연산자 앞뒤에서 사용할 수 있습니다. `--` 뒤의 값은 옵션으로 해석하지 않으므로 `-`로 시작하는 이름이나 경로에는 `--`를 사용하거나 경로에 `./`를 붙입니다. `probe`의 실행 옵션과 위험 확인 조건은 기존 전용 파서를 유지하며 `ssal probe --help`에서 확인합니다.
 

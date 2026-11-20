@@ -14,6 +14,11 @@ const COMMANDS: &[(&str, &str, &str)] = &[
     ("status", "", "Show images, profiles and background jobs"),
     ("logs", "", "Show daemon logs"),
     (
+        "logcat",
+        "[-d]",
+        "Stream the running Guest profile's captured Android logs",
+    ),
+    (
         "doctor",
         "[PROFILE_NAME]",
         "Check the daemon or a guest profile",
@@ -126,6 +131,9 @@ pub fn help(command: Option<&str>) -> String {
     if command == Some("prepare") {
         text.push_str("      --regen      Regenerate guest preparation artifacts\n      --native     Use the native KernelSU SELinux backend\n");
     }
+    if command == Some("logcat") {
+        text.push_str("  -d               Dump captured logs and exit\n");
+    }
     if command == Some("probe") {
         text.push_str("\nKinds: lock-sysconfig, lock-rro, lock-mount-plain, lock-mount-context,\n       lock-mount-relabel, lock-target-plain, lock-target-context\nOptions: --dry-run, --execute --acknowledge-risk, --image PATH,\n         --guest-root PATH, --apk PATH, --method METHOD,\n         --sysconfig-image PATH, --sysconfig-sha256 HASH, --fail-at STAGE\n");
     } else {
@@ -200,12 +208,14 @@ pub fn parse(args: &[String]) -> Result<Action, String> {
     let mut options = true;
     let mut force_regen = false;
     let mut native_sepolicy = false;
+    let mut dump_logs = false;
     for arg in &args[1..] {
         match arg.as_str() {
             "--" if options => options = false,
             "-h" | "--help" if options => return Ok(Action::Help(Some(first.clone()))),
             "--regen" if options && *command == "prepare" => force_regen = true,
             "--native" if options && *command == "prepare" => native_sepolicy = true,
+            "-d" if options && *command == "logcat" => dump_logs = true,
             _ if options && arg.starts_with('-') && arg != "-" => {
                 return Err(format!("{command}: unrecognized option '{arg}'"));
             }
@@ -216,7 +226,7 @@ pub fn parse(args: &[String]) -> Result<Action, String> {
         "doctor" | "stop" => (0, 1),
         "create" => (1, 2),
         "add" => (2, 2),
-        "status" | "logs" | "return" | "stop-for-restart" => (0, 0),
+        "status" | "logs" | "logcat" | "return" | "stop-for-restart" => (0, 0),
         _ => (1, 1),
     };
     if operands.len() < minimum || operands.len() > maximum {
@@ -255,7 +265,11 @@ pub fn parse(args: &[String]) -> Result<Action, String> {
     }
     let mut request = Request {
         version: VERSION,
-        command: first.clone(),
+        command: if dump_logs {
+            "logcat-dump".into()
+        } else {
+            first.clone()
+        },
         image_name: None,
         profile_name: None,
         force_regen,
@@ -372,9 +386,25 @@ mod tests {
             vec!["create", "../image"],
             vec!["remove", "bad/name"],
             vec!["status", "--native"],
+            vec!["logcat", "profile1"],
+            vec!["logs", "-d"],
             vec!["prepare", "--regen"],
         ] {
             assert!(parse_words(&args).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn logcat_defaults_to_following_the_active_profile() {
+        for (args, expected) in [
+            (&["logcat"][..], "logcat"),
+            (&["logcat", "-d"][..], "logcat-dump"),
+        ] {
+            let Action::Request(request, None) = parse_words(args).unwrap() else {
+                panic!()
+            };
+            assert_eq!(request.command, expected);
+            assert_eq!(request.profile_name, None);
         }
     }
 
@@ -388,7 +418,7 @@ mod tests {
                 "add" => vec![*command, "image", "/tmp/image.img"],
                 "allow" => vec![*command, "alyac.android.ssalsurface"],
                 "create" | "switch" => vec![*command, "image"],
-                "status" | "logs" | "return" | "stop-for-restart" => vec![*command],
+                "status" | "logs" | "logcat" | "return" | "stop-for-restart" => vec![*command],
                 _ => vec![*command, "profile1"],
             };
             let Action::Request(r, _) = parse_words(&args).unwrap() else {

@@ -25,7 +25,7 @@ fn filesystem_magic(path: &Path) -> io::Result<u64> {
     Ok(stat.f_type as u64)
 }
 
-fn mount_root(mount: &Path, kind: &str, controller: Option<&str>) -> io::Result<String> {
+pub(super) fn mount_root(mount: &Path, kind: &str, controller: Option<&str>) -> io::Result<String> {
     let text = fs::read_to_string("/proc/self/mountinfo")?;
     text.lines()
         .filter_map(|line| {
@@ -337,7 +337,7 @@ pub(crate) struct GuestMemory {
 }
 
 impl GuestMemory {
-    pub(crate) fn prepare() -> io::Result<Self> {
+    pub(crate) fn prepare(recover: impl FnOnce(Backend) -> io::Result<()>) -> io::Result<Self> {
         require(
             read("/sys/fs/selinux/enforce")? == "1",
             "Host must remain Enforcing",
@@ -360,6 +360,7 @@ impl GuestMemory {
                 "memory cgroup path contains symlink",
             )?;
             mount_root(v1_root, "cgroup", Some("memory"))?;
+            recover(backend)?;
             require(
                 !task_group(backend).exists() && !memory_group(backend).exists(),
                 "Guest cgroup already exists",
@@ -398,6 +399,7 @@ impl GuestMemory {
             read(apps.join("cgroup.procs"))?.is_empty(),
             "apps contains direct processes",
         )?;
+        recover(backend)?;
         require(
             !memory_group(backend).exists(),
             "Guest cgroup already exists",

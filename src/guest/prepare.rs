@@ -171,6 +171,9 @@ pub fn worker(
     mode: &str,
     force_regen: bool,
 ) -> io::Result<()> {
+    if mode == "--guest-start-worker" {
+        crate::diagnostics::zygote::open_session_log(base)?;
+    }
     let admission = if crate::guest::environment::managed(mode) {
         Some(crate::guest::environment::admission(
             userdata
@@ -198,6 +201,9 @@ pub(crate) fn worker_admitted(
     if installd_probe && mode != "--guest-start-worker" {
         return Err(io::Error::other("Guest installd probe requires the 7A worker"));
     }
+    let _cgroup_lock = crate::guest::cgroup::layout::uses_guest_cgroups(mode)
+        .then(crate::guest::cgroup::layout::lock_guest_cgroups)
+        .transpose()?;
     crate::diagnostics::selinux::servicemanager::check_recovery()?;
     let host_mount_namespace = crate::guest::mount::namespace::enter()?;
     let system_target = base.join("system");

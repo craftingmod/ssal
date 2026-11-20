@@ -4,7 +4,7 @@ use std::ffi::CString;
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -42,6 +42,125 @@ pub(crate) fn task_cgroup_path() -> io::Result<PathBuf> {
     Ok(crate::guest::cgroup::task_group(
         crate::guest::cgroup::backend()?,
     ))
+}
+
+pub(in crate::guest) fn uses_guest_cgroups(mode: &str) -> bool {
+    matches!(
+        mode,
+        "--guest-hwbinder-worker"
+            | "--guest-cgroup-worker"
+            | "--guest-child-worker"
+            | "--guest-processgroup-worker"
+            | "--guest-memory-worker"
+            | "--guest-service-worker"
+            | "--guest-services-6a-worker"
+            | "--guest-services-6b-worker"
+            | "--guest-start-worker"
+    )
+}
+
+pub(in crate::guest) fn lock_guest_cgroups() -> io::Result<File> {
+    // Lock the same Host directory for every worker using the fixed Guest paths.
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(ssal::unix::ROOT)?;
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(io::Error::other(format!(
+            "cannot lock Guest cgroups: {}",
+            io::Error::last_os_error()
+        )));
+    }
+    Ok(lock)
+}
+
+pub(in crate::guest) fn recover_guest_cgroups(backend: super::Backend) -> io::Result<()> {
+    let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
+    let mut empty_groups = Vec::new();
+    for (path, _) in guest_cgroup_mounts(backend) {
+        if !cgroup_exists(&path)? {
+            continue;
+        }
+        let check = (|| {
+            let parent = path.parent().unwrap();
+            let mount = match parent.to_str() {
+                Some("/sys/fs/cgroup" | "/sys/fs/cgroup/apps") => {
+                    super::memory::mount_root(Path::new("/sys/fs/cgroup"), "cgroup2", None)
+                }
+                Some("/dev/memcg") => super::memory::mount_root(parent, "cgroup", Some("memory")),
+                Some("/dev/cpuctl") => super::memory::mount_root(parent, "cgroup", Some("cpu")),
+                Some("/dev/cpuset") => super::memory::mount_root(parent, "cgroup", Some("cpuset")),
+                Some("/dev/blkio") => super::memory::mount_root(parent, "cgroup", Some("blkio")),
+                _ => Err(io::Error::other("unexpected cgroup parent")),
+            }?;
+            if mount != "/" || fs::canonicalize(&path)? != path {
+                return Err(io::Error::other("unexpected cgroup mount root or symlink"));
+            }
+            if mountinfo.lines().any(|line| {
+                line.split_whitespace()
+                    .nth(4)
+                    .is_some_and(|target| Path::new(target).starts_with(&path))
+            }) {
+                return Err(io::Error::other("mount inside residual Guest cgroup"));
+            }
+            collect_empty_cgroups(&path, &mut empty_groups)
+        })();
+        check.map_err(|error| io::Error::other(format!("{}: {error}", path.display())))?;
+    }
+    for path in empty_groups {
+        fs::remove_dir(&path)
+            .map_err(|error| io::Error::other(format!("rmdir {}: {error}", path.display())))?;
+        println!("Removed residual Guest cgroup: {}", path.display());
+    }
+    for (path, _) in guest_cgroup_mounts(backend) {
+        if cgroup_exists(&path)? {
+            return Err(io::Error::other(format!(
+                "Guest cgroup remains: {}",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn cgroup_exists(path: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(io::Error::other(format!("{}: {error}", path.display()))),
+    }
+}
+
+fn collect_empty_cgroups(path: &Path, groups: &mut Vec<PathBuf>) -> io::Result<()> {
+    for control in ["cgroup.procs", "tasks", "cgroup.threads"] {
+        let file = path.join(control);
+        if control != "cgroup.procs" && !cgroup_exists(&file)? {
+            continue;
+        }
+        let members = fs::read_to_string(&file)
+            .map_err(|error| io::Error::other(format!("{}: {error}", file.display())))?;
+        if !members.trim().is_empty() {
+            return Err(io::Error::other(format!(
+                "{} has live members",
+                file.display()
+            )));
+        }
+    }
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        if kind.is_symlink() {
+            return Err(io::Error::other(format!(
+                "unexpected symlink: {}",
+                entry.path().display()
+            )));
+        }
+        if kind.is_dir() {
+            collect_empty_cgroups(&entry.path(), groups)?;
+        }
+    }
+    groups.push(path.to_owned());
+    Ok(())
 }
 
 fn chown_system_cgroup(dir: &Path) -> io::Result<()> {
@@ -383,6 +502,27 @@ mod tests {
         fs::remove_file(root.join("unexpected"))?;
         fs::remove_dir(root)?;
         Ok(())
+    }
+
+    #[test]
+    fn stale_cgroup_scan_rejects_live_descendants_and_orders_empty_groups() -> io::Result<()> {
+        let root = std::env::temp_dir().join(format!("ssal-stale-cgroups-{}", std::process::id()));
+        fs::create_dir(&root)?;
+        let result = (|| {
+            let child = root.join("child");
+            fs::create_dir(&child)?;
+            fs::write(root.join("cgroup.procs"), "")?;
+            fs::write(child.join("cgroup.procs"), "123\n")?;
+            let mut groups = Vec::new();
+            assert!(collect_empty_cgroups(&root, &mut groups).is_err());
+            assert!(groups.is_empty());
+
+            fs::write(child.join("cgroup.procs"), "")?;
+            collect_empty_cgroups(&root, &mut groups)?;
+            assert_eq!(groups, [child, root.clone()]);
+            Ok(())
+        })();
+        result.and(fs::remove_dir_all(root))
     }
 
     #[test]

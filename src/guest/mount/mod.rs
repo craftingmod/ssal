@@ -296,33 +296,16 @@ pub(super) fn verify(
             libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
             "",
         )?;
-        if hwbinder || matches!(
-            mode,
-            "--guest-cgroup-worker"
-                | "--guest-child-worker"
-                | "--guest-processgroup-worker"
-                | "--guest-memory-worker"
-                | "--guest-service-worker"
-                | "--guest-services-6a-worker"
-                | "--guest-services-6b-worker"
-                | "--guest-start-worker"
-        ) {
-            if hwbinder || matches!(
-                mode,
-                "--guest-processgroup-worker"
-                    | "--guest-cgroup-worker"
-                    | "--guest-memory-worker"
-                    | "--guest-child-worker"
-                    | "--guest-service-worker"
-                    | "--guest-services-6a-worker"
-                    | "--guest-services-6b-worker"
-                    | "--guest-start-worker"
-            ) {
-                for key in ["SSAL_MEMORY_HIGH", "SSAL_MEMORY_MAX"] {
-                    crate::guest::cgroup::memory_limit(std::env::var(key).ok().as_deref())?;
-                }
-                cgroups.memory = Some(crate::guest::cgroup::GuestMemory::prepare()?);
+        if crate::guest::cgroup::layout::uses_guest_cgroups(mode) {
+            for key in ["SSAL_MEMORY_HIGH", "SSAL_MEMORY_MAX"] {
+                crate::guest::cgroup::memory_limit(std::env::var(key).ok().as_deref())?;
             }
+            cgroups.memory = Some(crate::guest::cgroup::GuestMemory::prepare(|backend| {
+                if mode == "--guest-start-worker" {
+                    crate::guest::cgroup::layout::recover_guest_cgroups(backend)?;
+                }
+                Ok(())
+            })?);
             cgroups.prepare(&mut mounts, &root)?;
         }
         if mode == "--guest-cgroup-worker" {
@@ -630,11 +613,16 @@ pub(super) fn verify(
     } else {
         Ok(())
     };
+    if mode == "--guest-start-worker" {
+        if let Err(error) = &descendants {
+            crate::diagnostics::selinux::servicemanager::mark_recovery(
+                &root.display().to_string(),
+                &error.to_string(),
+            );
+        }
+    }
     let descendants = descendants.and_then(|()| {
-        if mode == "--guest-start-worker"
-            && (std::env::var_os("SSAL_PHASE7FB_FORK").is_some()
-                || crate::guest::system_server_enabled())
-        {
+        if mode == "--guest-start-worker" {
             for path in &cgroups.created {
                 crate::guest::cgroup::remove_empty_cgroup_children(path)?;
             }
@@ -648,10 +636,12 @@ pub(super) fn verify(
     let cgroup_cleanup = cgroups.cleanup();
     println!(
         "Guest cgroup cleanup: {}",
-        if cgroup_cleanup.is_ok() {
-            "passed"
-        } else {
+        if cgroup_cleanup.is_err() {
             "failed"
+        } else if cgroups.memory.is_none() {
+            "skipped (no cgroups prepared)"
+        } else {
+            "passed"
         }
     );
     let residual = fs::read_to_string("/proc/self/mountinfo").and_then(|info| {
@@ -712,6 +702,12 @@ pub(super) fn verify(
     }
     match (result, cleanup) {
         (Ok(()), Ok(())) => Ok(()),
+        (Err(e), Ok(()))
+            if mode == "--guest-start-worker"
+                && crate::guest::process::supervision::is_shutdown(&e) =>
+        {
+            Ok(())
+        }
         (Err(e), Ok(())) | (Ok(()), Err(e)) => Err(e),
         (Err(e), Err(cleanup)) => Err(io::Error::other(format!("{e}; {cleanup}"))),
     }

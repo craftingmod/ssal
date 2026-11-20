@@ -13,6 +13,7 @@ vendor, node_modules has huge codebase so don't read unless explicit request.
 - Prioritize incremental runtime validation and first boot over exhaustive preemptive hardening. Avoid blocking all progress on unverified risks.
 - Cleanup work sholud be run on Luna sub-agent.
 - Erase temp userdata img like `.userdata-*.img`
+- Build `bun run build` to build.
 
 ## Analyze log
 

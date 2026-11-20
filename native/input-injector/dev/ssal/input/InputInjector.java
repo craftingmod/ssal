@@ -5,6 +5,7 @@ import android.net.LocalSocketAddress;
 import android.os.IBinder;
 import android.view.InputDevice;
 import android.view.InputEvent;
+import android.view.KeyEvent;
 import android.view.MotionEvent;
 
 import java.io.DataInputStream;
@@ -19,6 +20,7 @@ import java.nio.ByteOrder;
  */
 public final class InputInjector {
     private static final int TOUCH_MAGIC = 0x53544348; // 'STCH'
+    private static final int KEY_MAGIC = 0x534B4559; // 'SKEY'
     private static final int TOUCH_VERSION = 1;
     private static final int HEADER_BYTES = 32;
     private static final int POINTER_BYTES = 16;
@@ -80,10 +82,28 @@ public final class InputInjector {
                 int magic = bb.getInt();
                 int version = bb.getInt();
                 int action = bb.getInt();
-                int pointerCount = bb.getInt();
+                int arg3 = bb.getInt();
                 long downTime = bb.getLong();
                 long eventTime = bb.getLong();
 
+                if (magic == KEY_MAGIC && version == TOUCH_VERSION) {
+                    KeyEvent keyEv = new KeyEvent(
+                            downTime,
+                            eventTime,
+                            action,
+                            arg3,
+                            0,
+                            0,
+                            -1,
+                            0,
+                            0,
+                            InputDevice.SOURCE_KEYBOARD
+                    );
+                    injectInputEvent.invoke(inputManager, keyEv, INJECT_INPUT_EVENT_MODE_ASYNC);
+                    continue;
+                }
+
+                int pointerCount = arg3;
                 if (magic != TOUCH_MAGIC || version != TOUCH_VERSION ||
                         pointerCount <= 0 || pointerCount > MAX_POINTERS) {
                     System.err.println("GUEST_INPUT_INJECTOR_BAD_HDR magic=" + magic + " count=" + pointerCount);

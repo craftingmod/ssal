@@ -26,7 +26,9 @@ if [[ "$build_target" == clean ]]; then
         out/bin/ssal-gatekeeper out/bin/ssal-keymint out/bin/ssal-virtual-composer \
         out/bin/ssal-vold out/bin/ssal-netd out/bin/ssal-hwbinder-probe.sh \
         out/bin/ssal-hwbinder-probe out/bin/ssal-virtual-audio out/bin/ssal-audio-host \
-        out/bin/ssal-context-map.so out/bin/ssal-phase2-log.so
+        out/bin/ssal-context-map.so out/bin/ssal-phase2-log.so \
+        out/bin/ssal-binder-ipc out/bin/ssal-zygote-diag.so out/bin/ssal-zygote-fd-reopen.so \
+        out/bin/ssal-zygote-selinux-noop.so out/bin/fork-probe.jar out/bin/input-injector.jar
     build_target=all
 fi
 mkdir -p out/bin
@@ -61,6 +63,14 @@ if [[ "$build_target" == all || "$build_target" == native ]]; then
     install -m 755 scripts/ssal-hwbinder-probe.sh out/bin/ssal-hwbinder-probe.sh
     bash scripts/build-rust/build-hwbinder-probe.sh
     bash scripts/build-rust/build-virtual-audio.sh
+    bash scripts/build-rust/build-jars.sh
+    cargo build --locked --release --manifest-path tools/rsbinder/Cargo.toml --target aarch64-linux-android
+    install -m 755 "$CARGO_TARGET_DIR/aarch64-linux-android/release/ssal-binder-ipc" out/bin/ssal-binder-ipc
+    android30_linker="$android_ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android30-clang"
+    for lib in zygote-diagnostics:ssal-zygote-diag zygote-fd-reopen:ssal-zygote-fd-reopen zygote-selinux-noop:ssal-zygote-selinux-noop; do
+        "$android30_linker" -shared -fPIC -Os -Wall -Wextra -Werror "native/binder-probe/${lib%%:*}.c" \
+            -ldl -o "out/bin/${lib##*:}.so"
+    done
     "$android_linker" -shared -fPIC -O2 -Wall -Wextra -Werror native/binder-probe/context-map.c -ldl -o out/bin/ssal-context-map.so
     "$android_ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android30-clang" \
         -shared -fPIC -Os -Wall -Wextra -Werror native/binder-probe/log-to-stderr.c \

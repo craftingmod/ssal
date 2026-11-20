@@ -51,6 +51,30 @@ fn property_service_definitions(
             autostart,
         });
     }
+    let has_mediaswcodec_domain = plan.is_some_and(|p| p.types.contains_key("mediaswcodec"));
+    if has_mediaswcodec_domain
+        && root
+            .join("apex/com.android.media.swcodec/bin/mediaswcodec")
+            .is_file()
+    {
+        services.push(ssal::guest_properties::ServiceDefinition {
+            name: "mediaswcodec".into(),
+            executable: "/apex/com.android.media.swcodec/bin/mediaswcodec".into(),
+            args: Vec::new(),
+            interfaces: vec![
+                "android.hardware.media.c2@1.0::IComponentStore/software".into(),
+                "android.hardware.media.c2@1.1::IComponentStore/software".into(),
+                "android.hardware.media.c2@1.2::IComponentStore/software".into(),
+                "aidl/android.hardware.media.c2.IComponentStore/software".into(),
+            ],
+            uid: 1046,
+            gid: 1046,
+            domain: "mediaswcodec".into(),
+            oneshot: Some(false),
+            restart_period: Some(5),
+            autostart: false,
+        });
+    }
     services
 }
 
@@ -214,10 +238,13 @@ pub(crate) fn start_property_service(
         service.child.stdout.take().unwrap(),
         File::options().append(true).open(&service.log)?,
     )?);
-    service.output.push(crate::diagnostics::zygote::Stream::new(
-        service.child.stderr.take().unwrap(),
-        File::options().append(true).open(&service.log)?,
-    )?);
+    service.output.push(
+        crate::diagnostics::zygote::Stream::new(
+            service.child.stderr.take().unwrap(),
+            File::options().append(true).open(&service.log)?,
+        )?
+        .with_session_log(),
+    );
     service.wait_text("guest_property_service_ready")?;
     let process_context = fs::read_to_string(format!("/proc/{}/attr/current", service.child.id()))?;
     let expected = plan
@@ -625,6 +652,44 @@ mod tests {
         assert_eq!(defs[0].uid, 0);
         assert_eq!(defs[0].gid, 0);
         assert_eq!(defs[0].oneshot, Some(false));
+
+        fs::remove_dir_all(base)
+    }
+
+    #[test]
+    fn registers_mediaswcodec_service_with_c2_software_interfaces() -> io::Result<()> {
+        let base = std::env::temp_dir().join(format!("ssal-swcodec-svc-{}", std::process::id()));
+        let bin_dir = base.join("apex/com.android.media.swcodec/bin");
+        fs::create_dir_all(&bin_dir)?;
+        let inputs = std::collections::BTreeMap::from([(
+            "system/etc/selinux/plat_sepolicy.cil".into(),
+            "(type zygote)".into(),
+        )]);
+        let mut plan = ssal::guest_policy::generate("p0001", &inputs)?;
+
+        assert!(property_service_definitions(&base, Some(&plan), false).is_empty());
+
+        fs::write(bin_dir.join("mediaswcodec"), b"stub")?;
+        assert!(property_service_definitions(&base, Some(&plan), false).is_empty());
+
+        plan.types
+            .insert("mediaswcodec".into(), "ssal_p0001_mediaswcodec".into());
+        let defs = property_service_definitions(&base, Some(&plan), false);
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].name, "mediaswcodec");
+        assert_eq!(
+            defs[0].executable,
+            "/apex/com.android.media.swcodec/bin/mediaswcodec"
+        );
+        assert_eq!(defs[0].domain, "mediaswcodec");
+        assert_eq!(defs[0].uid, 1046);
+        assert_eq!(defs[0].gid, 1046);
+        assert_eq!(defs[0].oneshot, Some(false));
+        assert!(!defs[0].autostart);
+        assert!(defs[0]
+            .interfaces
+            .iter()
+            .any(|iface| iface == "android.hardware.media.c2@1.0::IComponentStore/software"));
 
         fs::remove_dir_all(base)
     }

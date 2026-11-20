@@ -623,7 +623,7 @@ pub(in crate::guest) fn probe_guest_context_manager(root: &Path) -> io::Result<S
         1000,
         Some(GUEST_PROBE_CONTEXT),
     )?;
-    command.args(["/run/ssal/phase3-ipc", "context-manager"]);
+    command.args(["/run/ssal/ssal-binder-ipc", "context-manager"]);
     let output = crate::guest::process::command::run_with_timeout(
         &mut command,
         "Guest Binder Context Manager probe",
@@ -1094,7 +1094,7 @@ fn probe_installd(root: &Path, userdata: &Path, host_ns: &Path, binder: u64) -> 
         let reply = run(
             root,
             "/system/bin/bootstrap/linker64",
-            &["/run/ssal/phase3-ipc", "inspect-data-service", "installd"],
+            &["/run/ssal/ssal-binder-ipc", "inspect-data-service", "installd"],
             1000,
         )?;
         if !reply.contains("\"descriptor\":\"android.os.IInstalld\"") {
@@ -1498,7 +1498,7 @@ pub(crate) fn verify(
         system_suspend::SERVICE.install(mounts, root, &bin)?;
     }
     let mut runtime_bins = vec![
-        "phase3-ipc",
+        "ssal-binder-ipc",
         "ssal-phase2-log.so",
         "ssal-zygote-diag.so",
         "ssal-property-service",
@@ -1523,16 +1523,16 @@ pub(crate) fn verify(
         let target = runtime.join(name);
         File::create(&target)?;
         ssal::guest_policy::runtime::bind_file(mounts, root, &bin.join(name), &target)?;
-        if name == "phase3-ipc" {
+        if name == "ssal-binder-ipc" {
             let helper = File::open(&target)?;
             println!(
-                "Guest phase3-ipc helper mode={:o} label={}",
+                "Guest ssal-binder-ipc helper mode={:o} label={}",
                 helper.metadata()?.mode() & 0o7777,
                 ssal::unix::image_context(&helper)?
             );
         }
     }
-    let aidl_server = runtime.join("phase3-ipc-server");
+    let aidl_server = runtime.join("ssal-binder-ipc-server");
     File::create(&aidl_server)?;
     let plan = ssal::guest_policy::runtime::load(root)?
         .ok_or_else(|| io::Error::other("Guest SELinux plan missing for AIDL server"))?;
@@ -1570,10 +1570,10 @@ pub(crate) fn verify(
         &aidl_server,
         &plan.context("aidl_lazy_test_server_exec", false)?,
     )?;
-    ssal::guest_policy::runtime::bind_file(mounts, root, &bin.join("phase3-ipc"), &aidl_server)?;
+    ssal::guest_policy::runtime::bind_file(mounts, root, &bin.join("ssal-binder-ipc"), &aidl_server)?;
     let aidl_server_file = File::open(&aidl_server)?;
     println!(
-        "Guest phase3-ipc server mode={:o} label={}",
+        "Guest ssal-binder-ipc server mode={:o} label={}",
         aidl_server_file.metadata()?.mode() & 0o7777,
         ssal::unix::image_context(&aidl_server_file)?
     );
@@ -1728,9 +1728,9 @@ test "$(getprop servicemanager.ready)" = false
 if test -z "$(getprop ro.boot.serialno)"; then echo "Guest boot serial property=withheld"; else echo "Guest boot serial property=unexpectedly-present"; exit 1; fi
 test -e /run/ssal/property-service.json
 echo "Guest property-service marker=present"
-test -r /run/ssal/phase3-ipc
-test -x /run/ssal/phase3-ipc
-echo "Guest phase3-ipc access=PASS"
+test -r /run/ssal/ssal-binder-ipc
+test -x /run/ssal/ssal-binder-ipc
+echo "Guest ssal-binder-ipc access=PASS"
 for fd in /proc/$$/fd/*; do
     target=$(readlink "$fd") || continue
     echo "Guest post-exec fd=$fd target=$target"
@@ -1785,7 +1785,7 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
         manager.wait_guest_context_manager(root, guest_binder)?;
         let mut server = Service::start(
             root,
-            "/run/ssal/phase3-ipc-server",
+            "/run/ssal/ssal-binder-ipc-server",
             &["server"],
             "aidl-server",
             1000,
@@ -1803,7 +1803,7 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
         let ipc = match run(
             root,
             "/system/bin/bootstrap/linker64",
-            &["/run/ssal/phase3-ipc", "client"],
+            &["/run/ssal/ssal-binder-ipc", "client"],
             1000,
         ) {
             Ok(ipc) => ipc,
@@ -2553,17 +2553,23 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
             if controlled_fork {
                 fork_probe::run(root, &mut zygote, true)?;
             }
-            zygote.stop()?;
-            fs::remove_file(root.join("dev/socket/zygote"))?;
-            fs::remove_file(root.join("dev/socket/usap_pool_primary"))?;
-            println!(
-                "PHASE7A_ZYGOTE=PASS preload_complete=true socket_removed=true system_server={}",
-                if start_system_server {
-                    "started"
-                } else {
-                    "not_started"
+            loop {
+                crate::guest::process::supervision::check_interrupted()?;
+                zygote.tick_diagnostics()?;
+                zygote.drain_output()?;
+                for service in &mut boot_services {
+                    service.tick_diagnostics()?;
+                    service.drain_output()?;
                 }
-            );
+                if let Some(service) = &mut apexservice {
+                    service.tick_diagnostics()?;
+                    service.drain_output()?;
+                }
+                if zygote.exited()? {
+                    return Err(io::Error::other("Guest Zygote exited unexpectedly"));
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
         }
         if phase6a {
             println!("PHASE6A=START installd/artd through common launcher");
@@ -2589,7 +2595,7 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
                 run(
                     root,
                     "/system/bin/bootstrap/linker64",
-                    &["/run/ssal/phase3-ipc", "inspect-data-service", name],
+                    &["/run/ssal/ssal-binder-ipc", "inspect-data-service", name],
                     1000,
                 )?;
                 if phase6b && name == "installd" {
@@ -2825,10 +2831,13 @@ fn start_lmkd(root: &Path) -> io::Result<Service> {
         service.child.stdout.take().unwrap(),
         File::options().append(true).open(&service.log)?,
     )?);
-    service.output.push(crate::diagnostics::zygote::Stream::new(
-        service.child.stderr.take().unwrap(),
-        File::options().append(true).open(&service.log)?,
-    )?);
+    service.output.push(
+        crate::diagnostics::zygote::Stream::new(
+            service.child.stderr.take().unwrap(),
+            File::options().append(true).open(&service.log)?,
+        )?
+        .with_session_log(),
+    );
     service.wait_text("guest_lmkd_ready=1")?;
     Ok(service)
 }
@@ -2969,7 +2978,7 @@ mod tests {
             );
         }
         assert_eq!(
-            mapped_exec_domain("/run/ssal/phase3-ipc-server", Some(AIDL_SERVER_CONTEXT)),
+            mapped_exec_domain("/run/ssal/ssal-binder-ipc-server", Some(AIDL_SERVER_CONTEXT)),
             "aidl_lazy_test_server"
         );
     }

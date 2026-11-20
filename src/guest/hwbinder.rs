@@ -388,11 +388,11 @@ pub(super) fn verify(mounts: &mut Mounts, root: &Path, host_namespace: &Path) ->
         )?;
 
         if surfaceflinger_retest {
-            let phase3 = bin.join("phase3-ipc");
-            if phase3.is_file() {
-                let target = root.join("run/ssal/phase3-ipc");
+            let binder_ipc = bin.join("ssal-binder-ipc");
+            if binder_ipc.is_file() {
+                let target = root.join("run/ssal/ssal-binder-ipc");
                 File::create(&target)?;
-                ssal::guest_policy::runtime::bind_file(mounts, root, &phase3, &target)?;
+                ssal::guest_policy::runtime::bind_file(mounts, root, &binder_ipc, &target)?;
             }
             let composer_bin = bin.join("ssal-virtual-composer");
             let composer_target = root.join("run/ssal/ssal-virtual-composer");

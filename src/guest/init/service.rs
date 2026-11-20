@@ -227,10 +227,13 @@ impl Service {
                 service.child.stdout.take().unwrap(),
                 File::options().append(true).open(&service.log)?,
             )?);
-            service.output.push(crate::diagnostics::zygote::Stream::new(
-                service.child.stderr.take().unwrap(),
-                File::options().append(true).open(&service.log)?,
-            )?);
+            service.output.push(
+                crate::diagnostics::zygote::Stream::new(
+                    service.child.stderr.take().unwrap(),
+                    File::options().append(true).open(&service.log)?,
+                )?
+                .with_session_log(),
+            );
             service.drain_output()?;
         }
         if let Some((code, status)) = service.exit_status()? {

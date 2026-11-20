@@ -63,7 +63,7 @@ public final class ForkProbe {
             }
             Files.write(session.resolve("properties.txt"),
                     ("sdk=" + sdk + "\npersist.ssal_probe=" + persist + "\n").getBytes(StandardCharsets.UTF_8));
-            String binder = run("/run/ssal/phase3-ipc", "client");
+            String binder = run("/run/ssal/ssal-binder-ipc", "client");
             if (!binder.contains("\"event\":\"ipc_passed\"")) {
                 throw new IllegalStateException("Guest Private Binder call failed: " + binder);
             }

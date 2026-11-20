@@ -1,19 +1,29 @@
 use super::{atomic, now};
 use ssal::unix::{label_image, receive, reply, valid_image_name, ROOT, VERSION};
-use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
-use std::os::fd::AsRawFd;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
+
+#[derive(Default)]
+struct GuestExit {
+    result: Mutex<Option<Result<(), String>>>,
+    finished: Condvar,
+}
 
 #[derive(Clone)]
 struct RunningGuest {
     profile: String,
     pid: u32,
     log_path: PathBuf,
+    logcat_path: PathBuf,
+    pidfd: Arc<File>,
+    exit: Arc<GuestExit>,
 }
 
 type ActiveGuest = Arc<Mutex<Option<RunningGuest>>>;
@@ -64,6 +74,33 @@ fn handle(
         return reply(&mut stream, false, "--regen is only supported by prepare");
     }
     match req.command.as_str() {
+        "logcat" | "logcat-dump" => {
+            let running = active_guest.lock().unwrap().clone();
+            let Some(running) = running else {
+                return reply(&mut stream, false, "no running Guest session");
+            };
+            let logcat = match File::open(&running.logcat_path) {
+                Ok(logcat) => logcat,
+                Err(error) => {
+                    return reply(&mut stream, false, format!("open Guest logcat: {error}"))
+                }
+            };
+            let dump = req.command == "logcat-dump";
+            let limit = if dump {
+                logcat.metadata()?.len()
+            } else {
+                u64::MAX
+            };
+            stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+            reply(&mut stream, true, "")?;
+            let mut logcat = logcat.take(limit);
+            if dump {
+                io::copy(&mut logcat, &mut stream)?;
+            } else {
+                follow_logcat(&mut logcat, &mut stream, running.pidfd.as_raw_fd())?;
+            }
+            Ok(())
+        }
         "status" => {
             let job = fs::read_to_string(root.join("state/last-job.json")).unwrap_or_else(|_| "none".into());
             let images = super::images::image_list(&root)?;
@@ -98,8 +135,9 @@ fn handle(
             if *guard {
                 return reply(&mut stream, false, "another operation is running");
             }
+            let result = start_session(&root, name, &active_guest);
             drop(guard);
-            match start_session(&root, name, &active_guest) {
+            match result {
                 Ok(message) => {
                     log(&root, &message);
                     reply(&mut stream, true, message)
@@ -130,19 +168,54 @@ fn handle(
                     );
                 }
             }
-            let pid = running.pid;
-            let profile = running.profile.clone();
+            let running = running.clone();
             drop(guard);
-            if unsafe { libc::kill(pid as i32, libc::SIGTERM) } != 0 {
-                return reply(
+            let pid = running.pid;
+            let profile = &running.profile;
+            if unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    running.pidfd.as_raw_fd(),
+                    libc::SIGTERM,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                )
+            } != 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    return reply(
+                        &mut stream,
+                        false,
+                        format!("failed to signal Guest {profile} (pid={pid}): {error}"),
+                    );
+                }
+            }
+            let (result, _) = running
+                .exit
+                .finished
+                .wait_timeout_while(
+                    running.exit.result.lock().unwrap(),
+                    Duration::from_secs(30),
+                    |result| result.is_none(),
+                )
+                .unwrap();
+            match result.as_ref() {
+                Some(Ok(())) => reply(
+                    &mut stream,
+                    true,
+                    format!("stopped Guest profile {profile} (pid={pid})"),
+                ),
+                Some(Err(error)) => reply(
                     &mut stream,
                     false,
-                    format!("failed to signal Guest {profile} (pid={pid}): {}", io::Error::last_os_error()),
-                );
+                    format!("Guest {profile} stop failed: {error}; see {}", running.log_path.display()),
+                ),
+                None => reply(
+                    &mut stream,
+                    false,
+                    format!("Guest {profile} stop timed out; see {}", running.log_path.display()),
+                ),
             }
-            let message = format!("stopping Guest profile {profile} (pid={pid})");
-            log(&root, &message);
-            reply(&mut stream, true, message)
         }
         "remove" => {
             let Some(name) = req.profile_name.as_deref().filter(|name| valid_image_name(name)) else { return reply(&mut stream, false, "invalid profile name"); };
@@ -221,6 +294,58 @@ fn handle(
         _ => reply(&mut stream, false, "unknown command")
     }
 }
+
+fn follow_logcat(
+    logcat: &mut impl Read,
+    stream: &mut UnixStream,
+    worker_fd: std::os::fd::RawFd,
+) -> io::Result<()> {
+    let mut fds = [
+        libc::pollfd {
+            fd: stream.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: worker_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    loop {
+        match io::copy(logcat, stream) {
+            Ok(_) => (),
+            Err(error) if matches!(error.kind(), io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset) => {
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        }
+        if fds[1].revents != 0 {
+            return Ok(());
+        }
+        if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, 100) } < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if fds[0].revents != 0 {
+            return Ok(());
+        }
+    }
+}
+fn daemon_exe() -> io::Result<PathBuf> {
+    let exe = std::env::current_exe()?;
+    if !exe.is_file() {
+        return Err(io::Error::other(format!(
+            "daemon executable {} is missing or replaced; restart ssald (restart.sh) or reboot",
+            exe.display()
+        )));
+    }
+    Ok(exe)
+}
+
 fn prepare_session(
     root: &Path,
     name: &str,
@@ -228,8 +353,9 @@ fn prepare_session(
     force_regen: bool,
     native_sepolicy: bool,
 ) -> io::Result<String> {
+    let exe = daemon_exe()?;
     if mode == "prepare" {
-        crate::guest::prepare::check_boot_binaries(std::env::current_exe()?.parent().unwrap())?;
+        crate::guest::prepare::check_boot_binaries(exe.parent().unwrap())?;
     }
     crate::diagnostics::selinux::servicemanager::check_recovery()?;
     let profile = crate::guest::prepare::check(root, name)?;
@@ -240,7 +366,7 @@ fn prepare_session(
     let result = (|| {
         fs::create_dir(base.join("system"))?;
         fs::create_dir(base.join("data"))?;
-        let mut worker = Command::new(std::env::current_exe()?);
+        let mut worker = Command::new(&exe);
         worker
             .arg(match mode {
                 "probe-binder" => "--binder-probe-worker",
@@ -343,6 +469,11 @@ fn cleanup_guest_scratch(base: &Path) -> io::Result<()> {
             }
         }
     }
+    if let Err(error) = fs::remove_file(base.join("logcat")) {
+        if error.kind() != io::ErrorKind::NotFound {
+            return Err(error);
+        }
+    }
     for path in [base.join("data"), base.join("system"), base.to_path_buf()] {
         if let Err(e) = fs::remove_dir(&path) {
             if e.kind() != io::ErrorKind::NotFound {
@@ -363,7 +494,8 @@ fn start_session(root: &Path, name: &str, active_guest: &ActiveGuest) -> io::Res
             )));
         }
     }
-    crate::guest::prepare::check_boot_binaries(std::env::current_exe()?.parent().unwrap())?;
+    let exe = daemon_exe()?;
+    crate::guest::prepare::check_boot_binaries(exe.parent().unwrap())?;
     crate::diagnostics::selinux::servicemanager::check_recovery()?;
     let profile = crate::guest::prepare::check(root, name)?;
     if !root.join("guests").join(name).join("selinux/plan.json").is_file() {
@@ -383,7 +515,17 @@ fn start_session(root: &Path, name: &str, active_guest: &ActiveGuest) -> io::Res
         .mode(0o600)
         .open(&log_path)?;
     let stderr = stdout.try_clone()?;
-    let mut worker = Command::new(std::env::current_exe()?);
+    let logcat_path = base.join("logcat");
+    if let Err(error) = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&logcat_path)
+    {
+        let _ = cleanup_guest_scratch(&base);
+        return Err(error);
+    }
+    let mut worker = Command::new(&exe);
     worker
         .arg("--guest-start-worker")
         .arg(&profile.system)
@@ -400,10 +542,22 @@ fn start_session(root: &Path, name: &str, active_guest: &ActiveGuest) -> io::Res
         }
     };
     let pid = child.id();
+    let raw_fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as i32;
+    if raw_fd < 0 {
+        let error = io::Error::last_os_error();
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = cleanup_guest_scratch(&base);
+        return Err(io::Error::other(format!("open Guest pidfd: {error}")));
+    }
+    let exit = Arc::new(GuestExit::default());
     *active_guest.lock().unwrap() = Some(RunningGuest {
         profile: name.to_owned(),
         pid,
         log_path: log_path.clone(),
+        logcat_path,
+        pidfd: Arc::new(unsafe { File::from_raw_fd(raw_fd) }),
+        exit: Arc::clone(&exit),
     });
     let root_owned = root.to_path_buf();
     let name_owned = name.to_owned();
@@ -411,12 +565,21 @@ fn start_session(root: &Path, name: &str, active_guest: &ActiveGuest) -> io::Res
     let base_owned = base.clone();
     std::thread::spawn(move || {
         let status = child.wait();
-        let cleanup = cleanup_guest_scratch(&base_owned);
+        let cleanup = match &status {
+            Ok(_) => cleanup_guest_scratch(&base_owned),
+            Err(_) => Err(io::Error::other("worker exit could not be verified")),
+        };
+        let result = match (&status, &cleanup) {
+            (Ok(status), Ok(())) if status.success() => Ok(()),
+            _ => Err(format!("worker exit={status:?}; scratch cleanup={cleanup:?}")),
+        };
         let mut guard = active_owned.lock().unwrap();
-        if guard.as_ref().is_some_and(|g| g.pid == pid) {
+        if status.is_ok() && guard.as_ref().is_some_and(|g| g.pid == pid) {
             *guard = None;
         }
         drop(guard);
+        *exit.result.lock().unwrap() = Some(result);
+        exit.finished.notify_all();
         log(
             &root_owned,
             &format!("Guest profile {name_owned} (pid={pid}) exited: {status:?}; cleanup={cleanup:?}"),
@@ -540,4 +703,36 @@ pub(crate) fn run() -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn logcat_follows_appends_until_session_exits() -> io::Result<()> {
+        let path = std::env::temp_dir().join(format!("ssal-logcat-test-{}", std::process::id()));
+        let mut writer = OpenOptions::new().append(true).create_new(true).open(&path)?;
+        let mut logcat = File::open(&path)?;
+        fs::remove_file(&path)?;
+        let (mut client, mut server) = UnixStream::pair()?;
+        let (mut exit, worker) = UnixStream::pair()?;
+        client.set_read_timeout(Some(Duration::from_secs(5)))?;
+        writer.write_all(b"boot\n")?;
+        let follower = std::thread::spawn(move || {
+            follow_logcat(&mut logcat, &mut server, worker.as_raw_fd())
+        });
+        let mut line = [0; 5];
+        client.read_exact(&mut line)?;
+        assert_eq!(&line, b"boot\n");
+        writer.write_all(b"live\n")?;
+        client.read_exact(&mut line)?;
+        assert_eq!(&line, b"live\n");
+        writer.write_all(b"exit\n")?;
+        exit.write_all(b"x")?;
+        let mut rest = Vec::new();
+        client.read_to_end(&mut rest)?;
+        assert_eq!(&rest, b"exit\n");
+        follower.join().unwrap()
+    }
 }

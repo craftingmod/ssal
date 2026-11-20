@@ -62,7 +62,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         Some("context-manager") => context_manager(),
         Some("inspect-data-service") => inspect_data_service(args.next().as_deref()),
         _ => {
-            Err("usage: phase3-ipc server|client|death-client|check-absent|context-manager".into())
+            Err("usage: ssal-binder-ipc server|client|death-client|check-absent|context-manager".into())
         }
     }
 }

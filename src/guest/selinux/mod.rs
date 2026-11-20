@@ -13,7 +13,7 @@ pub mod native;
 pub mod runtime;
 mod symbols;
 
-const VERSION: u32 = 65;
+const VERSION: u32 = 67;
 
 type Names = BTreeMap<String, String>;
 
@@ -1155,6 +1155,17 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
             );
             plan.rules.insert(rule);
         }
+        if let Some(mediaswcodec) = plan.types.get("mediaswcodec") {
+            let rule = format!("allow {init} {mediaswcodec} process2 {{ nosuid_transition }}");
+            native::record(
+                &mut native_rules,
+                rule.clone(),
+                1,
+                1,
+                &[init, mediaswcodec, "process2", "nosuid_transition"],
+            );
+            plan.rules.insert(rule);
+        }
         if let Some(adbd) = plan.types.get("adbd") {
             for (src, dst) in [(init, adbd)]
                 .into_iter()
@@ -1273,6 +1284,7 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
         "surfaceflinger",
         "hal_graphics_composer_default",
         "hal_graphics_allocator_default",
+        "mediaswcodec",
     ] {
         if let Some(domain) = plan.types.get(original) {
             for (class, permission) in [("fd", "use"), ("fifo_file", "write")] {
@@ -1301,6 +1313,31 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
                     1,
                     1,
                     &[lmkd_domain, "cgroup", class, permission],
+                );
+                plan.rules.insert(rule);
+            }
+        }
+    }
+    if let Some(system_server_domain) = plan.types.get("system_server") {
+        for (target, class, permissions) in [
+            ("vendor_file", "dir", &["search", "getattr"][..]),
+            (
+                "vendor_configs_file",
+                "dir",
+                &["read", "open", "search", "getattr"][..],
+            ),
+            ("vendor_configs_file", "file", &["read", "open", "getattr"][..]),
+            ("vendor_configs_file", "lnk_file", &["read", "getattr"][..]),
+        ] {
+            for permission in permissions {
+                let rule =
+                    format!("allow {system_server_domain} {target} {class} {{ {permission} }}");
+                native::record(
+                    &mut native_rules,
+                    rule.clone(),
+                    1,
+                    1,
+                    &[system_server_domain, target, class, permission],
                 );
                 plan.rules.insert(rule);
             }

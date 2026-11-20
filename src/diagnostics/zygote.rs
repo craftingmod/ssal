@@ -2,13 +2,30 @@
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::{Child, ExitStatus};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const LIMIT: usize = 1024 * 1024;
+static SESSION_LOG: OnceLock<File> = OnceLock::new();
+
+pub(crate) fn open_session_log(base: &Path) -> io::Result<()> {
+    let file = match File::options()
+        .append(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(base.join("logcat"))
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    SESSION_LOG
+        .set(file)
+        .map_err(|_| io::Error::other("Guest logcat already open"))
+}
 
 pub(crate) struct Stream {
     input: Box<dyn Read + Send>,
@@ -16,6 +33,7 @@ pub(crate) struct Stream {
     seen: u64,
     saved: usize,
     limit: usize,
+    session_log: Option<&'static File>,
 }
 impl Stream {
     pub(crate) fn new(
@@ -33,8 +51,15 @@ impl Stream {
             seen: 0,
             saved: 0,
             limit: LIMIT,
+            session_log: None,
         })
     }
+
+    pub(crate) fn with_session_log(mut self) -> Self {
+        self.session_log = SESSION_LOG.get();
+        self
+    }
+
     pub(crate) fn drain(&mut self) -> io::Result<()> {
         let mut buffer = [0; 8192];
         // A writer or descendant holding the pipe cannot stall cleanup indefinitely.
@@ -46,6 +71,12 @@ impl Stream {
                     // shortcut: keep the first bytes, add a tail ring if boot exceeds the cap.
                     let keep = n.min(self.limit.saturating_sub(self.saved));
                     self.output.write_all(&buffer[..keep])?;
+                    if self
+                        .session_log
+                        .is_some_and(|mut log| log.write_all(&buffer[..keep]).is_err())
+                    {
+                        self.session_log = None;
+                    }
                     self.saved += keep;
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
@@ -111,7 +142,8 @@ impl Diagnostics {
                     .take()
                     .ok_or_else(|| io::Error::other("stderr pipe missing"))?,
                 File::create(directory.join("stderr.log"))?,
-            )?,
+            )?
+            .with_session_log(),
             metadata: File::create(directory.join("metadata.jsonl"))?,
             memory: File::create(directory.join("memory.jsonl"))?,
             maps: directory.join("process-maps.txt"),
