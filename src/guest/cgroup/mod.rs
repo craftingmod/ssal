@@ -3,7 +3,7 @@ pub(crate) mod layout;
 mod memory;
 pub(crate) mod task_profiles;
 
-pub(crate) use layout::{guest_cgroup_mounts, task_cgroup_path};
+pub(crate) use layout::{guest_cgroup_mounts, namespace_fd, task_cgroup_path};
 pub(in crate::guest) use layout::{
     remove_empty_cgroup_children, GuestCgroups, GUEST_RESOURCE_CGROUPS,
 };

@@ -287,6 +287,7 @@ pub(crate) fn command(
     let installd_namespace = mapped_installd
         .then(|| fs::read_link("/proc/self/ns/mnt"))
         .transpose()?;
+    let cgroup_ns = crate::guest::cgroup::namespace_fd();
     unsafe {
         command.pre_exec(move || {
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 || libc::getppid() != parent
@@ -295,6 +296,14 @@ pub(crate) fn command(
             }
             // The root transition already ran; only this child joins Guest cgroups.
             join_cgroups(&pre_exec_cgroups)?;
+            if !property_service {
+                crate::guest::cgroup::verify_guest_mount_membership(std::process::id())?;
+            }
+            if let Some(fd) = cgroup_ns {
+                if libc::setns(fd, libc::CLONE_NEWCGROUP) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
             if suspend {
                 system_suspend::mask_host_power()?;
             }
@@ -315,9 +324,6 @@ pub(crate) fn command(
                 || libc::setresuid(uid, uid, uid) != 0
             {
                 return Err(io::Error::last_os_error());
-            }
-            if !property_service {
-                crate::guest::cgroup::verify_guest_mount_membership(std::process::id())?;
             }
             if let Some(expected) = &installd_namespace {
                 let namespace = fs::read_link("/proc/self/ns/mnt")?;
