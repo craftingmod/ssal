@@ -85,6 +85,8 @@ fn mapped_exec_domain(executable: &str, exec_context: Option<&[u8]>) -> &'static
             "/run/ssal/ssal-health" => health::SERVICE.domain,
             "/run/ssal/ssal-gatekeeper" => gatekeeper::SERVICE.domain,
             "/run/ssal/ssal-keymint" => keymint::SERVICE.domain,
+            "/system/bin/gatekeeperd" => "gatekeeperd",
+            "/system/bin/keystore2" => "keystore",
             "/apex/com.android.sdkext/bin/derive_classpath" => "derive_classpath",
             "/apex/com.android.runtime/bin/linkerconfig" | "/system/bin/linkerconfig" => {
                 "linkerconfig"
@@ -224,6 +226,7 @@ pub(crate) fn command(
         && exec_context == Some(DERIVE_CLASSPATH_CONTEXT);
     let mapped_installd =
         executable == INSTALLD && (installd_probe_requested() || graphics_system_server_requested());
+    let memlock_unlimited = executable == "/system/bin/keystore2";
     let mut command = crate::guest::process::command::root_command(root, executable, pivot)?;
     let exec_context = if let Some(plan) = ssal::guest_policy::runtime::load(root)? {
         let original = if mapped_installd {
@@ -296,6 +299,15 @@ pub(crate) fn command(
             }
             if let Some(context) = &exec_context {
                 fs::write("/proc/thread-self/attr/exec", context)?;
+            }
+            if memlock_unlimited {
+                let rlim = libc::rlimit {
+                    rlim_cur: libc::RLIM_INFINITY,
+                    rlim_max: libc::RLIM_INFINITY,
+                };
+                if libc::setrlimit(libc::RLIMIT_MEMLOCK, &rlim) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
             }
             if libc::setgroups(0, std::ptr::null()) != 0
                 || libc::setresgid(uid, uid, uid) != 0
@@ -810,6 +822,20 @@ fn isolated(root: &Path, userdata: &Path) -> io::Result<()> {
         return Err(io::Error::other(
             "Guest control socket directory is not empty",
         ));
+    }
+    Ok(())
+}
+
+fn prepare_security_daemon_dir(
+    root: &Path,
+    rel: &str,
+    uid: u32,
+    label_type: &str,
+) -> io::Result<()> {
+    let dir = crate::guest::mount::directory(root, rel, 0o700)?;
+    std::os::unix::fs::chown(&dir, Some(uid), Some(uid))?;
+    if let Some(plan) = ssal::guest_policy::runtime::load(root)? {
+        ssal::guest_policy::runtime::set_label(&dir, &plan.context(label_type, false)?)?;
     }
     Ok(())
 }
@@ -1458,6 +1484,21 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
             let auth_token_key = keymint::random_bytes::<32>()?;
             keymint::start(root, guest_binder, &auth_token_key, &mut boot_services)?;
             gatekeeper::start(root, guest_binder, &auth_token_key, &mut boot_services)?;
+            prepare_security_daemon_dir(
+                root,
+                "data/misc/gatekeeper",
+                1000,
+                "gatekeeper_data_file",
+            )?;
+            boot_services.push(Service::start(
+                root,
+                "/system/bin/gatekeeperd",
+                &["/data/misc/gatekeeper"],
+                "gatekeeperd",
+                1000,
+                None,
+                &[],
+            )?);
         }
         if system_server_graphics {
             let (major, minor) = hw_driver.provision_hwbinder(root)?;
@@ -1473,6 +1514,23 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
             )?;
             hwbinder::wait_manager(root, &mut hwmanager, &plan, host_mount_namespace, hwbinder_rdev)?;
             boot_services.push(hwmanager);
+            if start_system_server {
+                prepare_security_daemon_dir(
+                    root,
+                    "data/misc/keystore",
+                    1017,
+                    "keystore_data_file",
+                )?;
+                boot_services.push(Service::start(
+                    root,
+                    "/system/bin/keystore2",
+                    &["/data/misc/keystore"],
+                    "keystore2",
+                    1017,
+                    None,
+                    &[],
+                )?);
+            }
             boot_services.push(Service::start(
                 root,
                 hwbinder::GRAPHICS_ALLOCATOR,
@@ -2294,6 +2352,8 @@ mod tests {
             ("/run/ssal/ssal-health", "ssal_health"),
             ("/run/ssal/ssal-gatekeeper", "ssal_gatekeeper"),
             ("/run/ssal/ssal-keymint", "ssal_keymint"),
+            ("/system/bin/gatekeeperd", "gatekeeperd"),
+            ("/system/bin/keystore2", "keystore"),
             ("/system/bin/sh", "shell"),
         ] {
             assert_eq!(

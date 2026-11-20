@@ -13,7 +13,7 @@ pub mod native;
 pub mod runtime;
 mod symbols;
 
-const VERSION: u32 = 57;
+const VERSION: u32 = 58;
 
 type Names = BTreeMap<String, String>;
 
@@ -1171,6 +1171,8 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
         "vold",
         "netd",
         "audioserver",
+        "gatekeeperd",
+        "keystore",
         concurrent::SYSTEM_SUSPEND_DOMAIN,
         "zygote",
         "system_server_startup",
