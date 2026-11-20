@@ -204,6 +204,8 @@ pub(super) fn prepare(
     cache: &Path,
     loop_nodes: &crate::guest::mount::loop_device::LoopNodes,
     policy: Option<&ssal::guest_policy::Plan>,
+    cached_root: Option<&Path>,
+    cache_write_root: Option<&Path>,
 ) -> io::Result<()> {
     fs::create_dir(cache)?;
     if let Some(plan) = policy {
@@ -294,8 +296,25 @@ pub(super) fn prepare(
             return Err(io::Error::other("APEX outer/payload manifest mismatch"));
         }
         if let Some(plan) = policy {
-            ssal::guest_policy::runtime::isolate_tree(plan, mounts, &versioned,
-                &root.parent().unwrap().join("selinux-overlay").join(format!("apex-{index}")))?;
+            let apex_key = format!("apex-{name}@{version}");
+            let session_scratch = root.parent().unwrap().join("selinux-overlay").join(&apex_key);
+            if let Some(cached_upper) = cached_root
+                .map(|dir| dir.join(&apex_key).join("upper"))
+                .filter(|path| path.is_dir())
+            {
+                ssal::guest_policy::runtime::isolate_tree_cached(
+                    plan,
+                    mounts,
+                    &versioned,
+                    &cached_upper,
+                    &session_scratch,
+                )?;
+            } else {
+                let target_scratch = cache_write_root
+                    .map(|dir| dir.join(&apex_key))
+                    .unwrap_or(session_scratch);
+                ssal::guest_policy::runtime::isolate_tree(plan, mounts, &versioned, &target_scratch)?;
+            }
         }
         fs::create_dir(&destination)?;
         mounts.bind(&versioned, &destination, true, false)?;

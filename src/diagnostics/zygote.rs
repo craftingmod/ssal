@@ -1,16 +1,131 @@
 //! Bounded, nonblocking diagnostics owned by the disposable launcher session.
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::{Child, ExitStatus};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const LIMIT: usize = 1024 * 1024;
 static SESSION_LOG: OnceLock<File> = OnceLock::new();
+static DRAINER: OnceLock<LogDrainer> = OnceLock::new();
+
+struct LogDrainer {
+    epoll_fd: RawFd,
+    streams: Arc<Mutex<HashMap<RawFd, Weak<Mutex<StreamState>>>>>,
+}
+
+impl LogDrainer {
+    fn global() -> io::Result<&'static Self> {
+        if let Some(drainer) = DRAINER.get() {
+            return Ok(drainer);
+        }
+        let epoll_fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+        if epoll_fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let streams: Arc<Mutex<HashMap<RawFd, Weak<Mutex<StreamState>>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let worker_streams = Arc::clone(&streams);
+        std::thread::Builder::new()
+            .name("ssal-log-drain".into())
+            .spawn(move || Self::run(epoll_fd, worker_streams))
+            .map_err(|err| {
+                unsafe { libc::close(epoll_fd) };
+                err
+            })?;
+        let drainer = Self { epoll_fd, streams };
+        if DRAINER.set(drainer).is_err() {
+            unsafe { libc::close(epoll_fd) };
+        }
+        Ok(DRAINER.get().expect("drainer initialized"))
+    }
+
+    fn register(&self, fd: RawFd, state: &Arc<Mutex<StreamState>>) -> io::Result<()> {
+        let mut streams = self
+            .streams
+            .lock()
+            .map_err(|_| io::Error::other("log drainer lock poisoned"))?;
+        streams.insert(fd, Arc::downgrade(state));
+        let mut event = libc::epoll_event {
+            events: libc::EPOLLIN as u32,
+            u64: fd as u64,
+        };
+        if unsafe { libc::epoll_ctl(self.epoll_fd, libc::EPOLL_CTL_ADD, fd, &mut event) } < 0 {
+            streams.remove(&fd);
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn unregister(&self, fd: RawFd) {
+        if let Ok(mut streams) = self.streams.lock() {
+            streams.remove(&fd);
+        }
+        unsafe {
+            libc::epoll_ctl(self.epoll_fd, libc::EPOLL_CTL_DEL, fd, std::ptr::null_mut());
+        }
+    }
+
+    fn run(epoll_fd: RawFd, streams: Arc<Mutex<HashMap<RawFd, Weak<Mutex<StreamState>>>>>) {
+        let mut events = [libc::epoll_event { events: 0, u64: 0 }; 64];
+        loop {
+            let n = unsafe {
+                libc::epoll_wait(epoll_fd, events.as_mut_ptr(), events.len() as i32, -1)
+            };
+            if n < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                break;
+            }
+            for event in &events[..n as usize] {
+                let fd = event.u64 as RawFd;
+                let weak = streams
+                    .lock()
+                    .ok()
+                    .and_then(|map| map.get(&fd).cloned());
+                let Some(weak) = weak else {
+                    unsafe {
+                        libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_DEL, fd, std::ptr::null_mut());
+                    }
+                    continue;
+                };
+                let Some(state_arc) = weak.upgrade() else {
+                    if let Ok(mut map) = streams.lock() {
+                        map.remove(&fd);
+                    }
+                    unsafe {
+                        libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_DEL, fd, std::ptr::null_mut());
+                    }
+                    continue;
+                };
+                let done = match state_arc.lock() {
+                    Ok(mut state) => {
+                        let _ = state.drain_nonblocking();
+                        state.eof
+                    }
+                    Err(_) => true,
+                };
+                if done {
+                    if let Ok(mut map) = streams.lock() {
+                        if map.get(&fd).is_some_and(|w| w.ptr_eq(&weak)) {
+                            map.remove(&fd);
+                        }
+                    }
+                    unsafe {
+                        libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_DEL, fd, std::ptr::null_mut());
+                    }
+                }
+            }
+        }
+    }
+}
 
 pub(crate) fn open_session_log(base: &Path) -> io::Result<()> {
     let file = match File::options()
@@ -27,45 +142,29 @@ pub(crate) fn open_session_log(base: &Path) -> io::Result<()> {
         .map_err(|_| io::Error::other("Guest logcat already open"))
 }
 
-pub(crate) struct Stream {
+struct StreamState {
     input: Box<dyn Read + Send>,
     output: File,
     seen: u64,
     saved: usize,
     limit: usize,
     session_log: Option<&'static File>,
+    eof: bool,
 }
-impl Stream {
-    pub(crate) fn new(
-        input: impl Read + AsRawFd + Send + 'static,
-        output: File,
-    ) -> io::Result<Self> {
-        let fd = input.as_raw_fd();
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
-            return Err(io::Error::last_os_error());
+
+impl StreamState {
+    fn drain_nonblocking(&mut self) -> io::Result<()> {
+        if self.eof {
+            return Ok(());
         }
-        Ok(Self {
-            input: Box::new(input),
-            output,
-            seen: 0,
-            saved: 0,
-            limit: LIMIT,
-            session_log: None,
-        })
-    }
-
-    pub(crate) fn with_session_log(mut self) -> Self {
-        self.session_log = SESSION_LOG.get();
-        self
-    }
-
-    pub(crate) fn drain(&mut self) -> io::Result<()> {
         let mut buffer = [0; 8192];
         // A writer or descendant holding the pipe cannot stall cleanup indefinitely.
         for _ in 0..32 {
             match self.input.read(&mut buffer) {
-                Ok(0) => break,
+                Ok(0) => {
+                    self.eof = true;
+                    break;
+                }
                 Ok(n) => {
                     self.seen += n as u64;
                     // shortcut: keep the first bytes, add a tail ring if boot exceeds the cap.
@@ -81,10 +180,81 @@ impl Stream {
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e),
+                Err(e) => {
+                    self.eof = true;
+                    return Err(e);
+                }
             }
         }
         Ok(())
+    }
+}
+
+pub(crate) struct Stream {
+    state: Arc<Mutex<StreamState>>,
+    fd: RawFd,
+}
+impl Stream {
+    pub(crate) fn new(
+        input: impl Read + AsRawFd + Send + 'static,
+        output: File,
+    ) -> io::Result<Self> {
+        let fd = input.as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let state = Arc::new(Mutex::new(StreamState {
+            input: Box::new(input),
+            output,
+            seen: 0,
+            saved: 0,
+            limit: LIMIT,
+            session_log: None,
+            eof: false,
+        }));
+        LogDrainer::global()?.register(fd, &state)?;
+        Ok(Self { state, fd })
+    }
+
+    pub(crate) fn with_session_log(self) -> Self {
+        if let Ok(mut state) = self.state.lock() {
+            state.session_log = SESSION_LOG.get();
+        }
+        self
+    }
+
+    pub(crate) fn set_limit(&mut self, limit: usize) {
+        if let Ok(mut state) = self.state.lock() {
+            state.limit = limit;
+        }
+    }
+
+    pub(crate) fn seen(&self) -> u64 {
+        self.state.lock().map_or(0, |s| s.seen)
+    }
+
+    pub(crate) fn saved(&self) -> usize {
+        self.state.lock().map_or(0, |s| s.saved)
+    }
+
+    pub(crate) fn drain(&mut self) -> io::Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("stream lock poisoned"))?;
+        state.drain_nonblocking()
+    }
+}
+
+impl Drop for Stream {
+    fn drop(&mut self) {
+        if let Some(drainer) = DRAINER.get() {
+            drainer.unregister(self.fd);
+        }
+        if let Ok(mut state) = self.state.lock() {
+            let _ = state.drain_nonblocking();
+        }
     }
 }
 
@@ -152,13 +322,14 @@ impl Diagnostics {
             started,
             sample_at: Instant::now(),
         };
-        result.stderr.limit = stderr_limit.unwrap_or(LIMIT);
+        let stderr_cap = stderr_limit.unwrap_or(LIMIT);
+        result.stderr.set_limit(stderr_cap);
         writeln!(
             result.metadata,
             "{}",
             serde_json::json!({
                 "event": "launch", "unix_ms": launch_ms, "pid": child.id(),
-                "cgroup": cgroup, "stream_limit_bytes": LIMIT, "stderr_limit_bytes": result.stderr.limit,
+                "cgroup": cgroup, "stream_limit_bytes": LIMIT, "stderr_limit_bytes": stderr_cap,
                 "native_capture": "Guest-only abort interposer + SIGSEGV ucontext/maps/bounded stack/FP capture + liblog stderr logger; offline symbolization",
                 "host_debuggerd_tombstoned": "unchanged; not connected",
             })
@@ -241,8 +412,8 @@ impl Diagnostics {
                 "event": "exit", "unix_ms": unix_ms(), "elapsed_ms": self.started.elapsed().as_millis(),
                 "pid": self.pid, "raw_status": status.into_raw(), "exit_code": status.code(),
                 "signal": status.signal(), "core_dumped": status.core_dumped(),
-                "stdout_bytes_drained": self.stdout.seen, "stdout_bytes_saved": self.stdout.saved,
-                "stderr_bytes_drained": self.stderr.seen, "stderr_bytes_saved": self.stderr.saved,
+                "stdout_bytes_drained": self.stdout.seen(), "stdout_bytes_saved": self.stdout.saved(),
+                "stderr_bytes_drained": self.stderr.seen(), "stderr_bytes_saved": self.stderr.saved(),
                 "memory_log_capped": self.memory.metadata()?.len() >= (8 * LIMIT) as u64,
                 "tail_may_be_incomplete": true,
             })
@@ -354,6 +525,27 @@ mod tests {
         assert_eq!(fs::read_to_string(dir.join("stdout.log"))?, "stdout marker");
         assert_eq!(fs::read_to_string(dir.join("stderr.log"))?, "stderr marker");
         drop(diag);
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn stream_drains_continuously_without_manual_polling() -> io::Result<()> {
+        let dir = std::env::temp_dir().join(format!("ssal-drain-{}", std::process::id()));
+        fs::create_dir_all(&dir)?;
+        let log_path = dir.join("service.log");
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "head -c 262144 /dev/zero"])
+            .stdout(Stdio::piped())
+            .spawn()?;
+        let stream = Stream::new(
+            child.stdout.take().unwrap(),
+            File::create(&log_path)?,
+        )?;
+        let status = child.wait()?;
+        assert!(status.success());
+        drop(stream);
+        assert_eq!(fs::metadata(&log_path)?.len(), 262144);
         fs::remove_dir_all(dir)?;
         Ok(())
     }

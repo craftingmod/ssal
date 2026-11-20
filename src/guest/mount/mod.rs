@@ -4,6 +4,7 @@ mod devices;
 mod filesystem;
 pub(crate) mod loop_device;
 pub(crate) mod namespace;
+pub(crate) mod overlay_cache;
 pub(in crate::guest) mod profile;
 mod readonly;
 
@@ -85,9 +86,36 @@ pub(super) fn same_directory(source: &Path, target: &Path) -> io::Result<()> {
     Ok(())
 }
 
+fn cleanup_stale_overlays(userdata: &Path) {
+    let Ok(entries) = fs::read_dir(userdata) else {
+        return;
+    };
+    let current_pid = std::process::id();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(pid_str) = name.strip_prefix(".ssal-overlay-") else {
+            continue;
+        };
+        let Ok(pid) = pid_str.parse::<u32>() else {
+            continue;
+        };
+        if pid == current_pid || Path::new(&format!("/proc/{pid}")).exists() {
+            continue;
+        }
+        let path = entry.path();
+        if let Err(err) = fs::remove_dir_all(&path) {
+            eprintln!("Guest stale overlay cleanup failed {}: {err}", path.display());
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn verify(
     system: &Path,
+    system_image: &Path,
     userdata: &Path,
     profile_dir: &Path,
     base: &Path,
@@ -150,6 +178,7 @@ pub(super) fn verify(
     {
         Some(ssal::guest_policy::runtime::prepare_mounted(
             system,
+            system_image,
             profile_dir,
             force_regen,
         )?)
@@ -185,16 +214,29 @@ pub(super) fn verify(
                 return Err(io::Error::other("Guest installd lower backing is not the system image"));
             }
         }
+        let mut overlay_cache = None;
+        cleanup_stale_overlays(userdata);
         if let Some(plan) = &policy {
             fs::create_dir(&overlay_backing)?;
             overlay_created = true;
             fs::set_permissions(&overlay_backing, fs::Permissions::from_mode(0o700))?;
-            ssal::guest_policy::runtime::isolate_system(
+            let cache = overlay_cache::OverlayCache::open_or_create(
+                system_image,
+                profile_dir,
+                base,
+                plan,
+                &mut mounts,
+                loop_nodes,
+            )?;
+            ssal::guest_policy::runtime::isolate_system_with_cache(
                 plan,
                 &mut mounts,
                 &root,
                 &overlay_backing,
+                cache.cached_root(),
+                cache.write_root(),
             )?;
+            overlay_cache = Some(cache);
         }
         crate::guest::compat::patches::prepare_lock_compat(
             &mut mounts,
@@ -447,7 +489,18 @@ pub(super) fn verify(
         )?;
         crate::guest::compat::patches::code_bridges(&mut mounts, &root, &patch_dir)?;
         println!("guest stage: APEX preparation");
-        apex::prepare(&mut mounts, &root, &cache, loop_nodes, policy.as_ref())?;
+        apex::prepare(
+            &mut mounts,
+            &root,
+            &cache,
+            loop_nodes,
+            policy.as_ref(),
+            overlay_cache.as_ref().and_then(|c| c.cached_root()),
+            overlay_cache.as_ref().and_then(|c| c.write_root()),
+        )?;
+        if let Some(cache) = overlay_cache.as_mut() {
+            cache.finish()?;
+        }
         println!("guest stage: APEX patches");
         crate::guest::compat::patches::apply(
             &mut mounts,
@@ -623,9 +676,7 @@ pub(super) fn verify(
     }
     let descendants = descendants.and_then(|()| {
         if mode == "--guest-start-worker" {
-            for path in &cgroups.created {
-                crate::guest::cgroup::remove_empty_cgroup_children(path)?;
-            }
+            cgroups.prepare_stop_cleanup()?;
         }
         Ok(())
     });
@@ -955,6 +1006,28 @@ mod tests {
                 .split_whitespace()
                 .nth(4)
                 .is_some_and(|p| Path::new(p).starts_with(&base))));
+        fs::remove_dir_all(base)?;
+        Ok(())
+    }
+
+    #[test]
+    fn stale_overlay_directories_are_removed_while_live_pids_remain() -> io::Result<()> {
+        let base = std::env::temp_dir().join(format!("ssal-overlay-gc-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base)?;
+        let stale = base.join(".ssal-overlay-999999999");
+        let live = base.join(format!(".ssal-overlay-{}", std::process::id()));
+        let unrelated = base.join("keep-me");
+        fs::create_dir_all(stale.join("system/upper"))?;
+        fs::write(stale.join("system/upper/file"), b"stale")?;
+        fs::create_dir_all(&live)?;
+        fs::create_dir_all(&unrelated)?;
+
+        cleanup_stale_overlays(&base);
+
+        assert!(!stale.exists());
+        assert!(live.exists());
+        assert!(unrelated.exists());
         fs::remove_dir_all(base)?;
         Ok(())
     }

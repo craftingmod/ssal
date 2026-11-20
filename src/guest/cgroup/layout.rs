@@ -2,11 +2,12 @@ use crate::guest::mount::{cpath, directory, guest_path, same_directory};
 use ssal::namespace_mounts::Mounts;
 use std::ffi::CString;
 use std::fs::{self, File};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 static GUEST_CGROUP_NAMESPACE: Mutex<Option<File>> = Mutex::new(None);
 
@@ -81,31 +82,9 @@ pub(in crate::guest) fn recover_guest_cgroups(backend: super::Backend) -> io::Re
         if !cgroup_exists(&path)? {
             continue;
         }
-        let check = (|| {
-            let parent = path.parent().unwrap();
-            let mount = match parent.to_str() {
-                Some("/sys/fs/cgroup" | "/sys/fs/cgroup/apps") => {
-                    super::memory::mount_root(Path::new("/sys/fs/cgroup"), "cgroup2", None)
-                }
-                Some("/dev/memcg") => super::memory::mount_root(parent, "cgroup", Some("memory")),
-                Some("/dev/cpuctl") => super::memory::mount_root(parent, "cgroup", Some("cpu")),
-                Some("/dev/cpuset") => super::memory::mount_root(parent, "cgroup", Some("cpuset")),
-                Some("/dev/blkio") => super::memory::mount_root(parent, "cgroup", Some("blkio")),
-                _ => Err(io::Error::other("unexpected cgroup parent")),
-            }?;
-            if mount != "/" || fs::canonicalize(&path)? != path {
-                return Err(io::Error::other("unexpected cgroup mount root or symlink"));
-            }
-            if mountinfo.lines().any(|line| {
-                line.split_whitespace()
-                    .nth(4)
-                    .is_some_and(|target| Path::new(target).starts_with(&path))
-            }) {
-                return Err(io::Error::other("mount inside residual Guest cgroup"));
-            }
-            collect_empty_cgroups(&path, &mut empty_groups)
-        })();
-        check.map_err(|error| io::Error::other(format!("{}: {error}", path.display())))?;
+        validate_cgroup_root(&path, &mountinfo)
+            .and_then(|()| collect_empty_cgroups(&path, &mut empty_groups))
+            .map_err(|error| io::Error::other(format!("{}: {error}", path.display())))?;
     }
     for path in empty_groups {
         fs::remove_dir(&path)
@@ -119,6 +98,63 @@ pub(in crate::guest) fn recover_guest_cgroups(backend: super::Backend) -> io::Re
                 path.display()
             )));
         }
+    }
+    Ok(())
+}
+
+fn validate_cgroup_root(path: &Path, mountinfo: &str) -> io::Result<()> {
+    let parent = path.parent().unwrap();
+    let (mount, kind, controller) = match parent.to_str() {
+        Some("/sys/fs/cgroup" | "/sys/fs/cgroup/apps") => {
+            (Path::new("/sys/fs/cgroup"), "cgroup2", None)
+        }
+        Some("/dev/memcg") => (parent, "cgroup", Some("memory")),
+        Some("/dev/cpuctl") => (parent, "cgroup", Some("cpu")),
+        Some("/dev/cpuset") => (parent, "cgroup", Some("cpuset")),
+        Some("/dev/blkio") => (parent, "cgroup", Some("blkio")),
+        _ => return Err(io::Error::other("unexpected cgroup parent")),
+    };
+    if super::memory::mount_root(mount, kind, controller)? != "/" || fs::canonicalize(path)? != path
+    {
+        return Err(io::Error::other("unexpected cgroup mount root or symlink"));
+    }
+    if mountinfo.lines().any(|line| {
+        line.split_whitespace().nth(4).is_some_and(|target| {
+            let target = Path::new(target);
+            target.starts_with(path)
+                || (target != mount && target.starts_with(mount) && path.starts_with(target))
+        })
+    }) {
+        return Err(io::Error::other("unexpected mount in Guest cgroup path"));
+    }
+    Ok(())
+}
+
+fn cgroup_populated(events: &Path) -> io::Result<bool> {
+    match fs::read_to_string(events)?
+        .lines()
+        .find_map(|line| line.strip_prefix("populated "))
+    {
+        Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        _ => Err(io::Error::other(format!(
+            "{}: invalid populated field",
+            events.display()
+        ))),
+    }
+}
+
+fn wait_for_empty_cgroup(events: &Path, timeout: Duration) -> io::Result<()> {
+    let deadline = Instant::now() + timeout;
+    while cgroup_populated(events)? {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("{}: timed out waiting for populated 0", events.display()),
+            ));
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(20)));
     }
     Ok(())
 }
@@ -304,6 +340,53 @@ impl GuestCgroups {
         }
         Ok(())
     }
+
+    pub(in crate::guest) fn prepare_stop_cleanup(&mut self) -> io::Result<()> {
+        let Some(memory) = &self.memory else {
+            return Ok(());
+        };
+        let backend = memory.backend();
+        let task_group = super::task_group(backend);
+        let events = self
+            .created
+            .contains(&task_group)
+            .then(|| task_group.join("cgroup.events"));
+        if let Some(events) = &events {
+            let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
+            validate_cgroup_root(&task_group, &mountinfo)?;
+            if cgroup_populated(events)? {
+                match fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(task_group.join("cgroup.kill"))
+                {
+                    Ok(mut kill) => kill.write_all(b"1")?,
+                    // Older kernels rely on the worker's pidfd-based descendant cleanup.
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            wait_for_empty_cgroup(events, Duration::from_secs(5))?;
+        }
+
+        let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
+        let mut groups = Vec::new();
+        for (path, _) in guest_cgroup_mounts(backend) {
+            if self.created.contains(&path) {
+                validate_cgroup_root(&path, &mountinfo)
+                    .and_then(|()| collect_empty_cgroups(&path, &mut groups))
+                    .map_err(|error| io::Error::other(format!("{}: {error}", path.display())))?;
+            }
+        }
+        if let Some(events) = &events {
+            if cgroup_populated(events)? {
+                return Err(io::Error::other("Guest task cgroup became populated again"));
+            }
+        }
+        // Cleanup reverses this list, so each directory is removed once, children first.
+        self.created = groups.into_iter().rev().collect();
+        Ok(())
+    }
 }
 
 impl Drop for GuestCgroups {
@@ -312,21 +395,6 @@ impl Drop for GuestCgroups {
             eprintln!("Guest cgroup cleanup failed: {error}");
         }
     }
-}
-
-// Only rmdir descendants of a subtree this worker created, after all children were reaped.
-pub(in crate::guest) fn remove_empty_cgroup_children(path: &Path) -> io::Result<()> {
-    for entry in fs::read_dir(path)? {
-        let entry = entry?;
-        if entry.file_type()?.is_symlink() {
-            return Err(io::Error::other("unexpected symlink in Guest cgroup"));
-        }
-        if entry.file_type()?.is_dir() {
-            remove_empty_cgroup_children(&entry.path())?;
-            fs::remove_dir(entry.path())?;
-        }
-    }
-    Ok(())
 }
 
 fn pipe_cloexec() -> io::Result<(File, File)> {
@@ -485,23 +553,23 @@ mod tests {
     }
 
     #[test]
-    fn fork_cgroup_cleanup_uses_rmdir_and_rejects_symlinks() -> io::Result<()> {
-        let root = std::env::temp_dir().join(format!("ssal-fork-cgroups-{}", std::process::id()));
-        fs::create_dir_all(root.join("uid_10000/pid_42"))?;
-        remove_empty_cgroup_children(&root)?;
-        assert!(root.is_dir());
-        assert!(!root.join("uid_10000").exists());
-        fs::create_dir(root.join("occupied"))?;
-        fs::write(root.join("occupied/sentinel"), "keep")?;
-        assert!(remove_empty_cgroup_children(&root).is_err());
-        assert_eq!(fs::read_to_string(root.join("occupied/sentinel"))?, "keep");
-        fs::remove_file(root.join("occupied/sentinel"))?;
-        fs::remove_dir(root.join("occupied"))?;
-        symlink("/", root.join("unexpected"))?;
-        assert!(remove_empty_cgroup_children(&root).is_err());
-        fs::remove_file(root.join("unexpected"))?;
-        fs::remove_dir(root)?;
-        Ok(())
+    fn cgroup_drain_requires_populated_zero() -> io::Result<()> {
+        let events =
+            std::env::temp_dir().join(format!("ssal-cgroup-events-{}", std::process::id()));
+        let result = (|| {
+            fs::write(&events, "populated 1\nfrozen 0\n")?;
+            assert_eq!(
+                wait_for_empty_cgroup(&events, Duration::from_millis(20))
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::TimedOut
+            );
+            fs::write(&events, "frozen 0\n")?;
+            assert!(wait_for_empty_cgroup(&events, Duration::ZERO).is_err());
+            fs::write(&events, "populated 0\nfrozen 0\n")?;
+            wait_for_empty_cgroup(&events, Duration::ZERO)
+        })();
+        result.and(fs::remove_file(events))
     }
 
     #[test]
@@ -518,6 +586,10 @@ mod tests {
             assert!(groups.is_empty());
 
             fs::write(child.join("cgroup.procs"), "")?;
+            let unexpected = root.join("unexpected");
+            symlink("/", &unexpected)?;
+            assert!(collect_empty_cgroups(&root, &mut Vec::new()).is_err());
+            fs::remove_file(unexpected)?;
             collect_empty_cgroups(&root, &mut groups)?;
             assert_eq!(groups, [child, root.clone()]);
             Ok(())

@@ -2555,6 +2555,10 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
             }
             loop {
                 crate::guest::process::supervision::check_interrupted()?;
+                manager.drain_output()?;
+                if manager.exited()? {
+                    return Err(io::Error::other("Guest servicemanager exited unexpectedly"));
+                }
                 zygote.tick_diagnostics()?;
                 zygote.drain_output()?;
                 for service in &mut boot_services {

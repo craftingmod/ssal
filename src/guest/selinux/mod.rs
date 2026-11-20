@@ -82,6 +82,24 @@ pub fn allocate_id(root: &Path) -> io::Result<String> {
     Err(invalid("profile IDs exhausted"))
 }
 
+/// Compile-time guest concurrency mode ("single" | "multi").
+/// In "single" mode, SELinux policy IDs are allocated per system image rather than per profile.
+pub const MULTI_GUEST_SUPPORT: &str = "single";
+
+pub fn system_image_id(root: &Path, system_image_dir: &Path) -> io::Result<String> {
+    let path = system_image_dir.join("selinux-id");
+    if path.is_file() {
+        let id = fs::read_to_string(&path)?;
+        let id = id.trim();
+        if valid_id(id) && root.join("state/selinux-ids").join(id).is_file() {
+            return Ok(id.to_owned());
+        }
+    }
+    let id = allocate_id(root)?;
+    atomic(&path, id.as_bytes())?;
+    Ok(id)
+}
+
 pub fn profile_id(root: &Path, profile: &Path) -> io::Result<String> {
     let path = profile.join("profile.json");
     let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
@@ -1143,28 +1161,19 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
             &[init, init, "fifo_file", "create"],
         );
         plan.rules.insert(rule);
-        if let Some(shell) = plan.types.get("shell") {
-            // Guest system mounts remain nosuid; permit only the explicit Guest mock domain transition.
-            let rule = format!("allow {init} {shell} process2 {{ nosuid_transition }}");
-            native::record(
-                &mut native_rules,
-                rule.clone(),
-                1,
-                1,
-                &[init, shell, "process2", "nosuid_transition"],
-            );
-            plan.rules.insert(rule);
-        }
-        if let Some(mediaswcodec) = plan.types.get("mediaswcodec") {
-            let rule = format!("allow {init} {mediaswcodec} process2 {{ nosuid_transition }}");
-            native::record(
-                &mut native_rules,
-                rule.clone(),
-                1,
-                1,
-                &[init, mediaswcodec, "process2", "nosuid_transition"],
-            );
-            plan.rules.insert(rule);
+        for domain in ["shell", "mediaswcodec", "bootanim"] {
+            if let Some(target) = plan.types.get(domain) {
+                // Guest system mounts remain nosuid; permit only the explicit Guest domain transition.
+                let rule = format!("allow {init} {target} process2 {{ nosuid_transition }}");
+                native::record(
+                    &mut native_rules,
+                    rule.clone(),
+                    1,
+                    1,
+                    &[init, target, "process2", "nosuid_transition"],
+                );
+                plan.rules.insert(rule);
+            }
         }
         if let Some(adbd) = plan.types.get("adbd") {
             for (src, dst) in [(init, adbd)]
@@ -1285,6 +1294,7 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
         "hal_graphics_composer_default",
         "hal_graphics_allocator_default",
         "mediaswcodec",
+        "bootanim",
     ] {
         if let Some(domain) = plan.types.get(original) {
             for (class, permission) in [("fd", "use"), ("fifo_file", "write")] {
@@ -2054,7 +2064,7 @@ mod tests {
             "p0001",
             &BTreeMap::from([(
                 "policy.cil".into(),
-                "(type init) (type shell) (type unrelated)".into(),
+                "(type init) (type shell) (type bootanim) (type unrelated)".into(),
             )]),
         )?;
         let rule = "allow ssal_p0001_init ssal_p0001_init fifo_file { create }";
@@ -2068,23 +2078,26 @@ mod tests {
             .rules
             .iter()
             .any(|rule| rule.starts_with("allow init ")));
-        let transition = "allow ssal_p0001_init ssal_p0001_shell process2 { nosuid_transition }";
-        assert!(plan.rules.contains(transition));
-        assert_eq!(
-            plan.native_rules[transition][0].args,
-            [
-                "ssal_p0001_init",
-                "ssal_p0001_shell",
-                "process2",
-                "nosuid_transition"
-            ]
-        );
+        for domain in ["shell", "bootanim"] {
+            let target = format!("ssal_p0001_{domain}");
+            let transition = format!("allow ssal_p0001_init {target} process2 {{ nosuid_transition }}");
+            assert!(plan.rules.contains(&transition));
+            assert_eq!(
+                plan.native_rules[&transition][0].args,
+                [
+                    "ssal_p0001_init",
+                    target.as_str(),
+                    "process2",
+                    "nosuid_transition"
+                ]
+            );
+        }
         assert_eq!(
             plan.rules
                 .iter()
                 .filter(|rule| rule.contains("nosuid_transition"))
                 .count(),
-            1
+            2
         );
         Ok(())
     }
@@ -2296,6 +2309,21 @@ mod tests {
         assert_eq!(fs::read_dir(profile.join("selinux/plans"))?.count(), 2);
         fs::remove_dir_all(&profile)?;
         assert_eq!(allocate_id(&root)?, "p0002");
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn system_image_id_reuses_same_image_and_isolates_different_images() -> io::Result<()> {
+        let root = std::env::temp_dir().join(format!("ssal-sysimg-id-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let img1 = root.join("images/img1");
+        let img2 = root.join("images/img2");
+        fs::create_dir_all(&img1)?;
+        fs::create_dir_all(&img2)?;
+        assert_eq!(system_image_id(&root, &img1)?, "p0001");
+        assert_eq!(system_image_id(&root, &img1)?, "p0001");
+        assert_eq!(system_image_id(&root, &img2)?, "p0002");
         fs::remove_dir_all(root)?;
         Ok(())
     }

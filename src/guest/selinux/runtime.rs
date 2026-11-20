@@ -639,7 +639,12 @@ pub fn load_applied_for_probe(system: &Path, profile: &Path) -> io::Result<Plan>
     Ok(plan)
 }
 
-pub fn prepare_mounted(system: &Path, profile: &Path, force_regen: bool) -> io::Result<Plan> {
+pub fn prepare_mounted(
+    system: &Path,
+    system_image: &Path,
+    profile: &Path,
+    force_regen: bool,
+) -> io::Result<Plan> {
     fs::create_dir_all(profile.join("selinux"))?;
     let prepare_lock = File::create(profile.join("selinux/prepare.lock"))?;
     if unsafe { libc::flock(prepare_lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
@@ -653,7 +658,14 @@ pub fn prepare_mounted(system: &Path, profile: &Path, force_regen: bool) -> io::
     if unsafe { libc::flock(registry_lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    let id = profile_id(root, profile)?;
+    let id = if MULTI_GUEST_SUPPORT == "single" {
+        let image_dir = system_image
+            .parent()
+            .ok_or_else(|| invalid("system image directory missing"))?;
+        system_image_id(root, image_dir)?
+    } else {
+        profile_id(root, profile)?
+    };
     drop(registry_lock);
     let files = inputs(system)?;
     let (plan, regenerated) = prepare(profile, &id, &files, force_regen)?;
@@ -685,18 +697,107 @@ pub fn isolate_system(
     root: &Path,
     backing: &Path,
 ) -> io::Result<()> {
+    isolate_system_with_cache(plan, mounts, root, backing, None, None)
+}
+
+pub fn isolate_system_with_cache(
+    plan: &Plan,
+    mounts: &mut Mounts,
+    root: &Path,
+    session_backing: &Path,
+    cached_root: Option<&Path>,
+    cache_write_root: Option<&Path>,
+) -> io::Result<()> {
     plan.usable()?;
     let scratch = root.parent().unwrap().join("selinux-overlay");
     fs::create_dir(&scratch)?;
     // Android tmpfs can lack trusted xattrs; use the already mounted Guest ext4 userdata.
-    mounts.bind(backing, &scratch, false, false)?;
+    mounts.bind(session_backing, &scratch, false, false)?;
     for partition in ["system", "product", "system_ext"] {
         let target = root.join(partition);
         if !fs::symlink_metadata(&target).is_ok_and(|m| m.is_dir()) {
             continue;
         }
-        isolate_tree(plan, mounts, &target, &scratch.join(partition))?;
+        if let Some(cache_root) = cached_root {
+            let cached_upper = cache_root.join(partition).join("upper");
+            if cached_upper.is_dir() {
+                isolate_tree_cached(
+                    plan,
+                    mounts,
+                    &target,
+                    &cached_upper,
+                    &scratch.join(partition),
+                )?;
+                continue;
+            }
+        }
+        let target_scratch = cache_write_root
+            .unwrap_or(&scratch)
+            .join(partition);
+        isolate_tree(plan, mounts, &target, &target_scratch)?;
     }
+    Ok(())
+}
+
+pub fn isolate_tree_cached(
+    plan: &Plan,
+    mounts: &mut Mounts,
+    target: &Path,
+    cached_upper: &Path,
+    session_scratch: &Path,
+) -> io::Result<()> {
+    fs::create_dir(session_scratch)?;
+    let lower = File::open(target)?;
+    let original = crate::unix::image_context(&lower)?;
+    let mut parts: Vec<_> = original.split(':').collect();
+    let mapped = context_type(&original)
+        .and_then(|t| plan.types.get(t))
+        .ok_or_else(|| {
+            invalid(format!(
+                "unmapped lower root label {}: {original}",
+                target.display()
+            ))
+        })?;
+    parts[2] = mapped;
+    create_upper_root(&lower, &session_scratch.join("upper"), |upper| {
+        let expected = parts.join(":");
+        set_label(upper, &expected)?;
+        let actual = crate::unix::image_context(&File::open(upper)?)?;
+        if actual != expected {
+            return Err(invalid(format!(
+                "upper label mismatch: expected {expected}, got {actual}"
+            )));
+        }
+        Ok(())
+    })?;
+    fs::create_dir(session_scratch.join("work"))?;
+    if [target, cached_upper, session_scratch]
+        .iter()
+        .any(|p| p.as_os_str().as_bytes().iter().any(|b| b",:\\".contains(b)))
+    {
+        return Err(invalid("overlay path contains option separators"));
+    }
+    let options = format!(
+        "lowerdir={}:{},upperdir={},workdir={},metacopy=off",
+        cached_upper.display(),
+        target.display(),
+        session_scratch.join("upper").display(),
+        session_scratch.join("work").display()
+    );
+    mounts
+        .attach(
+            Path::new("overlay"),
+            target,
+            Some("overlay"),
+            libc::MS_NOSUID | libc::MS_NODEV,
+            &options,
+        )
+        .map_err(|e| {
+            io::Error::other(format!(
+                "Guest cached metadata overlay mount {}: {e}",
+                target.display()
+            ))
+        })?;
     Ok(())
 }
 

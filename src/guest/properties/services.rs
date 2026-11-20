@@ -452,7 +452,8 @@ impl Registry {
         for (name, service) in &mut self.0 {
             if service.exited()? {
                 let delay = service.restart_delay.filter(|_| service.state == "running");
-                if let (Some(delay), Some(status)) = (delay, service.reap()?) {
+                let status = service.reap()?;
+                if let (Some(delay), Some(status)) = (delay, status) {
                     service.restart = Some(Restart::Automatic {
                         since: service.started_at,
                         delay: if status.success() {
@@ -804,6 +805,19 @@ mod tests {
         );
         until(&mut registry, &mut properties, "stopped");
         assert!(registry.0["mock"].restart.is_none());
+        assert!(registry.0["mock"].child.is_none());
+        assert_eq!(
+            request(&mut registry, &mut properties, "start", "mock", true),
+            success
+        );
+        assert_eq!(properties.area.get("init.svc.mock").unwrap(), "running");
+        assert!(registry.0["mock"].child.is_some());
+        assert_eq!(
+            request(&mut registry, &mut properties, "stop", "mock", true),
+            success
+        );
+        until(&mut registry, &mut properties, "stopped");
+        assert!(registry.0["mock"].child.is_none());
         drop(registry);
         drop(properties);
         fs::remove_dir_all(root).unwrap();

@@ -330,6 +330,7 @@ pub(crate) fn worker_admitted(
         );
         crate::guest::mount::verify(
             &system_target,
+            &system,
             &data_target,
             profile_dir,
             base,
