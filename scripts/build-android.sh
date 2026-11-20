@@ -32,6 +32,10 @@ install -m 755 "$CARGO_TARGET_DIR/aarch64-linux-android/release/ssal-guest-domai
 install -m 755 "$CARGO_TARGET_DIR/aarch64-linux-android/release/ssal-binder-access" out/bin/ssal-binder-access
 install -m 755 "$CARGO_TARGET_DIR/aarch64-linux-android/release/ssal-enforcing-binder" out/bin/ssal-enforcing-binder
 install -m 755 "$CARGO_TARGET_DIR/aarch64-linux-android/release/ssal-property-service" out/bin/ssal-property-service
+install -m 755 "$CARGO_TARGET_DIR/aarch64-linux-android/release/ssal-art-exec-proc" out/bin/ssal-art-exec-proc
+install -m 755 "$CARGO_TARGET_DIR/aarch64-linux-android/release/ssal-ashmem-probe" out/bin/ssal-ashmem-probe
+install -m 755 "$CARGO_TARGET_DIR/aarch64-linux-android/release/ssal-selinux-startup-probe" out/bin/ssal-selinux-startup-probe
+install -m 755 "$CARGO_TARGET_DIR/aarch64-linux-android/release/ssal-system-server-stall" out/bin/ssal-system-server-stall
 install -m 755 scripts/ssal-hwbinder-probe.sh out/bin/ssal-hwbinder-probe.sh
 if [[ -f .cache/android16-hwbinder-libs/libhidlbase.so ]]; then
     bash scripts/build-hwbinder-probe.sh .cache/android16-hwbinder-libs

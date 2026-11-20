@@ -44,6 +44,29 @@ pub(crate) fn task_cgroup_path() -> io::Result<PathBuf> {
     ))
 }
 
+fn chown_system_cgroup(dir: &Path) -> io::Result<()> {
+    for entry in [
+        dir.to_path_buf(),
+        dir.join("cgroup.procs"),
+        dir.join("tasks"),
+        dir.join("cgroup.threads"),
+        dir.join("cgroup.subtree_control"),
+        dir.join("cgroup.freeze"),
+    ] {
+        if entry.exists() {
+            let path = cpath(&entry)?;
+            if unsafe { libc::chown(path.as_ptr(), 1000, 1000) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            fs::set_permissions(
+                &entry,
+                fs::Permissions::from_mode(if entry == dir { 0o775 } else { 0o664 }),
+            )?;
+        }
+    }
+    Ok(())
+}
+
 #[derive(Default)]
 pub(in crate::guest) struct GuestCgroups {
     pub(in crate::guest) created: Vec<PathBuf>,
@@ -92,32 +115,21 @@ impl GuestCgroups {
                     fs::write(source.join(name), value)?;
                 }
             }
-            // libprocessgroup creates uid_1000 below this Guest-owned parent.
-            let system_cgroup = if target == "sys/fs/cgroup"
+            // libprocessgroup creates uid_<uid> below system/ and apps/ under this Guest-owned parent.
+            let processgroup_parents = if target == "sys/fs/cgroup"
                 && std::env::var_os("SSAL_START_SYSTEM_SERVER").is_some()
             {
-                let system = source.join("system");
-                fs::create_dir(&system)?;
-                for entry in [
-                    system.clone(),
-                    system.join("cgroup.procs"),
-                    system.join("tasks"),
-                    system.join("cgroup.threads"),
-                ] {
-                    if entry.exists() {
-                        let path = cpath(&entry)?;
-                        if unsafe { libc::chown(path.as_ptr(), 1000, 1000) } != 0 {
-                            return Err(io::Error::last_os_error());
-                        }
-                        fs::set_permissions(
-                            &entry,
-                            fs::Permissions::from_mode(if entry == system { 0o755 } else { 0o664 }),
-                        )?;
-                    }
+                chown_system_cgroup(&source)?;
+                let mut created = Vec::with_capacity(2);
+                for name in ["system", "apps"] {
+                    let dir = source.join(name);
+                    fs::create_dir(&dir)?;
+                    chown_system_cgroup(&dir)?;
+                    created.push((name, dir));
                 }
-                Some(system)
+                created
             } else {
-                None
+                Vec::new()
             };
             // sysfs is read-only; its existing cgroup mountpoint needs no mkdir.
             let target = if target == "sys/fs/cgroup" {
@@ -127,11 +139,11 @@ impl GuestCgroups {
             };
             mounts.bind(&source, &target, false, false)?;
             same_directory(&source, &target)?;
-            if let Some(system) = system_cgroup {
-                same_directory(&system, &target.join("system"))?;
+            for (name, dir) in processgroup_parents {
+                same_directory(&dir, &target.join(name))?;
                 println!(
                     "Guest SystemServer cgroup prepared: {} uid=1000 gid=1000",
-                    system.display()
+                    dir.display()
                 );
             }
             println!(

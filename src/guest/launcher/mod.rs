@@ -1010,6 +1010,12 @@ fn check_boot_services(services: &mut [Service]) -> io::Result<()> {
     for service in services {
         service.drain_output()?;
         if service.exited()? {
+            if service.log.file_name().is_some_and(|name| name == "artd.log")
+                && service.exit_status()? == Some((libc::CLD_EXITED, 0))
+            {
+                // artd is a lazy AIDL service and exits cleanly when idle.
+                continue;
+            }
             let log = fs::read_to_string(&service.log).unwrap_or_default();
             if !log.is_empty() {
                 eprintln!("Guest boot service {} log:\n{log}", service.pid());
@@ -1054,12 +1060,25 @@ fn system_server_display_progress(stderr: &str, pid: u32) -> (bool, bool) {
     )
 }
 
-fn report_system_server_display_progress(root: &Path, pid: u32) -> io::Result<bool> {
+fn system_server_boot_completed(stderr: &str, pid: u32) -> bool {
+    let pid = pid.to_string();
+    stderr.lines().any(|line| {
+        line.split_whitespace().nth(2) == Some(pid.as_str())
+            && line
+                .split_once(" SystemServerTiming: ")
+                .is_some_and(|(_, timing)| timing.starts_with("OnBootPhase_1000 took to complete:"))
+    })
+}
+
+fn report_system_server_display_progress(root: &Path, pid: u32) -> io::Result<(bool, bool)> {
     let stderr = fs::read(root.parent().unwrap().join("phase7b/stderr.log"))?;
-    let (display, ready) = system_server_display_progress(&String::from_utf8_lossy(&stderr), pid);
+    let text = String::from_utf8_lossy(&stderr);
+    let (display, ready) = system_server_display_progress(&text, pid);
+    let boot_completed = system_server_boot_completed(&text, pid);
     println!("GUEST_DMS_DEFAULT_DISPLAY pid={pid} phase_returned={display}");
     println!("GUEST_SYSTEM_READY pid={pid} phase_returned={ready}");
-    Ok(ready)
+    println!("GUEST_BOOT_COMPLETED pid={pid} phase_returned={boot_completed}");
+    Ok((ready, boot_completed))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2024,8 +2043,10 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
             {
                 println!("Guest Zygote env={}", String::from_utf8_lossy(entry));
             }
-            let observation_seconds = 180;
+            let observation_seconds = 360;
             let deadline = Instant::now() + Duration::from_secs(observation_seconds);
+            let mut observed_system_ready = false;
+            let mut watch_ticks: u32 = 0;
             while Instant::now() < deadline {
                 crate::guest::process::supervision::check_interrupted()?;
                 check_boot_services(&mut boot_services)?;
@@ -2055,9 +2076,26 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
                 if zygote.exited()? {
                     if let (true, Some(pid)) = (system_server_graphics, system_server_pid) {
                         zygote.tick_diagnostics()?;
-                        report_system_server_display_progress(root, pid)?;
+                        let _ = report_system_server_display_progress(root, pid)?;
                     }
                     return Err(io::Error::other("Guest Zygote exited during residence"));
+                }
+                watch_ticks = watch_ticks.wrapping_add(1);
+                if watch_ticks % 10 == 0 {
+                    if let (true, Some(pid)) = (system_server_graphics, system_server_pid) {
+                        zygote.tick_diagnostics()?;
+                        if let Ok(stderr) = fs::read(root.parent().unwrap().join("phase7b/stderr.log")) {
+                            let text = String::from_utf8_lossy(&stderr);
+                            if !observed_system_ready && system_server_display_progress(&text, pid).1 {
+                                observed_system_ready = true;
+                                println!("GUEST_SYSTEM_READY pid={pid} phase_returned=true");
+                            }
+                            if system_server_boot_completed(&text, pid) {
+                                println!("GUEST_BOOT_COMPLETED pid={pid} phase_returned=true");
+                                break;
+                            }
+                        }
+                    }
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
@@ -2096,9 +2134,11 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
                 println!("PHASE7A_SYSTEM_SERVER=PASS framework_entry=true residence_seconds={observation_seconds}");
                 if system_server_graphics {
                     zygote.tick_diagnostics()?;
-                    if !report_system_server_display_progress(root, expected)? {
+                    let (ready, boot_completed) =
+                        report_system_server_display_progress(root, expected)?;
+                    if !ready || !boot_completed {
                         return Err(io::Error::other(
-                            "Guest SystemServer did not verify display and SystemReady phases",
+                            "Guest SystemServer did not verify display, SystemReady, and BootCompleted phases",
                         ));
                     }
                 }
@@ -2471,6 +2511,10 @@ mod tests {
         assert_eq!(system_server_display_progress(&stderr.join("\n"), 42), (true, true));
         let failed = format!("{}\n11-20 01:00:00.000 42 42 E SystemServer: BOOT FAILURE making Display Manager Service ready", stderr.join("\n"));
         assert_eq!(system_server_display_progress(&failed, 42), (true, false));
+        assert!(!system_server_boot_completed(&stderr.join("\n"), 42));
+        let boot_done = format!("{}\n11-20 01:00:01.000 42 42 V SystemServerTiming: OnBootPhase_1000 took to complete: 12ms", stderr.join("\n"));
+        assert!(!system_server_boot_completed(&boot_done, 43));
+        assert!(system_server_boot_completed(&boot_done, 42));
     }
 
     #[test]

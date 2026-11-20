@@ -12,4 +12,6 @@ pub(crate) use memory::{
     task_group, usage, verify_guest_membership, verify_guest_mount_membership, verify_membership,
     Backend, GuestMemory, Hierarchy,
 };
-pub(in crate::guest) use task_profiles::{guest_cgroup_probe, memory_limit, processgroup_probe};
+pub(in crate::guest) use task_profiles::{
+    guest_cgroup_probe, memory_limit, prepare_processgroup, processgroup_probe,
+};

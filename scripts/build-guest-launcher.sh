@@ -17,12 +17,7 @@ test -s out/bin/ssal-phase2-log.so
 "${ANDROID_NDK_HOME:-/opt/android-ndk}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android30-clang" \
     -shared -fPIC -Os -Wall -Wextra -Werror native/binder-probe/zygote-selinux-noop.c \
     -ldl -o out/bin/ssal-zygote-selinux-noop.so
-"${ANDROID_NDK_HOME:-/opt/android-ndk}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android30-clang" \
-    -Os -Wall -Wextra -Werror native/binder-probe/selinux-startup-probe.c \
-    -ldl -o out/bin/ssal-selinux-startup-probe
-"${ANDROID_NDK_HOME:-/opt/android-ndk}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android30-clang" \
-    -O2 -Wall -Wextra -Werror native/binder-probe/system-server-stall.c \
-    -o out/bin/ssal-system-server-stall
-"${ANDROID_NDK_HOME:-/opt/android-ndk}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android30-clang" \
-    -O2 -Wall -Wextra -Werror native/binder-probe/ashmem-probe.c -ldl \
-    -o out/bin/ssal-ashmem-probe
+# Standalone probe binaries are built by build-android.sh.
+test -x out/bin/ssal-selinux-startup-probe
+test -x out/bin/ssal-system-server-stall
+test -x out/bin/ssal-ashmem-probe

@@ -437,6 +437,15 @@ pub(super) fn verify(
         if let Some(plan) = &policy {
             ssal::guest_policy::runtime::install(plan, &mut mounts, &root)?;
         }
+        if mode == "--guest-zygote-7a-worker"
+            && std::env::var_os("SSAL_START_SYSTEM_SERVER").is_some()
+            && cgroups
+                .memory
+                .as_ref()
+                .is_some_and(|m| m.backend() == crate::guest::cgroup::Backend::V1)
+        {
+            crate::guest::cgroup::prepare_processgroup(&mut mounts, &mut cgroups, &root)?;
+        }
         crate::guest::compat::patches::apply(
             &mut mounts,
             &profile.patches,

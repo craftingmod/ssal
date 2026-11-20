@@ -105,7 +105,7 @@ __attribute__((constructor)) static void load_map(void) {
         int inspect = context && strstr(context, "system_server"); \
         if (context && !mapped) { \
             int error = errno; \
-            if (inspect) dprintf(2, "SSAL_CONTEXT_MAP setter=%s raw=%s mapped=NULL result=-1 errno=%d\n", #name, context, error); \
+            dprintf(2, "SSAL_CONTEXT_MAP_FAIL setter=%s raw=%s mapped=NULL result=-1 errno=%d\n", #name, context, error); \
             errno = error; \
             return -1; \
         } \
@@ -132,11 +132,19 @@ __attribute__((constructor)) static void load_map(void) {
         } \
         if (inspect) dprintf(2, "SSAL_CONTEXT_MAP_PRE setter=%s raw=%s mapped=%s source=%s getcon=%d getcon_errno=%d avc_reset=%d avc_errno=%d dyntransition=%d dyn_errno=%d setcurrent=%d current_errno=%d\n", #name, context, mapped ? mapped : "NULL", source ? source : "NULL", got, get_error, avc_reset, avc_error, dyntransition, dyn_error, setcurrent, current_error); \
         errno = incoming; \
-        int direct = inspect && !strcmp(#name, "setcon") && getenv("SSAL_CONTEXT_MAP_RAW_SETCON") && !strcmp(getenv("SSAL_CONTEXT_MAP_RAW_SETCON"), "1"); \
-        if (direct) dprintf(2, "SSAL_CONTEXT_MAP_RAW_SETCON_BEGIN mapped=%s path=/proc/thread-self/attr/current\n", mapped); \
+        int direct = !strcmp(#name, "setcon") && getenv("SSAL_CONTEXT_MAP_RAW_SETCON") && !strcmp(getenv("SSAL_CONTEXT_MAP_RAW_SETCON"), "1"); \
+        if (direct && inspect) dprintf(2, "SSAL_CONTEXT_MAP_RAW_SETCON_BEGIN mapped=%s path=/proc/thread-self/attr/current\n", mapped); \
         /* Avoid stdio/allocator locks inherited across the Zygote fork after the SID changes. */ \
-        if (direct) { free(source); return set_context_via_procattr(mapped); } \
+        if (direct) { \
+            free(source); \
+            int raw_result = set_context_via_procattr(mapped); \
+            int raw_error = errno; \
+            if (raw_result != 0) dprintf(2, "SSAL_CONTEXT_MAP_FAIL setter=%s raw=%s mapped=%s result=%d errno=%d\n", #name, context ? context : "NULL", mapped ? mapped : "NULL", raw_result, raw_error); \
+            errno = raw_error; \
+            return raw_result; \
+        } \
         int result = real_##name(mapped), error = errno; \
+        if (result != 0 && !inspect) dprintf(2, "SSAL_CONTEXT_MAP_FAIL setter=%s raw=%s mapped=%s result=%d errno=%d\n", #name, context ? context : "NULL", mapped ? mapped : "NULL", result, error); \
         if (inspect) dprintf(2, "SSAL_CONTEXT_MAP setter=%s raw=%s mapped=%s source=%s getcon=%d getcon_errno=%d dyntransition=%d dyn_errno=%d setcurrent=%d current_errno=%d result=%d errno=%d\n", #name, context, mapped ? mapped : "NULL", source ? source : "NULL", got, get_error, dyntransition, dyn_error, setcurrent, current_error, result, error); \
         free(source); \
         errno = error; \

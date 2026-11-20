@@ -13,7 +13,7 @@ pub mod native;
 pub mod runtime;
 mod symbols;
 
-const VERSION: u32 = 59;
+const VERSION: u32 = 61;
 
 type Names = BTreeMap<String, String>;
 
@@ -817,6 +817,18 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
             }
         }
     }
+    // Host mlsconstrain rules evaluate against Host mlstrustedsubject/mlstrustedobject.
+    for host_attr in ["mlstrustedsubject", "mlstrustedobject"] {
+        if let Some(values) = sets.get(host_attr) {
+            for original in values {
+                if let Some(name) = plan.types.get(original) {
+                    let rule = format!("typeattribute {name} {host_attr}");
+                    native::record(&mut native_rules, rule.clone(), 5, 0, &[name, host_attr]);
+                    plan.rules.insert(rule);
+                }
+            }
+        }
+    }
     let source = |name: &str| -> io::Result<String> {
         plan.types
             .get(name)
@@ -1191,6 +1203,21 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
                     1,
                     1,
                     &[domain, "ksu", class, permission],
+                );
+                plan.rules.insert(rule);
+            }
+        }
+    }
+    if active_attributes.contains("appdomain") {
+        if let Some(appdomain) = plan.attributes.get("appdomain") {
+            for (class, permission) in [("fd", "use"), ("fifo_file", "write")] {
+                let rule = format!("allow {appdomain} ksu {class} {{ {permission} }}");
+                native::record(
+                    &mut native_rules,
+                    rule.clone(),
+                    1,
+                    1,
+                    &[appdomain, "ksu", class, permission],
                 );
                 plan.rules.insert(rule);
             }
@@ -2292,5 +2319,22 @@ mod tests {
             plan.context(original, false)?;
         }
         plan.usable()
+    }
+
+    #[test]
+    fn guest_mls_trusted_types_inherit_host_mls_attributes() -> io::Result<()> {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "system/etc/selinux/plat_sepolicy.cil".into(),
+            "(type zygote) (type binder_device) (typeattribute mlstrustedsubject) (typeattribute mlstrustedobject) (typeattributeset mlstrustedsubject (zygote)) (typeattributeset mlstrustedobject (binder_device))".into(),
+        );
+        let plan = generate("p0003", &files)?;
+        assert!(plan
+            .rules
+            .contains("typeattribute ssal_p0003_zygote mlstrustedsubject"));
+        assert!(plan
+            .rules
+            .contains("typeattribute ssal_p0003_binder_device mlstrustedobject"));
+        Ok(())
     }
 }

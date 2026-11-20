@@ -62,7 +62,7 @@ if (existsSync("out/bin/ssal-binder-probe") || existsSync("out/bin/ssal-binder-p
     ["build_script_sha256", "scripts/build-binder-probe.sh"],
     ["phase2_apk_sha256", "out/bin/ssal-phase2.apk"],
     ["art_exec_proc_sha256", "out/bin/ssal-art-exec-proc"],
-    ["art_exec_proc_source_sha256", "native/binder-probe/art-exec-proc.c"],
+    ["art_exec_proc_source_sha256", "src/bin/ssal-art-exec-proc.rs"],
     ["phase2_log_sha256", "out/bin/ssal-phase2-log.so"],
     ["phase2_log_source_sha256", "native/binder-probe/log-to-stderr.c"],
     ["phase2_apk_source_sha256", "scripts/make-phase2-apk.py"],

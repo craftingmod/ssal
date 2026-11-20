@@ -104,13 +104,11 @@ fn processgroup_config(
     Ok((controllers, profiles))
 }
 
-pub(in crate::guest) fn processgroup_probe(
+pub(in crate::guest) fn prepare_processgroup(
     mounts: &mut Mounts,
     cgroups: &mut crate::guest::cgroup::GuestCgroups,
     root: &Path,
-) -> io::Result<()> {
-    let helper = std::env::var("SSAL_PROCESSGROUP_PROBE")
-        .map_err(|_| io::Error::other("SSAL_PROCESSGROUP_PROBE is required"))?;
+) -> io::Result<PathBuf> {
     let (controllers, profiles) = processgroup_config(
         serde_json::from_slice(&fs::read(guest_path(root, "system/etc/cgroups.json")?)?)?,
         serde_json::from_slice(&fs::read(guest_path(
@@ -125,11 +123,12 @@ pub(in crate::guest) fn processgroup_probe(
     ] {
         let source = runtime.join(name);
         fs::write(&source, serde_json::to_vec_pretty(value)?)?;
-        mounts.bind(
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o644))?;
+        ssal::guest_policy::runtime::bind_file(
+            mounts,
+            root,
             &source,
             &guest_path(root, &format!("system/etc/{name}"))?,
-            true,
-            false,
         )?;
     }
     let mut groups = std::collections::BTreeSet::new();
@@ -170,7 +169,10 @@ pub(in crate::guest) fn processgroup_probe(
         }
     }
     for name in ["apps", "system"] {
-        cgroups.create(&crate::guest::cgroup::task_cgroup_path()?.join(name))?;
+        let dir = crate::guest::cgroup::task_cgroup_path()?.join(name);
+        if !dir.exists() {
+            cgroups.create(&dir)?;
+        }
     }
     for path in &cgroups.created {
         for entry in [
@@ -185,11 +187,22 @@ pub(in crate::guest) fn processgroup_probe(
                 }
                 fs::set_permissions(
                     &entry,
-                    fs::Permissions::from_mode(if entry == *path { 0o755 } else { 0o664 }),
+                    fs::Permissions::from_mode(if entry == *path { 0o775 } else { 0o664 }),
                 )?;
             }
         }
     }
+    Ok(runtime)
+}
+
+pub(in crate::guest) fn processgroup_probe(
+    mounts: &mut Mounts,
+    cgroups: &mut crate::guest::cgroup::GuestCgroups,
+    root: &Path,
+) -> io::Result<()> {
+    let helper = std::env::var("SSAL_PROCESSGROUP_PROBE")
+        .map_err(|_| io::Error::other("SSAL_PROCESSGROUP_PROBE is required"))?;
+    let runtime = prepare_processgroup(mounts, cgroups, root)?;
     let target = runtime.join("probe");
     File::create(&target)?;
     mounts.bind(Path::new(&helper), &target, true, false)?;

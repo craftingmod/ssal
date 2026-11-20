@@ -81,7 +81,14 @@ impl PolicyCommand {
         match self.cmd {
             1 | 2 => guest(0),
             4 => guest(0) && guest(1),
-            5 => guest(1), // Shared Host labels may join a Guest target attribute.
+            5 => {
+                guest(1)
+                    || (guest(0)
+                        && matches!(
+                            self.args[1].as_str(),
+                            "mlstrustedsubject" | "mlstrustedobject"
+                        ))
+            } // Shared Host labels may join a Guest target attribute; Guest types may join Host MLS trusted attributes.
             6 => guest(0),
             7 => {
                 guest(0)

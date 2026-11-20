@@ -34,9 +34,10 @@ fetch_headers system/libbase include
 fetch_headers bionic libc/system_properties
 mkdir -p out/bin
 python3 scripts/make-phase2-apk.py
-"$ssal_ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android29-clang" \
-    -static -Os -Wall -Wextra -Werror -Wl,--strip-all \
-    native/binder-probe/art-exec-proc.c -o out/bin/ssal-art-exec-proc
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$(pwd)/target}"
+export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$ssal_ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android29-clang"
+cargo build --locked --release --target aarch64-linux-android --bin ssal-art-exec-proc
+install -m 755 "$CARGO_TARGET_DIR/aarch64-linux-android/release/ssal-art-exec-proc" out/bin/ssal-art-exec-proc
 "$ssal_ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android30-clang" \
     -shared -fPIC -Os -Wall -Wextra -Werror native/binder-probe/log-to-stderr.c \
     -llog -o out/bin/ssal-phase2-log.so
@@ -65,7 +66,7 @@ metadata = {
     'source_sha256': hashlib.sha256(pathlib.Path('native/binder-probe/main.cpp').read_bytes()).hexdigest(),
     'phase2_apk_sha256': hashlib.sha256(pathlib.Path('out/bin/ssal-phase2.apk').read_bytes()).hexdigest(),
     'art_exec_proc_sha256': hashlib.sha256(pathlib.Path('out/bin/ssal-art-exec-proc').read_bytes()).hexdigest(),
-    'art_exec_proc_source_sha256': hashlib.sha256(pathlib.Path('native/binder-probe/art-exec-proc.c').read_bytes()).hexdigest(),
+    'art_exec_proc_source_sha256': hashlib.sha256(pathlib.Path('src/bin/ssal-art-exec-proc.rs').read_bytes()).hexdigest(),
     'phase2_log_sha256': hashlib.sha256(pathlib.Path('out/bin/ssal-phase2-log.so').read_bytes()).hexdigest(),
     'phase2_log_source_sha256': hashlib.sha256(pathlib.Path('native/binder-probe/log-to-stderr.c').read_bytes()).hexdigest(),
     'phase2_apk_source_sha256': hashlib.sha256(pathlib.Path('scripts/make-phase2-apk.py').read_bytes()).hexdigest(),
