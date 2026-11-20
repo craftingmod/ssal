@@ -289,22 +289,36 @@ pub(in crate::guest) fn apply_virtual_composer_access(
         .types
         .get("hal_graphics_composer_service")
         .ok_or_else(|| io::Error::other("Guest hal_graphics_composer_service type missing"))?;
-    let rules: [(&str, &str, &str, &str, &[&str]); 11] = [
+    let alloc = plan
+        .types
+        .get("hal_graphics_allocator_default")
+        .ok_or_else(|| io::Error::other("Guest hal_graphics_allocator_default type missing"))?;
+    let rules: [(&str, &str, &str, &str, &[&str]); 19] = [
         (composer, "r", sys_file, "file", &["entrypoint", "execute", "execute_no_trans", "read", "open", "getattr", "map"]),
         (composer, "r", "ksu", "fd", &["use"]),
         (composer, "r", "ksu", "fifo_file", &["write"]),
+        (composer, "r", "ksu", "unix_stream_socket", &["read", "write", "getattr"]),
         (composer, "r", binder_dev, "chr_file", &["read", "write", "open", "ioctl", "map", "getattr"]),
         (composer, "r", sm, "binder", &["call", "transfer"]),
         (sm, "r", composer, "binder", &["call", "transfer"]),
         (composer, "r", comp_svc, "service_manager", &["add", "find"]),
         (composer, "r", sf, "binder", &["call", "transfer"]),
         (composer, "r", sf, "fd", &["use"]),
+        (composer, "r", alloc, "fd", &["use"]),
+        ("untrusted_app", "r", alloc, "fd", &["use"]),
+        ("untrusted_app", "r", sf, "fd", &["use"]),
+        ("untrusted_app", "r", composer, "fd", &["use"]),
+        ("surfaceflinger", "r", alloc, "fd", &["use"]),
+        ("surfaceflinger", "r", sf, "fd", &["use"]),
+        ("surfaceflinger", "r", composer, "fd", &["use"]),
         (sf, "r", composer, "binder", &["call", "transfer"]),
         (sf, "r", comp_svc, "service_manager", &["find"]),
     ];
     for (src, _src_role, dst, class, perms) in rules {
         let src_ctx = format!("u:r:{src}:s0");
-        let dst_role = if matches!(class, "binder" | "fd" | "fifo_file") && (dst == "ksu" || dst == sf || dst == sm || dst == composer) {
+        let dst_role = if matches!(class, "binder" | "fd" | "fifo_file" | "unix_stream_socket")
+            && (dst == "ksu" || dst == sf || dst == sm || dst == composer || dst == alloc)
+        {
             "r"
         } else {
             "object_r"
@@ -329,6 +343,32 @@ pub(in crate::guest) fn apply_virtual_composer_access(
         }
     }
     println!("Guest Virtual Composer SELinux rules verified for {composer_sid}");
+    for client in [
+        "bootanim",
+        "system_server",
+        "system_app",
+        "platform_app",
+        "priv_app",
+        "untrusted_app",
+    ] {
+        let Some(client_type) = plan.types.get(client) else {
+            continue;
+        };
+        let src_ctx = format!("u:r:{composer}:s0");
+        let dst_ctx = format!("u:r:{client_type}:s0");
+        if selinux::access_allowed(&src_ctx, &dst_ctx, "fd", "use")? {
+            continue;
+        }
+        let rule = vendor_rule(composer, client_type, "fd", &["use"]);
+        let status = Command::new("/data/adb/ksu/bin/ksud")
+            .args(["sepolicy", "patch", &rule])
+            .status()?;
+        if !status.success() || !selinux::access_allowed(&src_ctx, &dst_ctx, "fd", "use")? {
+            return Err(io::Error::other(format!(
+                "Guest Virtual Composer client fd rule failed: {rule}"
+            )));
+        }
+    }
     Ok(())
 }
 

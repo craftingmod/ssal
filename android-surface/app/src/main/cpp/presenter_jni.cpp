@@ -15,6 +15,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -34,6 +35,7 @@ constexpr uint32_t kPacketVersion = 1;
 constexpr size_t kMaxScmFds = 32;
 constexpr size_t kMaxInts = 256;
 constexpr int32_t kCreateFromHandleMethodRegister = 1;
+constexpr int32_t kCreateFromHandleMethodClone = 2;
 
 struct PresenterPacketHeader {
     uint32_t magic;
@@ -153,12 +155,19 @@ struct NativePresenter {
     std::string socket_addr;
     CreateFromHandleFn create_from_handle = nullptr;
     std::atomic<bool> running{true};
+    std::atomic<int> active_listener_fd{-1};
+    std::atomic<int> active_peer_fd{-1};
 
     std::mutex surface_mutex;
     ANativeWindow* window = nullptr;
     ASurfaceControl* surface_control = nullptr;
     int32_t surface_width = 0;
     int32_t surface_height = 0;
+
+    uint32_t probed_width = 0;
+    uint32_t probed_height = 0;
+    uint32_t probed_format = 0;
+    uint32_t probed_stride = 0;
 
     std::unordered_map<int32_t, AHardwareBuffer*> slot_cache;
     std::thread rx_thread;
@@ -171,6 +180,14 @@ struct NativePresenter {
 
     ~NativePresenter() {
         running.store(false, std::memory_order_release);
+        int listener = active_listener_fd.load(std::memory_order_acquire);
+        if (listener >= 0) {
+            shutdown(listener, SHUT_RDWR);
+        }
+        int peer = active_peer_fd.load(std::memory_order_acquire);
+        if (peer >= 0) {
+            shutdown(peer, SHUT_RDWR);
+        }
         if (rx_thread.joinable()) {
             rx_thread.join();
         }
@@ -236,8 +253,11 @@ struct NativePresenter {
             }
             const size_t handle_bytes =
                 sizeof(native_handle_t) + (hdr.num_fds + hdr.num_ints) * sizeof(int);
-            std::vector<uint8_t> handle_buf(handle_bytes, 0);
-            auto* handle = reinterpret_cast<native_handle_t*>(handle_buf.data());
+            auto* handle = static_cast<native_handle_t*>(std::calloc(1, handle_bytes));
+            if (!handle) {
+                close_fds(fds);
+                return;
+            }
             handle->version = sizeof(native_handle_t);
             handle->numFds = static_cast<int>(hdr.num_fds);
             handle->numInts = static_cast<int>(hdr.num_ints);
@@ -248,24 +268,126 @@ struct NativePresenter {
                 handle->data[hdr.num_fds + i] = ints[i];
             }
 
-            AHardwareBuffer_Desc desc{};
-            desc.width = hdr.width;
-            desc.height = hdr.height;
-            desc.layers = 1;
-            desc.format = hdr.format;
-            desc.usage = AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE |
-                         AHARDWAREBUFFER_USAGE_GPU_FRAMEBUFFER |
-                         AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY;
-            desc.stride = hdr.width;
+            uint32_t aligned_stride = hdr.width;
+            if (probed_width == hdr.width &&
+                probed_height == hdr.height &&
+                probed_format == hdr.format &&
+                probed_stride > 0) {
+                aligned_stride = probed_stride;
+            } else {
+                AHardwareBuffer_Desc probe_desc{};
+                probe_desc.width = hdr.width;
+                probe_desc.height = hdr.height;
+                probe_desc.layers = 1;
+                probe_desc.format = hdr.format;
+                probe_desc.usage =
+                    AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE |
+                    AHARDWAREBUFFER_USAGE_GPU_FRAMEBUFFER |
+                    AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY |
+                    (1ULL << 12);
+                AHardwareBuffer* probe_ahb = nullptr;
+                if (AHardwareBuffer_allocate(&probe_desc, &probe_ahb) == 0 && probe_ahb) {
+                    AHardwareBuffer_describe(probe_ahb, &probe_desc);
+                    aligned_stride = probe_desc.stride;
+                    probed_width = hdr.width;
+                    probed_height = hdr.height;
+                    probed_format = hdr.format;
+                    probed_stride = aligned_stride;
+                    LOGI("Probed allocator %ux%u fmt=%u -> stride=%u",
+                         probe_desc.width, probe_desc.height, probe_desc.format, aligned_stride);
+                    AHardwareBuffer_release(probe_ahb);
+                }
+            }
+
+            const uint32_t candidate_strides[] = {
+                aligned_stride,
+                hdr.width,
+                (hdr.width + 31u) & ~31u,
+                (hdr.width + 63u) & ~63u,
+                (hdr.width + 127u) & ~127u,
+            };
+            const uint64_t candidate_usages[] = {
+                AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE |
+                    AHARDWAREBUFFER_USAGE_GPU_FRAMEBUFFER |
+                    AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY |
+                    (1ULL << 12),
+                AHARDWAREBUFFER_USAGE_GPU_FRAMEBUFFER |
+                    AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY |
+                    (1ULL << 12),
+                AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE |
+                    AHARDWAREBUFFER_USAGE_GPU_FRAMEBUFFER |
+                    AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY,
+                AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE |
+                    AHARDWAREBUFFER_USAGE_GPU_FRAMEBUFFER,
+                0,
+            };
 
             AHardwareBuffer* ahb = nullptr;
-            int rc = create_from_handle(&desc, handle, kCreateFromHandleMethodRegister, &ahb);
-            for (uint32_t i = 0; i < hdr.num_fds; ++i) {
-                close(fds[i]);
-                fds[i] = -1;
+            int rc = -22;
+            uint32_t used_stride = hdr.width;
+            uint64_t used_usage = 0;
+            int32_t used_method = kCreateFromHandleMethodClone;
+            for (int32_t method : {kCreateFromHandleMethodClone, kCreateFromHandleMethodRegister}) {
+                for (uint64_t usage : candidate_usages) {
+                    for (uint32_t stride : candidate_strides) {
+                        AHardwareBuffer_Desc desc{};
+                        desc.width = hdr.width;
+                        desc.height = hdr.height;
+                        desc.layers = 1;
+                        desc.format = hdr.format;
+                        desc.usage = usage;
+                        desc.stride = stride;
+                        rc = create_from_handle(&desc, handle, method, &ahb);
+                        if (rc == 0 && ahb) {
+                            used_stride = stride;
+                            used_usage = usage;
+                            used_method = method;
+                            break;
+                        }
+                        ahb = nullptr;
+                    }
+                    if (ahb) {
+                        break;
+                    }
+                }
+                if (ahb) {
+                    break;
+                }
             }
             if (rc != 0 || !ahb) {
-                LOGE("AHardwareBuffer_createFromHandle failed: rc=%d slot=%d", rc, hdr.slot);
+                std::free(handle);
+            }
+            if (rc != 0 || !ahb || used_method == kCreateFromHandleMethodClone) {
+                for (uint32_t i = 0; i < hdr.num_fds; ++i) {
+                    close(fds[i]);
+                    fds[i] = -1;
+                }
+            }
+            if (rc != 0 || !ahb) {
+                AHardwareBuffer_Desc probe_desc{};
+                probe_desc.width = hdr.width;
+                probe_desc.height = hdr.height;
+                probe_desc.layers = 1;
+                probe_desc.format = hdr.format;
+                probe_desc.usage = AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE |
+                                   AHARDWAREBUFFER_USAGE_GPU_FRAMEBUFFER |
+                                   AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY;
+                AHardwareBuffer* probe_ahb = nullptr;
+                if (AHardwareBuffer_allocate(&probe_desc, &probe_ahb) == 0 && probe_ahb) {
+                    AHardwareBuffer_describe(probe_ahb, &probe_desc);
+                    LOGE("Probe allocate %ux%u -> stride=%u usage=0x%llx",
+                         probe_desc.width, probe_desc.height, probe_desc.stride,
+                         static_cast<unsigned long long>(probe_desc.usage));
+                    AHardwareBuffer_release(probe_ahb);
+                }
+                std::string ints_str;
+                for (uint32_t i = 0; i < hdr.num_ints && i < 16; ++i) {
+                    char buf[24];
+                    snprintf(buf, sizeof(buf), "%s%d", i ? "," : "", ints[i]);
+                    ints_str += buf;
+                }
+                LOGE("AHardwareBuffer_createFromHandle failed: rc=%d slot=%d %ux%u fmt=%u fds=%u ints=%u [%s]",
+                     rc, hdr.slot, hdr.width, hdr.height, hdr.format, hdr.num_fds, hdr.num_ints, ints_str.c_str());
                 if (hdr.has_fence && !fds.empty() && fds.back() >= 0) {
                     close(fds.back());
                 }
@@ -277,8 +399,9 @@ struct NativePresenter {
                 AHardwareBuffer_release(it->second);
             }
             slot_cache[hdr.slot] = ahb;
-            LOGI("Imported AHardwareBuffer slot=%d %ux%u fmt=%u",
-                 hdr.slot, hdr.width, hdr.height, hdr.format);
+            LOGI("Imported AHardwareBuffer slot=%d %ux%u stride=%u usage=0x%llx fmt=%u",
+                 hdr.slot, hdr.width, hdr.height, used_stride,
+                 static_cast<unsigned long long>(used_usage), hdr.format);
         }
 
         int acquire_fence = (hdr.has_fence && !fds.empty()) ? fds.back() : -1;
@@ -293,15 +416,48 @@ struct NativePresenter {
             return;
         }
 
+        static int tx_log_count = 0;
+        if (tx_log_count < 5) {
+            ++tx_log_count;
+            LOGI("Apply tx #%d slot=%d %ux%u -> %dx%d dataspace=%d has_fence=%u fence_fd=%d",
+                 tx_log_count, hdr.slot, hdr.width, hdr.height,
+                 surface_width, surface_height, hdr.dataspace, hdr.has_fence, acquire_fence);
+        }
+
+        if (acquire_fence >= 0) {
+            struct pollfd pfd { acquire_fence, POLLIN, 0 };
+            poll(&pfd, 1, 16);
+            close(acquire_fence);
+            acquire_fence = -1;
+        }
+
+        const ADataSpace ds = hdr.dataspace != 0
+            ? static_cast<ADataSpace>(hdr.dataspace)
+            : ADATASPACE_SRGB;
+
+        int32_t dst_w = surface_width;
+        int32_t dst_h = surface_height;
+        if (hdr.width > 0 && hdr.height > 0) {
+            const int64_t lhs = static_cast<int64_t>(surface_width) * hdr.height;
+            const int64_t rhs = static_cast<int64_t>(surface_height) * hdr.width;
+            if (lhs > rhs) {
+                dst_w = static_cast<int32_t>(rhs / hdr.height);
+            } else if (lhs < rhs) {
+                dst_h = static_cast<int32_t>(lhs / hdr.width);
+            }
+        }
+        const int32_t dst_x = (surface_width - dst_w) / 2;
+        const int32_t dst_y = (surface_height - dst_h) / 2;
+
         ASurfaceTransaction* tx = ASurfaceTransaction_create();
         ASurfaceTransaction_setVisibility(
             tx, surface_control, ASURFACE_TRANSACTION_VISIBILITY_SHOW);
+        ASurfaceTransaction_setZOrder(tx, surface_control, 1);
         ARect src{0, 0, static_cast<int32_t>(hdr.width), static_cast<int32_t>(hdr.height)};
-        ARect dst{0, 0, surface_width, surface_height};
+        ARect dst{dst_x, dst_y, dst_x + dst_w, dst_y + dst_h};
         ASurfaceTransaction_setGeometry(tx, surface_control, src, dst, 0);
-        ASurfaceTransaction_setBuffer(tx, surface_control, ahb, acquire_fence);
-        ASurfaceTransaction_setBufferDataSpace(
-            tx, surface_control, static_cast<ADataSpace>(hdr.dataspace));
+        ASurfaceTransaction_setBuffer(tx, surface_control, ahb, -1);
+        ASurfaceTransaction_setBufferDataSpace(tx, surface_control, ds);
         ASurfaceTransaction_apply(tx);
         ASurfaceTransaction_delete(tx);
     }
@@ -395,6 +551,7 @@ struct NativePresenter {
             return;
         }
         LOGI("Listening on presenter socket: %s", socket_addr.c_str());
+        active_listener_fd.store(listener, std::memory_order_release);
 
         while (running.load(std::memory_order_acquire)) {
             struct pollfd pfd { listener, POLLIN, 0 };
@@ -410,11 +567,14 @@ struct NativePresenter {
                 continue;
             }
             LOGI("Accepted presenter relay connection");
+            active_peer_fd.store(peer, std::memory_order_release);
             receive_from_peer(peer);
+            active_peer_fd.store(-1, std::memory_order_release);
             close(peer);
             clear_slot_cache();
         }
 
+        active_listener_fd.store(-1, std::memory_order_release);
         close(listener);
         unlink(socket_addr.c_str());
     }

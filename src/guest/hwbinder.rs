@@ -3,9 +3,12 @@ use crate::diagnostics::selinux::{access_allowed, require_enforcing_domain};
 use crate::guest::{binder, environment, init::Service, launcher, mount, runtime};
 use ssal::namespace_mounts::Mounts;
 use std::fs::{self, File};
-use std::io;
+use std::io::{self, BufRead};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 pub(super) const MANAGER: &str = "/system_ext/bin/hwservicemanager";
@@ -91,6 +94,66 @@ pub(super) fn wait_manager(
     }
 }
 
+fn register_presenter_pair() -> Option<OwnedFd> {
+    let mut fds = [-1 as libc::c_int; 2];
+    if unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+            0,
+            fds.as_mut_ptr(),
+        )
+    } != 0
+    {
+        eprintln!(
+            "GUEST_VIRTUAL_COMPOSER_PRESENTER=WARN socketpair_err={}",
+            io::Error::last_os_error()
+        );
+        return None;
+    }
+    let composer_fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+    let daemon_fd = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+
+    let mut stream = match UnixStream::connect(format!("{}/run/ssald.sock", ssal::unix::ROOT)) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("GUEST_VIRTUAL_COMPOSER_PRESENTER=WARN ssald_connect_err={e}");
+            return None;
+        }
+    };
+    let req = ssal::unix::Request {
+        version: ssal::unix::VERSION,
+        command: "register-presenter".into(),
+        image_name: None,
+        profile_name: None,
+        force_regen: false,
+        native_sepolicy: false,
+    };
+    if let Err(e) = ssal::unix::send(&mut stream, &req, Some(daemon_fd.as_raw_fd())) {
+        eprintln!("GUEST_VIRTUAL_COMPOSER_PRESENTER=WARN ssald_send_err={e}");
+        return None;
+    }
+    let mut line = String::new();
+    if let Err(e) = io::BufReader::new(stream).read_line(&mut line) {
+        eprintln!("GUEST_VIRTUAL_COMPOSER_PRESENTER=WARN ssald_read_err={e}");
+        return None;
+    }
+    match serde_json::from_str::<ssal::unix::Response>(&line) {
+        Ok(resp) if resp.ok => {
+            println!("GUEST_VIRTUAL_COMPOSER_PRESENTER=PASS {}", resp.message);
+            Some(composer_fd)
+        }
+        Ok(resp) => {
+            eprintln!("GUEST_VIRTUAL_COMPOSER_PRESENTER=WARN {}", resp.message);
+            None
+        }
+        Err(e) => {
+            eprintln!("GUEST_VIRTUAL_COMPOSER_PRESENTER=WARN invalid_resp={e}");
+            None
+        }
+    }
+}
+
 pub(super) fn start_composer(
     root: &Path,
     plan: &ssal::guest_policy::Plan,
@@ -98,14 +161,19 @@ pub(super) fn start_composer(
     hwbinder: u64,
 ) -> io::Result<Service> {
     let sid = plan.context("hal_graphics_composer_default", true)?;
-    let mut service = Service::start(
+    let (input, env): (Stdio, &[(&str, &str)]) = match register_presenter_pair() {
+        Some(composer_fd) => (Stdio::from(composer_fd), &[("SSAL_PRESENTER_FD", "0")]),
+        None => (Stdio::null(), &[]),
+    };
+    let mut service = Service::start_with_input(
         root,
         COMPOSER,
         &["serve", &binder.to_string(), &hwbinder.to_string(), &sid],
         "virtual-composer",
         1000,
         None,
-        &[],
+        env,
+        input,
     )?;
     service.wait_text(
         "guest_binder_registered=android.hardware.graphics.composer3.IComposer/default",

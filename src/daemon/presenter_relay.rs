@@ -7,7 +7,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const PRESENTER_ALLOW_FILE: &str = "state/presenter-allow.json";
-const VIRTUAL_COMPOSER_ABSTRACT: &str = "ssal-virtual-composer-presenter";
 const MAX_SCM_FDS: usize = 32;
 const MAX_PAYLOAD_BYTES: usize = 4096;
 
@@ -21,6 +20,8 @@ pub(crate) struct AllowedApp {
 #[derive(Clone)]
 pub(crate) struct RelayHandle {
     allowlist: Arc<Mutex<Vec<AllowedApp>>>,
+    composer_fd: Arc<Mutex<Option<Arc<OwnedFd>>>>,
+    app_fd: Arc<Mutex<Option<OwnedFd>>>,
 }
 
 pub(crate) fn valid_package_name(name: &str) -> bool {
@@ -113,16 +114,31 @@ pub(crate) fn allow_package(
     ))
 }
 
+pub(crate) fn set_composer_fd(relay: &RelayHandle, fd: OwnedFd) {
+    let arc_fd = Arc::new(fd);
+    *relay.composer_fd.lock().unwrap() = Some(Arc::clone(&arc_fd));
+    if relay.app_fd.lock().unwrap().is_some() {
+        send_resync(&arc_fd);
+    }
+}
+
 pub(crate) fn start(root: &Path) -> RelayHandle {
     let initial = load_allowlist(root);
-    let allowlist = Arc::new(Mutex::new(initial));
     let handle = RelayHandle {
-        allowlist: Arc::clone(&allowlist),
+        allowlist: Arc::new(Mutex::new(initial)),
+        composer_fd: Arc::new(Mutex::new(None)),
+        app_fd: Arc::new(Mutex::new(None)),
     };
+    let connector_handle = handle.clone();
     std::thread::Builder::new()
-        .name("ssal-presenter-relay".into())
-        .spawn(move || relay_loop(allowlist))
-        .expect("spawn presenter relay thread");
+        .name("ssal-presenter-app".into())
+        .spawn(move || app_connector_loop(connector_handle))
+        .expect("spawn presenter app connector thread");
+    let pump_handle = handle.clone();
+    std::thread::Builder::new()
+        .name("ssal-presenter-pump".into())
+        .spawn(move || composer_pump_loop(pump_handle))
+        .expect("spawn presenter composer pump thread");
     handle
 }
 
@@ -146,28 +162,6 @@ fn connect_seqpacket_path(path: &str) -> io::Result<OwnedFd> {
         );
     }
     let addr_len = std::mem::size_of::<libc::sa_family_t>() + bytes.len();
-    connect_seqpacket(&sun, addr_len)
-}
-
-fn connect_seqpacket_abstract(name: &str) -> io::Result<OwnedFd> {
-    let bytes = name.as_bytes();
-    let mut sun: libc::sockaddr_un = unsafe { std::mem::zeroed() };
-    sun.sun_family = libc::AF_UNIX as _;
-    if bytes.len() + 1 > sun.sun_path.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "abstract socket name too long",
-        ));
-    }
-    sun.sun_path[0] = 0;
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            bytes.as_ptr(),
-            sun.sun_path.as_mut_ptr().add(1).cast::<u8>(),
-            bytes.len(),
-        );
-    }
-    let addr_len = std::mem::size_of::<libc::sa_family_t>() + 1 + bytes.len();
     connect_seqpacket(&sun, addr_len)
 }
 
@@ -218,99 +212,67 @@ fn peer_closed(fd: &OwnedFd) -> bool {
     rc > 0 && (pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)) != 0
 }
 
-fn forward_session(app: &AllowedApp, app_fd: OwnedFd) {
+fn send_resync(vc_fd: &OwnedFd) {
+    let byte: [u8; 1] = [b'R'];
+    let _ = unsafe {
+        libc::send(
+            vc_fd.as_raw_fd(),
+            byte.as_ptr().cast(),
+            byte.len(),
+            libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT,
+        )
+    };
+}
+
+fn app_connector_loop(relay: RelayHandle) {
     loop {
-        if peer_closed(&app_fd) {
-            return;
-        }
-        let Ok(vc_fd) = connect_seqpacket_abstract(VIRTUAL_COMPOSER_ABSTRACT) else {
-            std::thread::sleep(Duration::from_millis(250));
-            continue;
-        };
-
-        let mut payload = vec![0u8; MAX_PAYLOAD_BYTES];
-        let cmsg_cap = unsafe { libc::CMSG_SPACE((MAX_SCM_FDS * std::mem::size_of::<RawFd>()) as u32) as usize };
-        let mut cmsg_buf = vec![0u8; cmsg_cap];
-
-        loop {
-            let mut pfds = [
-                libc::pollfd {
-                    fd: vc_fd.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                },
-                libc::pollfd {
-                    fd: app_fd.as_raw_fd(),
-                    events: libc::POLLHUP | libc::POLLERR,
-                    revents: 0,
-                },
-            ];
-            let prc = unsafe { libc::poll(pfds.as_mut_ptr(), 2, 250) };
-            if prc < 0 {
-                let err = io::Error::last_os_error();
-                if err.raw_os_error() == Some(libc::EINTR) {
+        {
+            let mut guard = relay.app_fd.lock().unwrap();
+            if let Some(ref fd) = *guard {
+                if !peer_closed(fd) {
+                    drop(guard);
+                    std::thread::sleep(Duration::from_millis(250));
                     continue;
                 }
-                return;
+                *guard = None;
             }
-            if (pfds[1].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)) != 0 {
-                return;
-            }
-            if (pfds[0].revents & libc::POLLIN) == 0 {
-                if (pfds[0].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)) != 0 {
-                    break; // VirtualComposer restarted; reconnect to it while keeping app_fd.
-                }
-                continue;
-            }
+        }
 
-            let mut iov = libc::iovec {
-                iov_base: payload.as_mut_ptr().cast(),
-                iov_len: payload.len(),
+        let snapshot = relay.allowlist.lock().unwrap().clone();
+        if snapshot.is_empty() {
+            std::thread::sleep(Duration::from_millis(500));
+            continue;
+        }
+
+        let mut connected = false;
+        for app in snapshot {
+            let Ok(new_app_fd) = connect_seqpacket_path(&app.socket_path) else {
+                continue;
             };
-            let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-            msg.msg_iov = &mut iov;
-            msg.msg_iovlen = 1;
-            msg.msg_control = cmsg_buf.as_mut_ptr().cast();
-            msg.msg_controllen = cmsg_buf.len() as _;
-
-            let n = unsafe { libc::recvmsg(vc_fd.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC) };
-            if n <= 0 {
-                break; // VirtualComposer closed or errored.
-            }
-
-            let mut received_fds: Vec<OwnedFd> = Vec::new();
-            unsafe {
-                let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
-                while !cmsg.is_null() {
-                    if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
-                        let data_len = (*cmsg).cmsg_len as usize - libc::CMSG_LEN(0) as usize;
-                        let count = data_len / std::mem::size_of::<RawFd>();
-                        let ptr = libc::CMSG_DATA(cmsg).cast::<RawFd>();
-                        for i in 0..count {
-                            let fd = std::ptr::read_unaligned(ptr.add(i));
-                            if fd >= 0 {
-                                received_fds.push(OwnedFd::from_raw_fd(fd));
-                            }
-                        }
-                    }
-                    cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
-                }
-            }
-
-            if (msg.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC)) != 0 {
+            let Ok(uid) = peer_uid(&new_app_fd) else {
+                continue;
+            };
+            if uid != app.uid {
+                eprintln!(
+                    "ssald_presenter_relay_uid_mismatch pkg={} expected={} actual={}",
+                    app.package_name, app.uid, uid
+                );
                 continue;
             }
-
-            let raw_fds: Vec<RawFd> = received_fds.iter().map(AsRawFd::as_raw_fd).collect();
-            let send_ok = send_packet(app_fd.as_raw_fd(), &payload[..n as usize], &raw_fds);
-            drop(received_fds);
-            if !send_ok {
-                eprintln!(
-                    "ssald_presenter_relay_app_disconnected pkg={} uid={}",
-                    app.package_name, app.uid
-                );
-                return;
+            *relay.app_fd.lock().unwrap() = Some(new_app_fd);
+            if let Some(ref vc_fd) = *relay.composer_fd.lock().unwrap() {
+                send_resync(vc_fd);
             }
+            eprintln!(
+                "ssald_presenter_relay_app_connected pkg={} uid={}",
+                app.package_name, app.uid
+            );
+            connected = true;
+            break;
+        }
+
+        if !connected {
+            std::thread::sleep(Duration::from_millis(500));
         }
     }
 }
@@ -355,33 +317,112 @@ fn send_packet(sock_fd: RawFd, data: &[u8], fds: &[RawFd]) -> bool {
     }
 }
 
-fn relay_loop(allowlist: Arc<Mutex<Vec<AllowedApp>>>) {
+fn composer_pump_loop(relay: RelayHandle) {
+    let mut payload = vec![0u8; MAX_PAYLOAD_BYTES];
+    let cmsg_cap =
+        unsafe { libc::CMSG_SPACE((MAX_SCM_FDS * std::mem::size_of::<RawFd>()) as u32) as usize };
+    let mut cmsg_buf = vec![0u8; cmsg_cap];
+
     loop {
-        let snapshot = allowlist.lock().unwrap().clone();
-        if snapshot.is_empty() {
-            std::thread::sleep(Duration::from_millis(500));
+        let Some(vc_fd) = relay.composer_fd.lock().unwrap().clone() else {
+            std::thread::sleep(Duration::from_millis(100));
             continue;
-        }
-        let mut any_connected = false;
-        for app in snapshot {
-            let Ok(app_fd) = connect_seqpacket_path(&app.socket_path) else {
-                continue;
+        };
+
+        loop {
+            let mut pfd = libc::pollfd {
+                fd: vc_fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
             };
-            let Ok(uid) = peer_uid(&app_fd) else {
-                continue;
-            };
-            if uid != app.uid {
-                eprintln!(
-                    "ssald_presenter_relay_uid_mismatch pkg={} expected={} actual={}",
-                    app.package_name, app.uid, uid
-                );
+            let prc = unsafe { libc::poll(&mut pfd, 1, 200) };
+            if prc < 0 {
+                let err = io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                break;
+            }
+            if prc == 0 {
+                let replaced = relay
+                    .composer_fd
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_none_or(|cur| !Arc::ptr_eq(cur, &vc_fd));
+                if replaced {
+                    break;
+                }
                 continue;
             }
-            any_connected = true;
-            forward_session(&app, app_fd);
-        }
-        if !any_connected {
-            std::thread::sleep(Duration::from_millis(500));
+            if (pfd.revents & libc::POLLIN) == 0 {
+                if (pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)) != 0 {
+                    let mut guard = relay.composer_fd.lock().unwrap();
+                    if guard.as_ref().is_some_and(|cur| Arc::ptr_eq(cur, &vc_fd)) {
+                        *guard = None;
+                    }
+                    eprintln!("ssald_presenter_relay_composer_disconnected");
+                    break;
+                }
+                continue;
+            }
+
+            let mut iov = libc::iovec {
+                iov_base: payload.as_mut_ptr().cast(),
+                iov_len: payload.len(),
+            };
+            let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+            msg.msg_iov = &mut iov;
+            msg.msg_iovlen = 1;
+            msg.msg_control = cmsg_buf.as_mut_ptr().cast();
+            msg.msg_controllen = cmsg_buf.len() as _;
+
+            let n = unsafe { libc::recvmsg(vc_fd.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC) };
+            if n <= 0 {
+                let mut guard = relay.composer_fd.lock().unwrap();
+                if guard.as_ref().is_some_and(|cur| Arc::ptr_eq(cur, &vc_fd)) {
+                    *guard = None;
+                }
+                eprintln!("ssald_presenter_relay_composer_disconnected");
+                break;
+            }
+
+            let mut received_fds: Vec<OwnedFd> = Vec::new();
+            unsafe {
+                let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+                while !cmsg.is_null() {
+                    if (*cmsg).cmsg_level == libc::SOL_SOCKET
+                        && (*cmsg).cmsg_type == libc::SCM_RIGHTS
+                    {
+                        let data_len = (*cmsg).cmsg_len as usize - libc::CMSG_LEN(0) as usize;
+                        let count = data_len / std::mem::size_of::<RawFd>();
+                        let ptr = libc::CMSG_DATA(cmsg).cast::<RawFd>();
+                        for i in 0..count {
+                            let fd = std::ptr::read_unaligned(ptr.add(i));
+                            if fd >= 0 {
+                                received_fds.push(OwnedFd::from_raw_fd(fd));
+                            }
+                        }
+                    }
+                    cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
+                }
+            }
+
+            if (msg.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC)) != 0 {
+                continue;
+            }
+
+            let raw_fds: Vec<RawFd> = received_fds.iter().map(AsRawFd::as_raw_fd).collect();
+            let mut app_guard = relay.app_fd.lock().unwrap();
+            if let Some(ref app_fd) = *app_guard {
+                let send_ok = send_packet(app_fd.as_raw_fd(), &payload[..n as usize], &raw_fds);
+                if !send_ok {
+                    *app_guard = None;
+                    eprintln!("ssald_presenter_relay_app_disconnected");
+                }
+            }
+            drop(app_guard);
+            drop(received_fds);
         }
     }
 }

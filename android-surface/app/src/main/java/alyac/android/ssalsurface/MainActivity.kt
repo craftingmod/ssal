@@ -4,6 +4,7 @@ import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Rect
+import android.graphics.Typeface
 import android.os.Bundle
 import android.os.FileObserver
 import android.os.Handler
@@ -13,17 +14,31 @@ import android.view.SurfaceHolder
 import android.view.SurfaceView
 import androidx.activity.enableEdgeToEdge
 import androidx.appcompat.app.AppCompatActivity
-import androidx.core.view.ViewCompat
+import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import java.io.File
 import java.io.IOException
 
 class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
     private lateinit var surfaceHolder: SurfaceHolder
     private val frame = Bitmap.createBitmap(4, 4, Bitmap.Config.ARGB_8888).apply {
-        eraseColor(Color.RED)
+        eraseColor(Color.BLACK)
     }
     private val paint = Paint().apply { isFilterBitmap = false }
+    private val bootBgColor = Color.rgb(0x14, 0x14, 0x16)
+    private val bootTitlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.rgb(0xB8, 0xBC, 0xC4)
+        textSize = 48f
+        textAlign = Paint.Align.CENTER
+        typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.NORMAL)
+    }
+    private val bootSubPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.rgb(0x74, 0x78, 0x80)
+        textSize = 28f
+        textAlign = Paint.Align.CENTER
+        typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.NORMAL)
+    }
     private val destination = Rect()
     private var resumed = false
     private var surfaceReady = false
@@ -34,17 +49,13 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
     private var nativePresenter: NativePresenter? = null
     private var receiver: HandlerThread? = null
     private var observer: FileObserver? = null
-    private var hasFrame = true
+    private var hasFrame = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         setContentView(R.layout.activity_main)
-        ViewCompat.setOnApplyWindowInsetsListener(findViewById(R.id.main)) { v, insets ->
-            val systemBars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
-            v.setPadding(systemBars.left, systemBars.top, systemBars.right, systemBars.bottom)
-            insets
-        }
+        hideSystemBars()
         surfaceHolder = findViewById<SurfaceView>(R.id.presenter_surface).holder
         surfaceHolder.addCallback(this)
         val session = intent.getStringExtra("presenter_session")
@@ -62,9 +73,25 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
         }
     }
 
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) {
+            hideSystemBars()
+        }
+    }
+
+    private fun hideSystemBars() {
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        val controller = WindowCompat.getInsetsController(window, window.decorView)
+        controller.systemBarsBehavior =
+            WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        controller.hide(WindowInsetsCompat.Type.systemBars())
+    }
+
     override fun onResume() {
         super.onResume()
         resumed = true
+        hideSystemBars()
         inbox?.let(::watchFrames)
         presenterSocket?.let { addr ->
             if (nativePresenter == null) {
@@ -79,8 +106,12 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
 
     override fun onPause() {
         resumed = false
-        nativePresenter?.close()
+        val closing = nativePresenter
         nativePresenter = null
+        closing?.let { presenter ->
+            presenter.setSurface(null, 0, 0)
+            Thread { presenter.close() }.start()
+        }
         observer?.stopWatching()
         observer = null
         receiver?.quitSafely()
@@ -165,7 +196,11 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
             if (hasFrame) {
                 canvas.drawBitmap(frame, null, destination, paint)
             } else {
-                canvas.drawColor(Color.BLACK)
+                canvas.drawColor(bootBgColor)
+                val cx = canvas.width / 2f
+                val cy = canvas.height / 2f
+                canvas.drawText("Guest OS 부팅 중...", cx, cy - 12f, bootTitlePaint)
+                canvas.drawText("Surface 출력 대기 중", cx, cy + 36f, bootSubPaint)
             }
         } finally {
             surfaceHolder.unlockCanvasAndPost(canvas)

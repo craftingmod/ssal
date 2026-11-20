@@ -97,6 +97,14 @@ fn handle(
                 Err(e) => reply(&mut stream, false, format!("allow failed: {e}")),
             }
         }
+        "register-presenter" => {
+            let Some(fd) = fd else {
+                return reply(&mut stream, false, "presenter socket fd required");
+            };
+            super::presenter_relay::set_composer_fd(&relay, fd);
+            log(&root, "registered virtual-composer presenter fd");
+            reply(&mut stream, true, "presenter fd registered")
+        }
         "switch" if !req.image_name.as_deref().is_some_and(valid_image_name) => reply(&mut stream, false, "invalid image name"),
         "switch" | "return" => reply(&mut stream, false, crate::service_contract::blocked_summary()?),
         "create" => {

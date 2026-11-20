@@ -2225,7 +2225,12 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
                 println!("Guest Zygote env={}", String::from_utf8_lossy(entry));
             }
             let observation_seconds = 360;
-            let deadline = Instant::now() + Duration::from_secs(observation_seconds);
+            let mut deadline = Instant::now() + Duration::from_secs(observation_seconds);
+            let hold_after_boot = std::env::var("SSAL_HOLD_AFTER_BOOT_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|&s| s > 0);
+            let mut boot_hold_deadline: Option<Instant> = None;
             let mut observed_system_ready = false;
             let mut observed_apex_boot_completed = false;
             let mut watch_ticks: u32 = 0;
@@ -2286,12 +2291,24 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
                                 observed_system_ready = true;
                                 println!("GUEST_SYSTEM_READY pid={pid} phase_returned=true");
                             }
-                            if system_server_boot_completed(&text, pid) {
+                            if boot_hold_deadline.is_none() && system_server_boot_completed(&text, pid) {
                                 println!("GUEST_BOOT_COMPLETED pid={pid} phase_returned=true");
-                                break;
+                                if let Some(secs) = hold_after_boot {
+                                    println!("GUEST_HOLD_AFTER_BOOT secs={secs}");
+                                    let until = Instant::now() + Duration::from_secs(secs);
+                                    boot_hold_deadline = Some(until);
+                                    if until > deadline {
+                                        deadline = until;
+                                    }
+                                } else {
+                                    break;
+                                }
                             }
                         }
                     }
+                }
+                if boot_hold_deadline.is_some_and(|until| Instant::now() >= until) {
+                    break;
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }

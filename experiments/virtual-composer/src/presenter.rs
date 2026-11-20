@@ -37,10 +37,20 @@ struct PeerState {
     generation: u64,
 }
 
+#[derive(Clone, Copy)]
+struct LastFrame {
+    slot: i32,
+    width: u32,
+    height: u32,
+    format: u32,
+    dataspace: i32,
+}
+
 pub struct PresenterBridge {
     peer: Arc<Mutex<PeerState>>,
     generation: Arc<AtomicU64>,
-    slots: Mutex<BTreeMap<i32, CachedHandle>>,
+    slots: Arc<Mutex<BTreeMap<i32, CachedHandle>>>,
+    last_frame: Arc<Mutex<Option<LastFrame>>>,
 }
 
 pub fn dup_fd(raw: RawFd) -> Option<OwnedFd> {
@@ -57,13 +67,56 @@ pub fn dup_fd(raw: RawFd) -> Option<OwnedFd> {
 
 impl PresenterBridge {
     pub fn start_from_env() -> Self {
-        let addr = std::env::var("SSAL_PRESENTER_SOCKET").unwrap_or_else(|_| DEFAULT_SOCKET.into());
         let peer = Arc::new(Mutex::new(PeerState {
             fd: None,
             generation: 0,
         }));
         let generation = Arc::new(AtomicU64::new(0));
+        let slots = Arc::new(Mutex::new(BTreeMap::new()));
+        let last_frame = Arc::new(Mutex::new(None));
 
+        if let Ok(fd_str) = std::env::var("SSAL_PRESENTER_FD") {
+            if let Ok(raw_fd) = fd_str.trim().parse::<RawFd>() {
+                if let Some(owned) = dup_fd(raw_fd) {
+                    if raw_fd == 0 {
+                        let dev_null = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
+                        if dev_null >= 0 {
+                            unsafe {
+                                libc::dup2(dev_null, 0);
+                                if dev_null > 2 {
+                                    libc::close(dev_null);
+                                }
+                            }
+                        }
+                    }
+                    let rx_fd = dup_fd(owned.as_raw_fd());
+                    let init_gen = generation.fetch_add(1, Ordering::AcqRel) + 1;
+                    {
+                        let mut guard = peer.lock().unwrap();
+                        guard.fd = Some(owned);
+                        guard.generation = init_gen;
+                    }
+                    println!("virtual_composer_presenter_fd_ready fd={raw_fd} gen={init_gen}");
+                    if let Some(rx_fd) = rx_fd {
+                        let peer_clone = Arc::clone(&peer);
+                        let gen_clone = Arc::clone(&generation);
+                        let slots_clone = Arc::clone(&slots);
+                        let last_clone = Arc::clone(&last_frame);
+                        std::thread::spawn(move || {
+                            resync_loop(rx_fd, peer_clone, gen_clone, slots_clone, last_clone)
+                        });
+                    }
+                    return Self {
+                        peer,
+                        generation,
+                        slots,
+                        last_frame,
+                    };
+                }
+            }
+        }
+
+        let addr = std::env::var("SSAL_PRESENTER_SOCKET").unwrap_or_else(|_| DEFAULT_SOCKET.into());
         if !addr.is_empty() && addr != "none" {
             let peer_clone = Arc::clone(&peer);
             let gen_clone = Arc::clone(&generation);
@@ -73,7 +126,8 @@ impl PresenterBridge {
         Self {
             peer,
             generation,
-            slots: Mutex::new(BTreeMap::new()),
+            slots,
+            last_frame,
         }
     }
 
@@ -101,70 +155,100 @@ impl PresenterBridge {
         dataspace: i32,
         acquire_fence: Option<OwnedFd>,
     ) -> bool {
-        let mut peer_guard = self.peer.lock().unwrap();
-        let Some(peer_fd) = peer_guard.fd.as_ref() else {
-            return false;
-        };
-        let peer_gen = peer_guard.generation;
-
-        let mut slots = self.slots.lock().unwrap();
-        let Some(cached) = slots.get_mut(&slot) else {
-            return false;
-        };
-
-        let send_handle = cached.sent_generation != peer_gen;
-        let num_fds = if send_handle { cached.fds.len() } else { 0 };
-        let num_ints = if send_handle { cached.ints.len() } else { 0 };
-        let has_fence = if acquire_fence.is_some() { 1 } else { 0 };
-
-        if num_fds + has_fence > MAX_SCM_FDS {
-            eprintln!(
-                "virtual_composer_presenter_drop slot={slot} too_many_fds={}",
-                num_fds + has_fence
-            );
-            return false;
-        }
-
-        let header = PresenterPacketHeader {
-            magic: PACKET_MAGIC,
-            version: PACKET_VERSION,
+        *self.last_frame.lock().unwrap() = Some(LastFrame {
             slot,
             width,
             height,
             format,
             dataspace,
-            num_fds: num_fds as u32,
-            num_ints: num_ints as u32,
-            has_fence: has_fence as u32,
-        };
+        });
+        present_slot_inner(
+            &self.peer,
+            &self.slots,
+            slot,
+            width,
+            height,
+            format,
+            dataspace,
+            acquire_fence,
+        )
+    }
+}
 
-        let mut fds_to_send: Vec<RawFd> = Vec::with_capacity(num_fds + has_fence);
-        if send_handle {
-            for fd in &cached.fds {
-                fds_to_send.push(fd.as_raw_fd());
-            }
-        }
-        if let Some(ref fence) = acquire_fence {
-            fds_to_send.push(fence.as_raw_fd());
-        }
+fn present_slot_inner(
+    peer: &Mutex<PeerState>,
+    slots: &Mutex<BTreeMap<i32, CachedHandle>>,
+    slot: i32,
+    width: u32,
+    height: u32,
+    format: u32,
+    dataspace: i32,
+    acquire_fence: Option<OwnedFd>,
+) -> bool {
+    let mut peer_guard = peer.lock().unwrap();
+    let Some(peer_fd) = peer_guard.fd.as_ref() else {
+        return false;
+    };
+    let peer_gen = peer_guard.generation;
 
-        let ints_slice: &[i32] = if send_handle { &cached.ints } else { &[] };
-        match send_packet(peer_fd.as_raw_fd(), &header, ints_slice, &fds_to_send) {
-            Ok(()) => {
-                if send_handle {
-                    cached.sent_generation = peer_gen;
-                }
-                true
+    let mut slots = slots.lock().unwrap();
+    let Some(cached) = slots.get_mut(&slot) else {
+        eprintln!("virtual_composer_presenter_missing_slot slot={slot}");
+        return false;
+    };
+
+    let send_handle = cached.sent_generation != peer_gen;
+    let num_fds = if send_handle { cached.fds.len() } else { 0 };
+    let num_ints = if send_handle { cached.ints.len() } else { 0 };
+    let has_fence = if acquire_fence.is_some() { 1 } else { 0 };
+
+    if num_fds + has_fence > MAX_SCM_FDS {
+        eprintln!(
+            "virtual_composer_presenter_drop slot={slot} too_many_fds={}",
+            num_fds + has_fence
+        );
+        return false;
+    }
+
+    let header = PresenterPacketHeader {
+        magic: PACKET_MAGIC,
+        version: PACKET_VERSION,
+        slot,
+        width,
+        height,
+        format,
+        dataspace,
+        num_fds: num_fds as u32,
+        num_ints: num_ints as u32,
+        has_fence: has_fence as u32,
+    };
+
+    let mut fds_to_send: Vec<RawFd> = Vec::with_capacity(num_fds + has_fence);
+    if send_handle {
+        for fd in &cached.fds {
+            fds_to_send.push(fd.as_raw_fd());
+        }
+    }
+    if let Some(ref fence) = acquire_fence {
+        fds_to_send.push(fence.as_raw_fd());
+    }
+
+    let ints_slice: &[i32] = if send_handle { &cached.ints } else { &[] };
+    match send_packet(peer_fd.as_raw_fd(), &header, ints_slice, &fds_to_send) {
+        Ok(()) => {
+            if send_handle {
+                cached.sent_generation = peer_gen;
             }
-            Err(err) => {
-                if err == libc::EPIPE || err == libc::ECONNRESET || err == libc::ENOTCONN {
-                    eprintln!("virtual_composer_presenter_disconnected errno={err}");
-                    peer_guard.fd = None;
-                } else if err != libc::EAGAIN && err != libc::EWOULDBLOCK {
-                    eprintln!("virtual_composer_presenter_send_err errno={err}");
-                }
-                false
+            true
+        }
+        Err(err) => {
+            if err == libc::EPIPE || err == libc::ECONNRESET || err == libc::ENOTCONN {
+                eprintln!("virtual_composer_presenter_disconnected errno={err}");
+                peer_guard.fd = None;
+            } else if err != libc::EAGAIN && err != libc::EWOULDBLOCK {
+                eprintln!("virtual_composer_presenter_send_err errno={err}");
             }
+            false
         }
     }
 }
@@ -333,5 +417,47 @@ fn accept_loop(addr: &str, peer: Arc<Mutex<PeerState>>, generation: Arc<AtomicU6
         guard.fd = Some(owned);
         guard.generation = new_gen;
         println!("virtual_composer_presenter_connected gen={new_gen}");
+    }
+}
+
+fn resync_loop(
+    rx_fd: OwnedFd,
+    peer: Arc<Mutex<PeerState>>,
+    generation: Arc<AtomicU64>,
+    slots: Arc<Mutex<BTreeMap<i32, CachedHandle>>>,
+    last_frame: Arc<Mutex<Option<LastFrame>>>,
+) {
+    let mut buf = [0u8; 64];
+    loop {
+        let n = unsafe {
+            libc::recv(
+                rx_fd.as_raw_fd(),
+                buf.as_mut_ptr().cast::<libc::c_void>(),
+                buf.len(),
+                0,
+            )
+        };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            break;
+        }
+        if n == 0 {
+            break;
+        }
+        let new_gen = generation.fetch_add(1, Ordering::AcqRel) + 1;
+        {
+            let mut guard = peer.lock().unwrap();
+            guard.generation = new_gen;
+        }
+        let last = *last_frame.lock().unwrap();
+        let resent = if let Some(f) = last {
+            present_slot_inner(&peer, &slots, f.slot, f.width, f.height, f.format, f.dataspace, None)
+        } else {
+            false
+        };
+        println!("virtual_composer_presenter_resync gen={new_gen} resent={resent}");
     }
 }

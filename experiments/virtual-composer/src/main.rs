@@ -337,7 +337,7 @@ impl IComposerClient for VirtualComposerClient {
                 } else {
                     false
                 };
-                if count <= 5 || count % 60 == 0 {
+                if count <= 5 || count % 60 == 0 || (presented && count <= 30) {
                     println!(
                         "virtual_composer_present display={} frame={} layers={} presenter={}",
                         DISPLAY_ID,
