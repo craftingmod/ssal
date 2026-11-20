@@ -1143,6 +1143,8 @@ pub(crate) fn verify(
         .ok_or_else(|| io::Error::other("Guest SELinux plan missing for AIDL server"))?;
     if start_system_server || system_server_graphics {
         graphics::install_vintf(mounts, root, &plan, system_server_graphics, start_system_server)?;
+        crate::guest::concurrent::device_vintf::install_overlay(mounts, root, &plan)?;
+        crate::guest::concurrent::device_vintf::install_unavailable_features(mounts, root, &plan)?;
     }
     if system_server_graphics {
         let target = root.join(hwbinder::COMPOSER.trim_start_matches('/'));
