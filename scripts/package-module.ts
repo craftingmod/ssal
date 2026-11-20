@@ -37,6 +37,8 @@ const entries: { name: string; path: string; mode: number }[] = [
     "ssal-apexservice",
     "ssal-system-suspend",
     "ssal-health",
+    "ssal-gatekeeper",
+    "ssal-keymint",
     "ssal-virtual-composer",
     "ssal-context-map.so",
     "phase3-ipc",

@@ -13,7 +13,7 @@ pub mod native;
 pub mod runtime;
 mod symbols;
 
-const VERSION: u32 = 56;
+const VERSION: u32 = 57;
 
 type Names = BTreeMap<String, String>;
 
@@ -1496,6 +1496,8 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
         }
     }
     concurrent::add_health_rules(&mut plan, &mut native_rules)?;
+    concurrent::add_gatekeeper_rules(&mut plan, &mut native_rules)?;
+    concurrent::add_keymint_rules(&mut plan, &mut native_rules)?;
     plan.native_rules = native_rules;
     // Partial offline fixtures remain supported; mounted preparation requires these types.
     if ["init", "socket_device", "property_socket"]
@@ -1718,6 +1720,38 @@ mod tests {
                         target == "binder_device" || target.contains("sysfs")
                     })
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn gatekeeper_and_keymint_domains_are_private_and_isolated() -> io::Result<()> {
+        let mut inputs = fixture();
+        inputs.get_mut("system/etc/selinux/plat_sepolicy.cil").unwrap().push_str(
+            " (type servicemanager) (type keystore) (type gatekeeperd) (type vold) (type hal_gatekeeper_service) (type hal_keymint_service) (type hal_sharedsecret_service) (type hal_secureclock_service)",
+        );
+        let plan = generate("p0001", &inputs)?;
+        let gk = &plan.types["ssal_gatekeeper"];
+        let km = &plan.types["ssal_keymint"];
+        assert!(plan.rules.contains(&format!(
+            "allow {gk} ssal_p0001_hal_gatekeeper_service service_manager {{ add find }}"
+        )));
+        assert!(plan.rules.contains(&format!(
+            "allow {km} ssal_p0001_hal_keymint_service service_manager {{ add find }}"
+        )));
+        assert!(plan.rules.contains(&format!(
+            "allow ssal_p0001_keystore {km} binder {{ call transfer }}"
+        )));
+        for domain in [gk, km] {
+            assert!(!plan.rules.iter().any(|rule| {
+                rule.starts_with(&format!("typeattribute {domain} "))
+                    || rule.starts_with(&format!("allow {domain} "))
+                        && rule.split_whitespace().nth(2).is_some_and(|target| {
+                            target == "binder_device"
+                                || target.contains("tee")
+                                || target.contains("smcinvoke")
+                        })
+            }));
+        }
         Ok(())
     }
 

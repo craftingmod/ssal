@@ -215,6 +215,8 @@ pub(in crate::guest) fn install_vintf(
     for (enabled, name, xml) in [
         (composer, "ssal_virtual_composer.xml", VIRTUAL_COMPOSER_VINTF),
         (health, "ssal_health.xml", super::health::VINTF),
+        (health, "ssal_gatekeeper.xml", super::gatekeeper::VINTF),
+        (health, "ssal_keymint.xml", super::keymint::VINTF),
     ] {
         if enabled {
             let fragment = staging.join(name);

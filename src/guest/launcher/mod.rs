@@ -3,7 +3,7 @@ mod net;
 use crate::diagnostics::launcher::{
     fork_probe, system_server_preflight, system_server_runtime_sid,
 };
-use crate::guest::concurrent::{graphics, health, system_suspend};
+use crate::guest::concurrent::{gatekeeper, graphics, health, keymint, system_suspend};
 use crate::guest::hwbinder;
 use crate::guest::environment::start_property_service;
 use crate::guest::init::{wait_for_system_server, Service};
@@ -49,6 +49,8 @@ pub(in crate::guest) fn uses_own_diagnostics(executable: &str) -> bool {
         "/run/ssal/ssal-virtual-audio",
         system_suspend::SERVICE.executable,
         health::SERVICE.executable,
+        gatekeeper::SERVICE.executable,
+        keymint::SERVICE.executable,
         hwbinder::COMPOSER,
         "/vendor/bin/hw/vendor.qti.hardware.display.allocator-service",
     ]
@@ -81,6 +83,8 @@ fn mapped_exec_domain(executable: &str, exec_context: Option<&[u8]>) -> &'static
             "/system/bin/audioserver" => "audioserver",
             "/run/ssal/ssal-system-suspend" => system_suspend::SERVICE.domain,
             "/run/ssal/ssal-health" => health::SERVICE.domain,
+            "/run/ssal/ssal-gatekeeper" => gatekeeper::SERVICE.domain,
+            "/run/ssal/ssal-keymint" => keymint::SERVICE.domain,
             "/apex/com.android.sdkext/bin/derive_classpath" => "derive_classpath",
             "/apex/com.android.runtime/bin/linkerconfig" | "/system/bin/linkerconfig" => {
                 "linkerconfig"
@@ -1076,6 +1080,10 @@ pub(crate) fn verify(
     if start_system_server {
         health::SERVICE.install(mounts, root, &bin)
             .map_err(|error| io::Error::other(format!("install Guest Health HAL: {error}")))?;
+        gatekeeper::SERVICE.install(mounts, root, &bin)
+            .map_err(|error| io::Error::other(format!("install Guest GateKeeper HAL: {error}")))?;
+        keymint::SERVICE.install(mounts, root, &bin)
+            .map_err(|error| io::Error::other(format!("install Guest KeyMint HAL: {error}")))?;
         if bin.join("ssal-vold").is_file() {
             crate::guest::init::binder_service::VOLD.install(mounts, root, &bin)?;
         }
@@ -1445,6 +1453,9 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
         let mut boot_services = Vec::new();
         if start_system_server {
             health::start(root, &bin, guest_binder, &mut boot_services)?;
+            let auth_token_key = keymint::random_bytes::<32>()?;
+            keymint::start(root, guest_binder, &auth_token_key, &mut boot_services)?;
+            gatekeeper::start(root, guest_binder, &auth_token_key, &mut boot_services)?;
         }
         if system_server_graphics {
             let (major, minor) = hw_driver.provision_hwbinder(root)?;
@@ -2279,6 +2290,8 @@ mod tests {
             ("/run/ssal/ssal-apexservice", "apexd"),
             ("/run/ssal/ssal-system-suspend", "system_suspend"),
             ("/run/ssal/ssal-health", "ssal_health"),
+            ("/run/ssal/ssal-gatekeeper", "ssal_gatekeeper"),
+            ("/run/ssal/ssal-keymint", "ssal_keymint"),
             ("/system/bin/sh", "shell"),
         ] {
             assert_eq!(

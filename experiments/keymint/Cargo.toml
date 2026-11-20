@@ -1,0 +1,21 @@
+[package]
+name = "ssal-keymint"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+ssal-binder-service = { path = "../binder-service" }
+rsbinder = { version = "=0.13.0", default-features = false, features = ["android_14_plus"] }
+libc = "0.2"
+sha2 = "0.11.1"
+aes = "0.8"
+aes-gcm = "0.10"
+cbc = "0.1"
+ctr = "0.9"
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[build-dependencies]
+rsbinder-aidl = "=0.13.0"
