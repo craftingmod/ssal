@@ -114,7 +114,7 @@ impl Service {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
             if std::env::var_os("SSAL_PHASE7FB_FORK").is_some()
-                || std::env::var_os("SSAL_START_SYSTEM_SERVER").is_some()
+                || crate::guest::system_server_enabled()
             {
                 command.env("LD_PRELOAD", "/run/ssal/ssal-phase2-log.so:/run/ssal/ssal-zygote-diag.so:/run/ssal/ssal-zygote-fd-reopen.so")
                     .env("SSAL_PHASE7FB_FD_REOPEN", "1");

@@ -44,6 +44,16 @@ const COMMANDS: &[(&str, &str, &str)] = &[
         "Validate guest mounts without starting Android",
     ),
     (
+        "start",
+        "PROFILE_NAME",
+        "Start the prepared Guest Android session",
+    ),
+    (
+        "stop",
+        "[PROFILE_NAME]",
+        "Stop the running Guest Android session",
+    ),
+    (
         "switch",
         "IMAGE_NAME",
         "Switch systems (currently unavailable)",
@@ -203,7 +213,7 @@ pub fn parse(args: &[String]) -> Result<Action, String> {
         }
     }
     let (minimum, maximum) = match *command {
-        "doctor" => (0, 1),
+        "doctor" | "stop" => (0, 1),
         "create" => (1, 2),
         "add" => (2, 2),
         "status" | "logs" | "return" | "stop-for-restart" => (0, 0),

@@ -36,8 +36,7 @@ pub(crate) fn installd_probe_requested() -> bool {
 }
 
 pub(super) fn graphics_system_server_requested() -> bool {
-    std::env::var_os("SSAL_START_SYSTEM_SERVER").as_deref() == Some(std::ffi::OsStr::new("1"))
-        && graphics::requested()
+    crate::guest::system_server_enabled() && graphics::requested()
 }
 
 pub(in crate::guest) fn uses_own_diagnostics(executable: &str) -> bool {
@@ -223,9 +222,10 @@ pub(crate) fn command(
     crate::guest::process::supervision::check_interrupted()?;
     // A real Guest mount root also gives Zygote's FD allowlist Guest-relative proc paths.
     let suspend = executable == system_suspend::SERVICE.executable;
-    let pivot = suspend || (executable == "/system/bin/app_process64"
-        && (std::env::var_os("SSAL_PHASE7FB_FORK").is_some()
-            || std::env::var_os("SSAL_START_SYSTEM_SERVER").is_some()));
+    let pivot = suspend
+        || (executable == "/system/bin/app_process64"
+            && (std::env::var_os("SSAL_PHASE7FB_FORK").is_some()
+                || crate::guest::system_server_enabled()));
     let derive_classpath_linker = executable == "/system/bin/bootstrap/linker64"
         && exec_context == Some(DERIVE_CLASSPATH_CONTEXT);
     let mapped_installd =
@@ -1250,9 +1250,7 @@ fn report_system_server_display_progress(root: &Path, pid: u32) -> io::Result<(b
 }
 
 fn adbd_requested(start_system_server: bool) -> bool {
-    (start_system_server
-        && std::env::var_os("SSAL_GUEST_ADBD").as_deref() != Some(std::ffi::OsStr::new("0")))
-        || std::env::var_os("SSAL_GUEST_ADBD").as_deref() == Some(std::ffi::OsStr::new("1"))
+    start_system_server && !crate::guest::disabled("ADBD")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1268,7 +1266,6 @@ pub(crate) fn verify(
     admission: &mut Option<File>,
 ) -> io::Result<()> {
     let start_system_server = system_server_requested(
-        std::env::var_os("SSAL_START_SYSTEM_SERVER").as_deref(),
         phase7a,
         ssal::guest_policy::runtime::load(root)?.is_some(),
     )?;
@@ -2811,17 +2808,9 @@ mod tests {
 
     #[test]
     fn system_server_requires_explicit_mapped_zygote_worker() {
-        use std::ffi::OsStr;
-        assert!(!system_server_requested(None, true, true).unwrap());
-        assert!(system_server_requested(Some(OsStr::new("1")), true, true).unwrap());
-        for (value, zygote, mapped) in [
-            ("0", true, true),
-            ("", true, true),
-            ("1", false, true),
-            ("1", true, false),
-        ] {
-            assert!(system_server_requested(Some(OsStr::new(value)), zygote, mapped).is_err());
-        }
+        assert!(system_server_requested(true, true).unwrap());
+        assert!(!system_server_requested(false, true).unwrap());
+        assert!(!system_server_requested(true, false).unwrap());
     }
 
     #[test]

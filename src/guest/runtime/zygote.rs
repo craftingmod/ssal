@@ -7,17 +7,13 @@ use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Command;
 pub(in crate::guest) fn system_server_requested(
-    value: Option<&std::ffi::OsStr>,
     phase7a: bool,
     mapped: bool,
 ) -> io::Result<bool> {
-    match value {
-        None => Ok(false),
-        Some(value) if value == "1" && phase7a && mapped => Ok(true),
-        _ => Err(io::Error::other(
-            "SSAL_START_SYSTEM_SERVER=1 requires the mapped Guest Zygote worker",
-        )),
+    if crate::guest::disabled("SYSTEM_SERVER") {
+        return Ok(false);
     }
+    Ok(phase7a && mapped)
 }
 
 pub(in crate::guest) fn zygote_args(

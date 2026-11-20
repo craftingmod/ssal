@@ -159,7 +159,7 @@ pub(crate) fn worker_admitted(
         return Err(io::Error::other("--regen is only supported by prepare"));
     }
     let installd_probe = crate::guest::launcher::installd_probe_requested();
-    if installd_probe && mode != "--guest-zygote-7a-worker" {
+    if installd_probe && mode != "--guest-start-worker" {
         return Err(io::Error::other("Guest installd probe requires the 7A worker"));
     }
     crate::diagnostics::selinux::servicemanager::check_recovery()?;

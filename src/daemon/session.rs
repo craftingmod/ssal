@@ -6,8 +6,17 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
+
+#[derive(Clone)]
+struct RunningGuest {
+    profile: String,
+    pid: u32,
+    log_path: PathBuf,
+}
+
+type ActiveGuest = Arc<Mutex<Option<RunningGuest>>>;
 
 fn log(root: &Path, text: &str) {
     if let Ok(mut f) = OpenOptions::new()
@@ -40,6 +49,7 @@ fn handle(
     mut stream: UnixStream,
     root: PathBuf,
     busy: Arc<Mutex<bool>>,
+    active_guest: ActiveGuest,
     relay: super::presenter_relay::RelayHandle,
 ) -> io::Result<()> {
     stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
@@ -54,7 +64,18 @@ fn handle(
         return reply(&mut stream, false, "--regen is only supported by prepare");
     }
     match req.command.as_str() {
-        "status" => { let job = fs::read_to_string(root.join("state/last-job.json")).unwrap_or_else(|_| "none".into()); let images = super::images::image_list(&root)?; let profiles = super::profiles::profile_list(&root)?; reply(&mut stream, true, format!("HOST_ACTIVE\nimages:\n{images}\nprofiles:\n{profiles}\nlast job: {job}")) }
+        "status" => {
+            let job = fs::read_to_string(root.join("state/last-job.json")).unwrap_or_else(|_| "none".into());
+            let images = super::images::image_list(&root)?;
+            let profiles = super::profiles::profile_list(&root)?;
+            let guest = active_guest
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|g| format!("\nGUEST_RUNNING profile={} pid={} log={}", g.profile, g.pid, g.log_path.display()))
+                .unwrap_or_default();
+            reply(&mut stream, true, format!("HOST_ACTIVE{guest}\nimages:\n{images}\nprofiles:\n{profiles}\nlast job: {job}"))
+        }
         "doctor" if req.profile_name.is_some() => {
             match crate::guest::prepare::check(&root, req.profile_name.as_deref().unwrap()) {
                 Ok(profile) => reply(&mut stream, true, profile.report),
@@ -69,6 +90,60 @@ fn handle(
             let result = prepare_session(&root, name, &req.command, req.force_regen, req.native_sepolicy);
             match result { Ok(message) => { log(&root, &message); reply(&mut stream, true, message) }, Err(e) => { let message = format!("prepare failed: {e}"); log(&root, &message); reply(&mut stream, false, message) } }
         }
+        "start" => {
+            let Some(name) = req.profile_name.as_deref().filter(|name| valid_image_name(name)) else {
+                return reply(&mut stream, false, "invalid profile name");
+            };
+            let guard = busy.lock().unwrap();
+            if *guard {
+                return reply(&mut stream, false, "another operation is running");
+            }
+            drop(guard);
+            match start_session(&root, name, &active_guest) {
+                Ok(message) => {
+                    log(&root, &message);
+                    reply(&mut stream, true, message)
+                }
+                Err(e) => {
+                    let message = format!("start failed: {e}");
+                    log(&root, &message);
+                    reply(&mut stream, false, message)
+                }
+            }
+        }
+        "stop" => {
+            if let Some(name) = req.profile_name.as_deref() {
+                if !valid_image_name(name) {
+                    return reply(&mut stream, false, "invalid profile name");
+                }
+            }
+            let guard = active_guest.lock().unwrap();
+            let Some(running) = guard.as_ref() else {
+                return reply(&mut stream, false, "no Guest session is running");
+            };
+            if let Some(name) = req.profile_name.as_deref() {
+                if name != running.profile {
+                    return reply(
+                        &mut stream,
+                        false,
+                        format!("running Guest profile is {}, not {name}", running.profile),
+                    );
+                }
+            }
+            let pid = running.pid;
+            let profile = running.profile.clone();
+            drop(guard);
+            if unsafe { libc::kill(pid as i32, libc::SIGTERM) } != 0 {
+                return reply(
+                    &mut stream,
+                    false,
+                    format!("failed to signal Guest {profile} (pid={pid}): {}", io::Error::last_os_error()),
+                );
+            }
+            let message = format!("stopping Guest profile {profile} (pid={pid})");
+            log(&root, &message);
+            reply(&mut stream, true, message)
+        }
         "remove" => {
             let Some(name) = req.profile_name.as_deref().filter(|name| valid_image_name(name)) else { return reply(&mut stream, false, "invalid profile name"); };
             let Ok(guard) = busy.try_lock() else { return reply(&mut stream, false, "another operation is running"); };
@@ -80,7 +155,9 @@ fn handle(
         }
         "stop-for-restart" => {
             let guard = busy.lock().unwrap();
-            if *guard { return reply(&mut stream, false, "an operation is running; try again later"); }
+            if *guard || active_guest.lock().unwrap().is_some() {
+                return reply(&mut stream, false, "an operation or Guest session is running; try again later");
+            }
             reply(&mut stream, true, "daemon stopping")?;
             std::process::exit(0);
         }
@@ -235,6 +312,127 @@ fn prepare_session(
     result
 }
 
+fn cleanup_guest_scratch(base: &Path) -> io::Result<()> {
+    let host_mounts = fs::read_to_string("/proc/self/mountinfo")?;
+    if host_mounts
+        .lines()
+        .filter_map(|line| line.split_whitespace().nth(4))
+        .any(|path| Path::new(path).starts_with(base))
+    {
+        return Err(io::Error::other(format!(
+            "host namespace still has a mount under {}; scratch cleanup refused",
+            base.display()
+        )));
+    }
+    for scratch in ["rootfs", "apex-cache", "loop-devices", "selinux-overlay", "phase7b"] {
+        let path = base.join(scratch);
+        if let Err(e) = fs::remove_dir_all(&path) {
+            if e.kind() != io::ErrorKind::NotFound {
+                return Err(e);
+            }
+        }
+    }
+    for path in [base.join("data"), base.join("system"), base.to_path_buf()] {
+        if let Err(e) = fs::remove_dir(&path) {
+            if e.kind() != io::ErrorKind::NotFound {
+                return Err(e);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn start_session(root: &Path, name: &str, active_guest: &ActiveGuest) -> io::Result<String> {
+    {
+        let guard = active_guest.lock().unwrap();
+        if let Some(running) = guard.as_ref() {
+            return Err(io::Error::other(format!(
+                "Guest session already running (profile={}, pid={})",
+                running.profile, running.pid
+            )));
+        }
+    }
+    crate::diagnostics::selinux::servicemanager::check_recovery()?;
+    let profile = crate::guest::prepare::check(root, name)?;
+    if !root.join("guests").join(name).join("selinux/plan.json").is_file() {
+        return Err(io::Error::other(format!(
+            "profile {name} is not prepared; run 'ssal prepare {name}' first"
+        )));
+    }
+    let base = root.join("mnt").join(format!("guest-{name}-{}", now()));
+    fs::create_dir(&base)?;
+    fs::create_dir(base.join("system"))?;
+    fs::create_dir(base.join("data"))?;
+    let log_path = root.join("logs").join(format!("guest-{name}.log"));
+    let stdout = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&log_path)?;
+    let stderr = stdout.try_clone()?;
+    let mut worker = Command::new(std::env::current_exe()?);
+    worker
+        .arg("--guest-start-worker")
+        .arg(&profile.system)
+        .arg(&profile.userdata)
+        .arg(&base)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr));
+    let mut child = match worker.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = cleanup_guest_scratch(&base);
+            return Err(error);
+        }
+    };
+    let pid = child.id();
+    *active_guest.lock().unwrap() = Some(RunningGuest {
+        profile: name.to_owned(),
+        pid,
+        log_path: log_path.clone(),
+    });
+    let root_owned = root.to_path_buf();
+    let name_owned = name.to_owned();
+    let active_owned = Arc::clone(active_guest);
+    let base_owned = base.clone();
+    std::thread::spawn(move || {
+        let status = child.wait();
+        let cleanup = cleanup_guest_scratch(&base_owned);
+        let mut guard = active_owned.lock().unwrap();
+        if guard.as_ref().is_some_and(|g| g.pid == pid) {
+            *guard = None;
+        }
+        drop(guard);
+        log(
+            &root_owned,
+            &format!("Guest profile {name_owned} (pid={pid}) exited: {status:?}; cleanup={cleanup:?}"),
+        );
+    });
+    std::thread::sleep(std::time::Duration::from_millis(250));
+    if active_guest.lock().unwrap().as_ref().is_none_or(|g| g.pid != pid) {
+        let tail = fs::read_to_string(&log_path)
+            .unwrap_or_default()
+            .lines()
+            .rev()
+            .take(10)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(io::Error::other(format!(
+            "Guest exited immediately; see {}:\n{tail}",
+            log_path.display()
+        )));
+    }
+    Ok(format!(
+        "started Guest profile {name} (pid={pid}, log={})",
+        log_path.display()
+    ))
+}
+
 #[cfg(feature = "phase2c-diagnostic")]
 pub(crate) fn run_phase2c_diagnostic(
     root: &Path,
@@ -310,6 +508,7 @@ pub(crate) fn run() -> io::Result<()> {
     let listener = UnixListener::bind(&socket)?;
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
     let busy = Arc::new(Mutex::new(false));
+    let active_guest: ActiveGuest = Arc::new(Mutex::new(None));
     let relay = super::presenter_relay::start(&root);
     log(&root, "ssald started");
     for stream in listener.incoming() {
@@ -317,9 +516,10 @@ pub(crate) fn run() -> io::Result<()> {
             Ok(s) => {
                 let r = root.clone();
                 let b = busy.clone();
+                let ag = active_guest.clone();
                 let rel = relay.clone();
                 std::thread::spawn(move || {
-                    if let Err(e) = handle(s, r.clone(), b, rel) {
+                    if let Err(e) = handle(s, r.clone(), b, ag, rel) {
                         log(&r, &format!("request error: {e}"));
                     }
                 });

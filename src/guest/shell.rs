@@ -66,7 +66,7 @@ pub(crate) fn session(name: &str, words: &[String]) -> io::Result<i32> {
         use crate::guest::concurrent::graphics;
         if attached.root.join("dev").join(graphics::KGSL).exists() != graphics::requested() {
             return Err(io::Error::other(
-                "SSAL_Y702_GRAPHICS must match the active Guest shell session",
+                "graphics mode must match the active Guest shell session",
             ));
         }
         drop(admission);

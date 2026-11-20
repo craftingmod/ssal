@@ -117,7 +117,7 @@ impl GuestCgroups {
             }
             // libprocessgroup creates uid_<uid> below system/ and apps/ under this Guest-owned parent.
             let processgroup_parents = if target == "sys/fs/cgroup"
-                && std::env::var_os("SSAL_START_SYSTEM_SERVER").is_some()
+                && crate::guest::system_server_enabled()
             {
                 chown_system_cgroup(&source)?;
                 let mut created = Vec::with_capacity(2);

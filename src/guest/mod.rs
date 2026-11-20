@@ -27,3 +27,18 @@ pub(crate) mod runtime;
 #[cfg(unix)]
 pub(crate) mod shell;
 pub(crate) mod userdata;
+
+#[cfg(unix)]
+pub(crate) fn disabled(feature: &str) -> bool {
+    std::env::var_os("SSAL_DISABLE").is_some_and(|value| {
+        value
+            .to_string_lossy()
+            .split(',')
+            .any(|item| item.trim().eq_ignore_ascii_case(feature))
+    })
+}
+
+#[cfg(unix)]
+pub(crate) fn system_server_enabled() -> bool {
+    !disabled("SYSTEM_SERVER")
+}

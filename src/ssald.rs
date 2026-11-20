@@ -159,7 +159,7 @@ fn main() {
             || arg == "--guest-hwbinder-worker"
             || arg == "--guest-services-6a-worker"
             || arg == "--guest-services-6b-worker"
-            || arg == "--guest-zygote-7a-worker"
+            || arg == "--guest-start-worker"
     }) {
         let force_regen = args.len() == 6 && args[5] == "--regen";
         if (args.len() != 5 && !force_regen)

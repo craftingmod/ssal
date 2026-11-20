@@ -16,7 +16,7 @@ const VENDOR_ACCESS: [(&str, &str, &[&str]); 4] = [
 ];
 
 pub(in crate::guest) fn requested() -> bool {
-    std::env::var("SSAL_Y702_GRAPHICS").as_deref() == Ok("1")
+    !crate::guest::disabled("GRAPHICS") && Path::new("/sys/class/kgsl/kgsl-3d0/dev").exists()
 }
 
 pub(in crate::guest) fn require_y702() -> io::Result<()> {

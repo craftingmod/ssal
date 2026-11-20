@@ -4,7 +4,7 @@
 
 ## WARNING
 
-vendor has huge codebase so don't read unless explicit request.
+vendor, node_modules has huge codebase so don't read unless explicit request.
 
 ## Rule
 

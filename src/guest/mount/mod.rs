@@ -112,13 +112,13 @@ pub(super) fn verify(
             | "--guest-service-worker"
             | "--guest-services-6a-worker"
             | "--guest-services-6b-worker"
-            | "--guest-zygote-7a-worker"
+            | "--guest-start-worker"
     );
     let installd_probe =
-        mode == "--guest-zygote-7a-worker" && crate::guest::launcher::installd_probe_requested();
+        mode == "--guest-start-worker" && crate::guest::launcher::installd_probe_requested();
     let surfaceflinger_retest =
         std::env::var("SSAL_Y702_SURFACEFLINGER_RETEST").as_deref() == Ok("1");
-    let system_server_graphics = mode == "--guest-zygote-7a-worker"
+    let system_server_graphics = mode == "--guest-start-worker"
         && crate::guest::launcher::graphics_system_server_requested();
     if surfaceflinger_retest
         && !matches!(mode, "--guest-service-worker" | "--guest-hwbinder-worker")
@@ -164,7 +164,7 @@ pub(super) fn verify(
             | "--guest-service-worker"
             | "--guest-services-6a-worker"
             | "--guest-services-6b-worker"
-            | "--guest-zygote-7a-worker"
+            | "--guest-start-worker"
     ) {
         crate::guest::process::supervision::install_signal_handlers();
         crate::guest::process::supervision::enable_subreaper()?;
@@ -305,7 +305,7 @@ pub(super) fn verify(
                 | "--guest-service-worker"
                 | "--guest-services-6a-worker"
                 | "--guest-services-6b-worker"
-                | "--guest-zygote-7a-worker"
+                | "--guest-start-worker"
         ) {
             if hwbinder || matches!(
                 mode,
@@ -316,7 +316,7 @@ pub(super) fn verify(
                     | "--guest-service-worker"
                     | "--guest-services-6a-worker"
                     | "--guest-services-6b-worker"
-                    | "--guest-zygote-7a-worker"
+                    | "--guest-start-worker"
             ) {
                 for key in ["SSAL_MEMORY_HIGH", "SSAL_MEMORY_MAX"] {
                     crate::guest::cgroup::memory_limit(std::env::var(key).ok().as_deref())?;
@@ -446,8 +446,8 @@ pub(super) fn verify(
         if let Some(plan) = &policy {
             ssal::guest_policy::runtime::install(plan, &mut mounts, &root)?;
         }
-        if mode == "--guest-zygote-7a-worker"
-            && std::env::var_os("SSAL_START_SYSTEM_SERVER").is_some()
+        if mode == "--guest-start-worker"
+            && crate::guest::system_server_enabled()
             && cgroups
                 .memory
                 .as_ref()
@@ -569,7 +569,7 @@ pub(super) fn verify(
                 | "--guest-service-worker"
                 | "--guest-services-6a-worker"
                 | "--guest-services-6b-worker"
-                | "--guest-zygote-7a-worker"
+                | "--guest-start-worker"
         ) {
             return crate::guest::launcher::verify(
                 &mut mounts,
@@ -577,7 +577,7 @@ pub(super) fn verify(
                 userdata,
                 mode == "--guest-services-6a-worker" || mode == "--guest-services-6b-worker",
                 mode == "--guest-services-6b-worker",
-                mode == "--guest-zygote-7a-worker",
+                mode == "--guest-start-worker",
                 host_mount_namespace,
                 profile_dir,
                 admission,
@@ -631,9 +631,9 @@ pub(super) fn verify(
         Ok(())
     };
     let descendants = descendants.and_then(|()| {
-        if mode == "--guest-zygote-7a-worker"
+        if mode == "--guest-start-worker"
             && (std::env::var_os("SSAL_PHASE7FB_FORK").is_some()
-                || std::env::var_os("SSAL_START_SYSTEM_SERVER").is_some())
+                || crate::guest::system_server_enabled())
         {
             for path in &cgroups.created {
                 crate::guest::cgroup::remove_empty_cgroup_children(path)?;

@@ -34,12 +34,10 @@ fn property_service_definitions(
     }
     let has_adbd_domain = plan.is_some_and(|p| p.types.contains_key("adbd"));
     if has_adbd_domain && root.join("apex/com.android.adbd/bin/adbd").is_file() {
-        let autostart = (std::env::var_os("SSAL_START_SYSTEM_SERVER").as_deref()
-            == Some(std::ffi::OsStr::new("1"))
-            && std::env::var_os("SSAL_GUEST_ADBD").as_deref()
-                != Some(std::ffi::OsStr::new("0")))
-            || std::env::var_os("SSAL_GUEST_ADBD").as_deref()
-                == Some(std::ffi::OsStr::new("1"));
+        let autostart = std::env::args_os().nth(1).as_deref()
+            == Some(std::ffi::OsStr::new("--guest-start-worker"))
+            && crate::guest::system_server_enabled()
+            && !crate::guest::disabled("ADBD");
         services.push(ssal::guest_properties::ServiceDefinition {
             name: "adbd".into(),
             executable: "/apex/com.android.adbd/bin/adbd".into(),
@@ -324,7 +322,7 @@ pub(crate) fn managed(mode: &str) -> bool {
             | "--guest-hwbinder-worker"
             | "--guest-services-6a-worker"
             | "--guest-services-6b-worker"
-            | "--guest-zygote-7a-worker"
+            | "--guest-start-worker"
     )
 }
 
