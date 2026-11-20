@@ -12,8 +12,8 @@ pub(super) const GUEST_DEVICE_NODES: [(&str, u32, u32); 4] = [
     ("random", 1, 8),
     ("urandom", 1, 9),
 ];
-pub(super) const GUEST_DEV_ENTRIES: [&str; 7] = [
-    "binderfs", "block", "null", "random", "socket", "urandom", "zero",
+pub(super) const GUEST_DEV_ENTRIES: [&str; 9] = [
+    "binderfs", "block", "null", "ptmx", "pts", "random", "socket", "urandom", "zero",
 ];
 
 fn bind_guest_device(
@@ -103,9 +103,21 @@ pub(super) fn prepare_guest_dev(
         libc::MS_NOSUID | libc::MS_NOEXEC,
         "mode=0755,size=4m",
     )?;
-    for path in ["socket", "block", "binderfs"] {
+    for path in ["socket", "block", "binderfs", "pts"] {
         directory(&dev, path, 0o755)?;
     }
+    mounts.attach(
+        Path::new("devpts"),
+        &dev.join("pts"),
+        Some("devpts"),
+        libc::MS_NOSUID | libc::MS_NOEXEC,
+        "newinstance,ptmxmode=0666,mode=0620",
+    )?;
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dev.join("ptmx"))?;
+    mounts.bind(&dev.join("pts/ptmx"), &dev.join("ptmx"), false, false)?;
     for (name, major, minor) in GUEST_DEVICE_NODES {
         bind_guest_device(mounts, &dev, name, major, minor, (0, 0), None)?;
     }

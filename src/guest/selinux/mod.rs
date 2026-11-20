@@ -13,7 +13,7 @@ pub mod native;
 pub mod runtime;
 mod symbols;
 
-const VERSION: u32 = 61;
+const VERSION: u32 = 65;
 
 type Names = BTreeMap<String, String>;
 
@@ -1155,6 +1155,81 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
             );
             plan.rules.insert(rule);
         }
+        if let Some(adbd) = plan.types.get("adbd") {
+            for (src, dst) in [(init, adbd)]
+                .into_iter()
+                .chain(plan.types.get("shell").map(|shell| (adbd, shell)))
+            {
+                let rule = format!("allow {src} {dst} process2 {{ nosuid_transition }}");
+                native::record(
+                    &mut native_rules,
+                    rule.clone(),
+                    1,
+                    1,
+                    &[src, dst, "process2", "nosuid_transition"],
+                );
+                plan.rules.insert(rule);
+            }
+            for (domain, permissions) in [
+                (adbd, &["entrypoint", "execute", "getattr", "map", "open", "read"][..]),
+                (init, &["execute", "getattr", "open", "read"][..]),
+            ] {
+                for permission in permissions {
+                    let rule = format!("allow {domain} adbd_exec file {{ {permission} }}");
+                    native::record(
+                        &mut native_rules,
+                        rule.clone(),
+                        1,
+                        1,
+                        &[domain, "adbd_exec", "file", permission],
+                    );
+                    plan.rules.insert(rule);
+                }
+            }
+            for (target, permission) in [("node", "node_bind"), ("port", "name_bind")] {
+                let rule = format!("allow {adbd} {target} tcp_socket {{ {permission} }}");
+                native::record(
+                    &mut native_rules,
+                    rule.clone(),
+                    1,
+                    1,
+                    &[adbd, target, "tcp_socket", permission],
+                );
+                plan.rules.insert(rule);
+            }
+            for ioctl in ["0x5430", "0x5431"] {
+                let rule = format!("allowxperm {adbd} devpts chr_file ioctl {ioctl}");
+                native::record(
+                    &mut native_rules,
+                    rule.clone(),
+                    2,
+                    1,
+                    &[adbd, "devpts", "chr_file", "ioctl", ioctl],
+                );
+                plan.rules.insert(format!("allowxperm {adbd} devpts chr_file ioctl {{ {ioctl} }}"));
+            }
+        }
+    }
+    // Guest devpts uses an isolated newinstance mount; allow adbd and shell to use its PTY nodes.
+    for original in ["adbd", "shell"] {
+        if let Some(domain) = plan.types.get(original) {
+            for (class, permissions) in [
+                ("dir", &["getattr", "open", "read", "search"][..]),
+                ("chr_file", &["getattr", "ioctl", "open", "read", "setattr", "write"][..]),
+            ] {
+                for permission in permissions {
+                    let rule = format!("allow {domain} devpts {class} {{ {permission} }}");
+                    native::record(
+                        &mut native_rules,
+                        rule.clone(),
+                        1,
+                        1,
+                        &[domain, "devpts", class, permission],
+                    );
+                    plan.rules.insert(rule);
+                }
+            }
+        }
     }
     // Guest processes are execed by KSU and retain KSU-owned inherited FDs.
     if let Some(shell) = plan.types.get("shell") {
@@ -1174,6 +1249,7 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
     for original in [
         "init",
         "shell",
+        "adbd",
         "derive_classpath",
         "linkerconfig",
         "servicemanager",

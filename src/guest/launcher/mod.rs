@@ -87,6 +87,7 @@ fn mapped_exec_domain(executable: &str, exec_context: Option<&[u8]>) -> &'static
             "/run/ssal/ssal-health" => health::SERVICE.domain,
             "/run/ssal/ssal-gatekeeper" => gatekeeper::SERVICE.domain,
             "/run/ssal/ssal-keymint" => keymint::SERVICE.domain,
+            "/apex/com.android.adbd/bin/adbd" => "adbd",
             "/system/bin/gatekeeperd" => "gatekeeperd",
             "/system/bin/keystore2" => "keystore",
             "/system/bin/aconfigd-system" => "aconfigd",
@@ -1248,6 +1249,12 @@ fn report_system_server_display_progress(root: &Path, pid: u32) -> io::Result<(b
     Ok((ready, boot_completed))
 }
 
+fn adbd_requested(start_system_server: bool) -> bool {
+    (start_system_server
+        && std::env::var_os("SSAL_GUEST_ADBD").as_deref() != Some(std::ffi::OsStr::new("0")))
+        || std::env::var_os("SSAL_GUEST_ADBD").as_deref() == Some(std::ffi::OsStr::new("1"))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn verify(
     mounts: &mut Mounts,
@@ -1319,6 +1326,14 @@ pub(crate) fn verify(
         return Err(io::Error::other("Host global Enforcing required"));
     }
     isolated(root, userdata)?;
+    let adbd_enabled = phase7a
+        && adbd_requested(start_system_server)
+        && root.join("apex/com.android.adbd/bin/adbd").is_file();
+    let mut adb_host_listener = if adbd_enabled {
+        Some(net::bind_adb_host_listener(profile_dir)?)
+    } else {
+        None
+    };
     if phase7a {
         let host_net_namespace = fs::read_link("/proc/1/ns/net")?;
         if unsafe { libc::unshare(libc::CLONE_NEWNET) } != 0 {
@@ -1766,6 +1781,20 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
                 None,
                 &[],
             )?);
+        } else if adbd_enabled {
+            prepare_security_daemon_dir(
+                root,
+                "data/misc/adb",
+                1000,
+                2000,
+                0o2750,
+                "adb_data_file",
+            )?;
+        }
+        if adbd_enabled {
+            if let Some((listener, port)) = adb_host_listener.take() {
+                net::spawn_adb_relay(listener, port);
+            }
         }
         if system_server_graphics {
             let (major, minor) = hw_driver.provision_hwbinder(root)?;

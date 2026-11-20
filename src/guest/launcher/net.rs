@@ -1,7 +1,12 @@
 use std::ffi::CString;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io;
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, RawFd};
+use std::path::Path;
+
+const BASE_HOST_ADB_PORT: u16 = 15554;
+pub(crate) const GUEST_ADB_PORT: u16 = 5555;
 
 const IFLA_IFNAME: u16 = 3;
 const IFLA_LINKINFO: u16 = 18;
@@ -173,4 +178,88 @@ pub(crate) fn setup_guest_veth() -> io::Result<File> {
     bring_up_interface("lo")?;
     bring_up_interface("eth0")?;
     Ok(peer_ns)
+}
+
+fn parse_profile_adb_port(profile_json: &str) -> Option<u16> {
+    let value: serde_json::Value = serde_json::from_str(profile_json).ok()?;
+    let id = value.get("selinux_id")?.as_str()?;
+    let index: u16 = id.strip_prefix('p')?.parse().ok()?;
+    if index == 0 {
+        return None;
+    }
+    BASE_HOST_ADB_PORT.checked_add(index)
+}
+
+pub(crate) fn profile_adb_port(profile_dir: &Path) -> u16 {
+    fs::read_to_string(profile_dir.join("profile.json"))
+        .ok()
+        .and_then(|json| parse_profile_adb_port(&json))
+        .unwrap_or(BASE_HOST_ADB_PORT + 1)
+}
+
+/// Bind a loopback TCP listener in the Host network namespace before `unshare(CLONE_NEWNET)`.
+pub(crate) fn bind_adb_host_listener(profile_dir: &Path) -> io::Result<(TcpListener, u16)> {
+    let requested = std::env::var("SSAL_GUEST_ADB_PORT")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or_else(|| profile_adb_port(profile_dir));
+    let listener = match TcpListener::bind(("127.0.0.1", requested)) {
+        Ok(listener) => listener,
+        Err(err) if err.kind() == io::ErrorKind::AddrInUse && requested != 0 => {
+            TcpListener::bind(("127.0.0.1", 0))?
+        }
+        Err(err) => return Err(err),
+    };
+    let port = listener.local_addr()?.port();
+    Ok((listener, port))
+}
+
+fn relay_pair(mut client: TcpStream, mut guest: TcpStream) {
+    let Ok(mut client_w) = client.try_clone() else {
+        return;
+    };
+    let Ok(mut guest_r) = guest.try_clone() else {
+        return;
+    };
+    let uplink = std::thread::spawn(move || {
+        let _ = io::copy(&mut client, &mut guest);
+        let _ = guest.shutdown(Shutdown::Write);
+    });
+    let _ = io::copy(&mut guest_r, &mut client_w);
+    let _ = client_w.shutdown(Shutdown::Write);
+    let _ = uplink.join();
+}
+
+/// Forward Host loopback connections from `listener` into Guest `127.0.0.1:5555`.
+/// Must be called after the launcher has entered the Guest network namespace with `lo` UP.
+pub(crate) fn spawn_adb_relay(listener: TcpListener, host_port: u16) {
+    println!(
+        "Guest adbd TCP relay listening on Host 127.0.0.1:{host_port} -> Guest 127.0.0.1:{GUEST_ADB_PORT}"
+    );
+    std::thread::spawn(move || {
+        for incoming in listener.incoming() {
+            let Ok(client) = incoming else {
+                break;
+            };
+            std::thread::spawn(move || {
+                if let Ok(guest) = TcpStream::connect(("127.0.0.1", GUEST_ADB_PORT)) {
+                    relay_pair(client, guest);
+                }
+            });
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn profile_adb_port_shifts_by_selinux_index() {
+        assert_eq!(parse_profile_adb_port(r#"{"selinux_id":"p0001"}"#), Some(15555));
+        assert_eq!(parse_profile_adb_port(r#"{"selinux_id":"p0002"}"#), Some(15556));
+        assert_eq!(parse_profile_adb_port(r#"{"selinux_id":"p0010"}"#), Some(15564));
+        assert_eq!(parse_profile_adb_port(r#"{"selinux_id":"p0000"}"#), None);
+        assert_eq!(parse_profile_adb_port(r#"{}"#), None);
+    }
 }

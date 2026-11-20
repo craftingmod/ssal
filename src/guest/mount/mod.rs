@@ -833,6 +833,8 @@ mod tests {
         assert!(p.tmpfs.iter().any(|s| s == "mnt"));
         assert!(GUEST_DEV_ENTRIES.contains(&"socket"));
         assert!(GUEST_DEV_ENTRIES.contains(&"binderfs"));
+        assert!(GUEST_DEV_ENTRIES.contains(&"pts"));
+        assert!(GUEST_DEV_ENTRIES.contains(&"ptmx"));
         assert!(p
             .runtime_tmpfs
             .iter()

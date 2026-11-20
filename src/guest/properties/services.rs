@@ -32,6 +32,8 @@ pub struct ServiceDefinition {
     /// Seconds from the previous start. Crashes use a minimum of five seconds.
     #[serde(default)]
     pub restart_period: Option<u32>,
+    #[serde(default)]
+    pub autostart: bool,
 }
 
 impl ServiceDefinition {
@@ -359,6 +361,24 @@ impl Registry {
         Ok(())
     }
 
+    pub fn start_autostart(&mut self, properties: &mut Properties) -> io::Result<()> {
+        let names: Vec<String> = self
+            .0
+            .iter()
+            .filter(|(_, service)| service.definition.autostart)
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in names {
+            if let Some(service) = self.0.get_mut(&name) {
+                if service.child.is_none() {
+                    service.start()?;
+                    properties.set(&format!("init.svc.{name}"), service.state)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn dispatch(
         &mut self,
         action: &str,
@@ -378,9 +398,6 @@ impl Registry {
             (action, name)
         };
         let Some(service) = self.0.get_mut(name) else {
-            if name == "adbd" {
-                return Ok(true);
-            }
             return Ok(false);
         };
         if peer.is_none()
@@ -505,6 +522,7 @@ mod tests {
             domain: "shell".into(),
             oneshot: None,
             restart_period: None,
+            autostart: false,
         }
     }
 

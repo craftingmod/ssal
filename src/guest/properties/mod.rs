@@ -455,6 +455,7 @@ fn guest_input(path: &Path) -> io::Result<()> {
         "/product",
         "/vendor",
         "/odm",
+        "/apex",
         "/run/ssal",
     ]
     .iter()
@@ -544,6 +545,7 @@ pub fn serve(config: Config) -> io::Result<()> {
         .transpose()?;
     let mut services = services::Registry::new(config.services, &config.selinux_types)?;
     services.publish(&mut properties)?;
+    services.start_autostart(&mut properties)?;
     if init_context.is_some() {
         let mut values = crate::guest_initrc::Properties::new();
         properties.area.list(|name, value| {

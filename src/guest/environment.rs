@@ -29,6 +29,28 @@ fn property_service_definitions(
             domain: "bootanim".into(),
             oneshot: Some(true),
             restart_period: None,
+            autostart: false,
+        });
+    }
+    let has_adbd_domain = plan.is_some_and(|p| p.types.contains_key("adbd"));
+    if has_adbd_domain && root.join("apex/com.android.adbd/bin/adbd").is_file() {
+        let autostart = (std::env::var_os("SSAL_START_SYSTEM_SERVER").as_deref()
+            == Some(std::ffi::OsStr::new("1"))
+            && std::env::var_os("SSAL_GUEST_ADBD").as_deref()
+                != Some(std::ffi::OsStr::new("0")))
+            || std::env::var_os("SSAL_GUEST_ADBD").as_deref()
+                == Some(std::ffi::OsStr::new("1"));
+        services.push(ssal::guest_properties::ServiceDefinition {
+            name: "adbd".into(),
+            executable: "/apex/com.android.adbd/bin/adbd".into(),
+            args: Vec::new(),
+            interfaces: Vec::new(),
+            uid: 0,
+            gid: 0,
+            domain: "adbd".into(),
+            oneshot: Some(false),
+            restart_period: Some(5),
+            autostart,
         });
     }
     services
@@ -81,6 +103,8 @@ pub(crate) fn start_property_service(
         "ro.build.version.codename=REL",
         "dalvik.vm.dex2oat64.enabled=true",
         "ro.zygote.disable_gl_preload=1",
+        "service.adb.tcp.port=5555",
+        "ro.adb.secure=0",
     ];
     if crate::guest::concurrent::graphics::requested() {
         build_props.extend([
@@ -574,6 +598,35 @@ mod tests {
         assert_eq!(defs[0].uid, 1000);
         assert_eq!(defs[0].gid, 1000);
         assert_eq!(defs[0].oneshot, Some(true));
+
+        fs::remove_dir_all(base)
+    }
+
+    #[test]
+    fn registers_adbd_service_when_binary_and_domain_exist() -> io::Result<()> {
+        let base = std::env::temp_dir().join(format!("ssal-adbd-svc-{}", std::process::id()));
+        let bin_dir = base.join("apex/com.android.adbd/bin");
+        fs::create_dir_all(&bin_dir)?;
+        let inputs = std::collections::BTreeMap::from([(
+            "system/etc/selinux/plat_sepolicy.cil".into(),
+            "(type zygote)".into(),
+        )]);
+        let mut plan = ssal::guest_policy::generate("p0001", &inputs)?;
+
+        assert!(property_service_definitions(&base, Some(&plan), false).is_empty());
+
+        fs::write(bin_dir.join("adbd"), b"stub")?;
+        assert!(property_service_definitions(&base, Some(&plan), false).is_empty());
+
+        plan.types.insert("adbd".into(), "ssal_p0001_adbd".into());
+        let defs = property_service_definitions(&base, Some(&plan), false);
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].name, "adbd");
+        assert_eq!(defs[0].executable, "/apex/com.android.adbd/bin/adbd");
+        assert_eq!(defs[0].domain, "adbd");
+        assert_eq!(defs[0].uid, 0);
+        assert_eq!(defs[0].gid, 0);
+        assert_eq!(defs[0].oneshot, Some(false));
 
         fs::remove_dir_all(base)
     }
