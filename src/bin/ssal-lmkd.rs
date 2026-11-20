@@ -397,6 +397,7 @@ fn set_nonblocking(fd: RawFd) -> io::Result<()> {
 }
 
 fn main() -> io::Result<()> {
+    eprintln!("ssal-lmkd: main entered");
     let mut socket_path: Option<PathBuf> = None;
     let mut cgroup_arg: Option<PathBuf> = None;
     let mut args = env::args_os().skip(1);

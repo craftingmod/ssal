@@ -160,16 +160,18 @@ impl Plan {
                 &[domain, "kernel", "security", "compute_av"],
             );
         }
-        if let Some(domain) = self.types.get("hwservicemanager") {
-            let rule = format!("allow {domain} kernel security {{ compute_av }}");
-            self.rules.insert(rule.clone());
-            native::record(
-                &mut self.native_rules,
-                rule,
-                1,
-                1,
-                &[domain, "kernel", "security", "compute_av"],
-            );
+        for original in ["hwservicemanager", "keystore"] {
+            if let Some(domain) = self.types.get(original) {
+                let rule = format!("allow {domain} kernel security {{ compute_av }}");
+                self.rules.insert(rule.clone());
+                native::record(
+                    &mut self.native_rules,
+                    rule,
+                    1,
+                    1,
+                    &[domain, "kernel", "security", "compute_av"],
+                );
+            }
         }
         for original in ["zygote", "installd"] {
             if let Some(domain) = self.types.get(original) {
@@ -1183,6 +1185,7 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
         "artd",
         "vold",
         "netd",
+        "lmkd",
         "audioserver",
         "gatekeeperd",
         "keystore",
@@ -1204,6 +1207,24 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
                     1,
                     1,
                     &[domain, "ksu", class, permission],
+                );
+                plan.rules.insert(rule);
+            }
+        }
+    }
+    if let Some(lmkd_domain) = plan.types.get("lmkd") {
+        for (class, permissions) in [
+            ("dir", &["read", "open", "search", "getattr"][..]),
+            ("file", &["read", "open", "getattr"][..]),
+        ] {
+            for permission in permissions {
+                let rule = format!("allow {lmkd_domain} cgroup {class} {{ {permission} }}");
+                native::record(
+                    &mut native_rules,
+                    rule.clone(),
+                    1,
+                    1,
+                    &[lmkd_domain, "cgroup", class, permission],
                 );
                 plan.rules.insert(rule);
             }
@@ -1377,7 +1398,7 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
         );
         plan.rules.insert(rule);
     }
-    for exec_name in ["vold_exec", "netd_exec", "audioserver_exec"] {
+    for exec_name in ["vold_exec", "netd_exec", "lmkd_exec", "lmkd_socket", "audioserver_exec"] {
         if let Some(exec_type) = plan.types.get(exec_name) {
             let rule = format!("allow {exec_type} tmpfs filesystem {{ associate }}");
             if plan.rules.insert(rule.clone()) {

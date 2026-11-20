@@ -67,7 +67,7 @@ pub(in crate::guest) fn apply_vendor_access(
     Ok(())
 }
 
-const SURFACEFLINGER_GRAPHICS_ACCESS: [(&str, &str, &[&str]); 7] = [
+const SURFACEFLINGER_GRAPHICS_ACCESS: [(&str, &str, &[&str]); 10] = [
     ("vendor_file", "dir", &["search", "getattr", "read", "open"]),
     ("vendor_file", "file", &["read", "open", "getattr", "map", "execute"]),
     ("vendor_hal_file", "dir", &["search", "getattr", "read", "open"]),
@@ -78,6 +78,9 @@ const SURFACEFLINGER_GRAPHICS_ACCESS: [(&str, &str, &[&str]); 7] = [
         "file",
         &["read", "open", "getattr", "map", "execute"],
     ),
+    ("same_process_hal_file", "lnk_file", &["read", "getattr"]),
+    ("vendor_sysfs_kgsl", "dir", &["search", "getattr", "read", "open"]),
+    ("vendor_sysfs_kgsl", "file", &["read", "open", "getattr"]),
     (
         "gpu_device",
         "chr_file",
@@ -85,21 +88,22 @@ const SURFACEFLINGER_GRAPHICS_ACCESS: [(&str, &str, &[&str]); 7] = [
     ),
 ];
 
-pub(in crate::guest) fn apply_surfaceflinger_graphics_access(
+fn apply_graphics_client_access(
     plan: &ssal::guest_policy::Plan,
+    original_domain: &str,
 ) -> io::Result<()> {
-    let sf = plan.context("surfaceflinger", true)?;
-    selinux::require_enforcing_domain(&sf)?;
+    let sid = plan.context(original_domain, true)?;
+    selinux::require_enforcing_domain(&sid)?;
     let domain = plan
         .types
-        .get("surfaceflinger")
-        .ok_or_else(|| io::Error::other("Guest surfaceflinger type missing"))?;
+        .get(original_domain)
+        .ok_or_else(|| io::Error::other(format!("Guest {original_domain} type missing")))?;
     for (target, class, permissions) in SURFACEFLINGER_GRAPHICS_ACCESS {
         let context = format!("u:object_r:{target}:s0");
         let allowed = || {
             permissions.iter().try_fold(true, |all, permission| {
                 Ok::<_, io::Error>(
-                    selinux::access_allowed(&sf, &context, class, permission)? && all,
+                    selinux::access_allowed(&sid, &context, class, permission)? && all,
                 )
             })
         };
@@ -112,11 +116,31 @@ pub(in crate::guest) fn apply_surfaceflinger_graphics_access(
             .status()?;
         if !status.success() || !allowed()? {
             return Err(io::Error::other(format!(
-                "Y702 Guest SurfaceFlinger graphics rule failed: {rule}"
+                "Y702 Guest {original_domain} graphics rule failed: {rule}"
             )));
         }
     }
-    println!("Y702 Guest SurfaceFlinger graphics permissions verified for {sf}");
+    println!("Y702 Guest {original_domain} graphics permissions verified for {sid}");
+    Ok(())
+}
+
+pub(in crate::guest) fn apply_surfaceflinger_graphics_access(
+    plan: &ssal::guest_policy::Plan,
+) -> io::Result<()> {
+    apply_graphics_client_access(plan, "surfaceflinger")?;
+    for domain in [
+        "bootanim",
+        "zygote",
+        "system_server",
+        "system_app",
+        "platform_app",
+        "priv_app",
+        "untrusted_app",
+    ] {
+        if plan.types.contains_key(domain) {
+            apply_graphics_client_access(plan, domain)?;
+        }
+    }
     Ok(())
 }
 
@@ -317,7 +341,7 @@ pub(in crate::guest) fn apply_graphics_allocator_access(
         .types
         .get("hal_graphics_allocator_default")
         .ok_or_else(|| io::Error::other("Guest hal_graphics_allocator_default type missing"))?;
-    let sf = plan
+    let _ = plan
         .types
         .get("surfaceflinger")
         .ok_or_else(|| io::Error::other("Guest surfaceflinger type missing"))?;
@@ -345,7 +369,7 @@ pub(in crate::guest) fn apply_graphics_allocator_access(
         .types
         .get("hidl_base_hwservice")
         .ok_or_else(|| io::Error::other("Guest hidl_base_hwservice type missing"))?;
-    let rules: [(&str, &str, &str, &[&str]); 25] = [
+    let mut rules: Vec<(&str, &str, &str, &[&str])> = vec![
         (alloc, "hal_graphics_allocator_default_exec", "file", &["entrypoint", "execute", "execute_no_trans", "read", "open", "getattr", "map"]),
         (alloc, "vendor_file", "dir", &["search", "getattr", "read", "open"]),
         (alloc, "vendor_file", "file", &["read", "open", "getattr", "map", "execute"]),
@@ -365,17 +389,33 @@ pub(in crate::guest) fn apply_graphics_allocator_access(
         (alloc, hwsm_prop, "file", &["read", "open", "getattr", "map"]),
         (alloc, "dmabuf_system_heap_device", "chr_file", &["read", "open", "ioctl", "getattr"]),
         (alloc, "vendor_dmabuf_system_heap_device", "chr_file", &["read", "open", "ioctl", "getattr"]),
-        (sf, alloc, "binder", &["call", "transfer"]),
-        (sf, alloc, "fd", &["use"]),
-        (alloc, sf, "binder", &["call", "transfer"]),
-        (alloc, sf, "fd", &["use"]),
-        (sf, alloc_hwsvc, "hwservice_manager", &["find"]),
-        (sf, default_hwsvc, "hwservice_manager", &["find"]),
     ];
+    let clients: Vec<&str> = [
+        "surfaceflinger",
+        "bootanim",
+        "system_server",
+        "system_app",
+        "platform_app",
+        "priv_app",
+        "untrusted_app",
+    ]
+    .into_iter()
+    .filter_map(|name| plan.types.get(name).map(String::as_str))
+    .collect();
+    for client in &clients {
+        rules.extend([
+            (*client, alloc.as_str(), "binder", &["call", "transfer"][..]),
+            (*client, alloc.as_str(), "fd", &["use"][..]),
+            (alloc.as_str(), *client, "binder", &["call", "transfer"][..]),
+            (alloc.as_str(), *client, "fd", &["use"][..]),
+            (*client, alloc_hwsvc.as_str(), "hwservice_manager", &["find"][..]),
+            (*client, default_hwsvc.as_str(), "hwservice_manager", &["find"][..]),
+        ]);
+    }
     for (src, dst, class, perms) in rules {
         let src_ctx = format!("u:r:{src}:s0");
         let dst_role = if matches!(class, "binder" | "fd" | "fifo_file")
-            && (dst == "ksu" || dst == sf || dst == hwsm || dst == alloc)
+            && (dst == "ksu" || dst == hwsm || dst == alloc || clients.contains(&dst))
         {
             "r"
         } else {

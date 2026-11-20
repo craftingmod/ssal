@@ -1,6 +1,6 @@
 //! Experimental foreground Guest services; this registry never adopts existing PIDs.
 use super::{server::PeerCredentials, Properties};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 const DEFAULT_RESTART_PERIOD: Duration = Duration::from_secs(5);
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 /// A trusted foreground service. Descendants must remain in its process group.
 pub struct ServiceDefinition {
@@ -378,6 +378,9 @@ impl Registry {
             (action, name)
         };
         let Some(service) = self.0.get_mut(name) else {
+            if name == "adbd" {
+                return Ok(true);
+            }
             return Ok(false);
         };
         if peer.is_none()

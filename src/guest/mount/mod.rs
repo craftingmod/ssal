@@ -387,13 +387,18 @@ pub(super) fn verify(
         owned_directory(&root.join("data"), "media", 0o770, 1023, 1023)?;
         owned_directory(&root.join("data"), "media/0", 0o770, 1023, 1023)?;
         for (path, mode, uid, gid) in [
+            ("anr", 0o775, 1000, 1000),
             ("misc", 0o1771, 1000, 9998),
             ("misc/apexdata", 0o711, 0, 0),
+            ("misc/apexdata/com.android.permission", 0o700, 1000, 1000),
             ("misc/apexdata/com.android.tethering", 0o771, 1000, 1000),
             ("misc/apexdata/com.android.tethering/netstats", 0o771, 1000, 1000),
             ("misc/critical-events", 0o771, 1000, 1000),
             ("misc_ce", 0o1771, 1000, 9998),
             ("misc_de", 0o1771, 1000, 9998),
+            ("misc_de/0", 0o711, 0, 0),
+            ("misc_de/0/apexdata", 0o711, 0, 0),
+            ("misc_de/0/apexdata/com.android.permission", 0o700, 1000, 1000),
             ("system", 0o775, 1000, 1000),
             ("system/dropbox", 0o700, 1000, 1000),
             ("system/users", 0o775, 1000, 1000),
@@ -402,6 +407,10 @@ pub(super) fn verify(
             ("system_ce/0", 0o770, 1000, 1000),
             ("system_de", 0o770, 1000, 1000),
             ("system_de/0", 0o770, 1000, 1000),
+            ("user", 0o711, 1000, 1000),
+            ("user/0", 0o711, 1000, 1000),
+            ("user_de", 0o711, 1000, 1000),
+            ("user_de/0", 0o711, 1000, 1000),
         ] {
             owned_directory(&root.join("data"), path, mode, uid, gid)?;
         }

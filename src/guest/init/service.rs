@@ -273,6 +273,10 @@ impl Service {
         }
         Ok(())
     }
+    pub(in crate::guest) fn log_contains(&self, text: &str) -> io::Result<bool> {
+        let log = fs::read_to_string(&self.log)?;
+        Ok(log.contains(text))
+    }
     pub(in crate::guest) fn wait_text(&mut self, text: &str) -> io::Result<()> {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {

@@ -90,7 +90,12 @@ impl IApexService for ApexService {
         denied()
     }
     fn markBootCompleted(&self) -> BinderResult<()> {
-        denied()
+        eprintln!(
+            "guest_apex_call=markBootCompleted pid={} uid={}",
+            rsbinder::get_calling_pid(),
+            rsbinder::get_calling_uid()
+        );
+        Ok(())
     }
     fn calculateSizeForCompressedApex(&self, _: &CompressedApexInfoList) -> BinderResult<i64> {
         denied()
@@ -237,7 +242,6 @@ mod tests {
             s.stagePackages(&[]),
             s.resumeRevertIfNeeded(),
             s.recollectPreinstalledData(),
-            s.markBootCompleted(),
             s.calculateSizeForCompressedApex(&compressed).map(|_| ()),
             s.reserveSpaceForCompressedApex(&compressed),
             s.installAndActivatePackage("/ignored", true).map(|_| ()),
@@ -308,10 +312,7 @@ mod tests {
         assert_eq!(service.getActivePackages()?, vec![info]);
         assert!(service.getSessions()?.is_empty());
         assert!(service.getStagedSessionInfo(42)?.isUnknown);
-        assert_eq!(
-            service.markBootCompleted().unwrap_err().exception_code(),
-            ExceptionCode::UnsupportedOperation
-        );
+        service.markBootCompleted()?;
         Ok(())
     }
 }

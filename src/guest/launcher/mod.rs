@@ -1180,12 +1180,59 @@ fn preopt_system_apps(
     Ok(())
 }
 
+fn notify_host_boot_completed(_host_mount_namespace: &Path, pid: Option<u32>) {
+    let message = match pid {
+        Some(pid) => format!("ApexService::markBootCompleted (system_server pid={pid})"),
+        None => "ApexService::markBootCompleted".to_string(),
+    };
+    let host_ns_path = "/proc/1/ns/mnt";
+    let Ok(host_mnt) = File::open(host_ns_path) else {
+        eprintln!("Guest host notify failed: open {host_ns_path}");
+        return;
+    };
+    let host_fd = host_mnt.as_raw_fd();
+    let mut command = std::process::Command::new("/system/bin/cmd");
+    command.args([
+        "activity",
+        "broadcast",
+        "-a",
+        "alyac.android.ssalsurface.ACTION_GUEST_BOOT_COMPLETED",
+        "-n",
+        "alyac.android.ssalsurface/.BootDebugNotificationReceiver",
+        "--es",
+        "message",
+        &message,
+    ]);
+    unsafe {
+        command.pre_exec(move || {
+            if libc::setns(host_fd, libc::CLONE_NEWNS) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    match command.output() {
+        Ok(output) => {
+            println!(
+                "GUEST_HOST_NOTIFY status={} stdout={} stderr={}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout).trim(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Err(error) => {
+            eprintln!("Guest host notify spawn failed: {error}");
+        }
+    }
+}
+
 fn system_server_boot_completed(stderr: &str, pid: u32) -> bool {
     let pid = pid.to_string();
     stderr.lines().any(|line| {
         line.split_whitespace().nth(2) == Some(pid.as_str())
             && line
                 .split_once(" SystemServerTiming: ")
+                .or_else(|| line.split_once(" ActivityManagerTiming: "))
                 .is_some_and(|(_, timing)| timing.starts_with("OnBootPhase_1000 took to complete:"))
     })
 }
@@ -2180,9 +2227,16 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
             let observation_seconds = 360;
             let deadline = Instant::now() + Duration::from_secs(observation_seconds);
             let mut observed_system_ready = false;
+            let mut observed_apex_boot_completed = false;
             let mut watch_ticks: u32 = 0;
             while Instant::now() < deadline {
                 crate::guest::process::supervision::check_interrupted()?;
+                manager.drain_output()?;
+                if manager.exited()? {
+                    return Err(io::Error::other(
+                        "Guest servicemanager exited during SystemServer residence",
+                    ));
+                }
                 check_boot_services(&mut boot_services)?;
                 if use_initrc {
                     if let Some(service) = &mut property_service {
@@ -2194,6 +2248,14 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
                 }
                 if let Some(service) = &mut apexservice {
                     service.drain_output()?;
+                    if !observed_apex_boot_completed
+                        && service
+                            .log_contains("guest_apex_call=markBootCompleted")
+                            .unwrap_or(false)
+                    {
+                        observed_apex_boot_completed = true;
+                        notify_host_boot_completed(host_mount_namespace, system_server_pid);
+                    }
                     if service.exited()? {
                         return Err(io::Error::other("Guest apexservice exited during SystemServer residence"));
                     }
@@ -2534,8 +2596,12 @@ fn start_lmkd(root: &Path) -> io::Result<Service> {
                 return Err(io::Error::last_os_error());
             }
             fs::set_permissions(Path::new("/dev/socket/lmkd"), fs::Permissions::from_mode(0o660))?;
-            if libc::dup2(bound_guard.as_raw_fd(), fd) < 0 || libc::fcntl(fd, libc::F_SETFD, 0) != 0
-            {
+            if bound_guard.as_raw_fd() == fd {
+                std::mem::forget(bound_guard);
+            } else if libc::dup2(bound_guard.as_raw_fd(), fd) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::fcntl(fd, libc::F_SETFD, 0) != 0 {
                 return Err(io::Error::last_os_error());
             }
             Ok(())

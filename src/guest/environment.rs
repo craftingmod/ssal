@@ -8,6 +8,32 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 const PROPERTY_SERVICE_CONTEXT: &[u8] = b"u:r:ssal_property:s0\0";
 
+fn property_service_definitions(
+    root: &Path,
+    plan: Option<&ssal::guest_policy::Plan>,
+    graphics_system_server: bool,
+) -> Vec<ssal::guest_properties::ServiceDefinition> {
+    let mut services = Vec::new();
+    let has_bootanim_domain = plan.is_some_and(|p| p.types.contains_key("bootanim"));
+    if graphics_system_server
+        && has_bootanim_domain
+        && root.join("system/bin/bootanimation").is_file()
+    {
+        services.push(ssal::guest_properties::ServiceDefinition {
+            name: "bootanim".into(),
+            executable: "/system/bin/bootanimation".into(),
+            args: Vec::new(),
+            interfaces: Vec::new(),
+            uid: 1000,
+            gid: 1000,
+            domain: "bootanim".into(),
+            oneshot: Some(true),
+            restart_period: None,
+        });
+    }
+    services
+}
+
 pub(crate) fn start_property_service(
     mounts: &mut Mounts,
     root: &Path,
@@ -109,6 +135,14 @@ pub(crate) fn start_property_service(
         }
         config["property_contexts"] = serde_json::to_value(paths)?;
         config["selinux_types"] = serde_json::to_value(&plan.types)?;
+    }
+    let services = property_service_definitions(
+        root,
+        plan.as_ref(),
+        crate::guest::launcher::graphics_system_server_requested(),
+    );
+    if !services.is_empty() {
+        config["services"] = serde_json::to_value(&services)?;
     }
     fs::write(
         runtime.join("property-service.json"),
@@ -509,6 +543,38 @@ mod tests {
         fs::write(&path, serde_json::to_vec(&record)?)?;
         assert!(attach(&profile)?.is_none());
         drop(published.finish()?);
+        fs::remove_dir_all(base)
+    }
+
+    #[test]
+    fn registers_bootanim_service_only_for_graphics_sessions_with_binary_and_domain() -> io::Result<()>
+    {
+        let base = std::env::temp_dir().join(format!("ssal-bootanim-svc-{}", std::process::id()));
+        let bin_dir = base.join("system/bin");
+        fs::create_dir_all(&bin_dir)?;
+        let inputs = std::collections::BTreeMap::from([(
+            "system/etc/selinux/plat_sepolicy.cil".into(),
+            "(type zygote)".into(),
+        )]);
+        let mut plan = ssal::guest_policy::generate("p0001", &inputs)?;
+
+        assert!(property_service_definitions(&base, Some(&plan), true).is_empty());
+
+        fs::write(bin_dir.join("bootanimation"), b"stub")?;
+        assert!(property_service_definitions(&base, Some(&plan), true).is_empty());
+
+        plan.types.insert("bootanim".into(), "ssal_p0001_bootanim".into());
+        assert!(property_service_definitions(&base, Some(&plan), false).is_empty());
+
+        let defs = property_service_definitions(&base, Some(&plan), true);
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].name, "bootanim");
+        assert_eq!(defs[0].executable, "/system/bin/bootanimation");
+        assert_eq!(defs[0].domain, "bootanim");
+        assert_eq!(defs[0].uid, 1000);
+        assert_eq!(defs[0].gid, 1000);
+        assert_eq!(defs[0].oneshot, Some(true));
+
         fs::remove_dir_all(base)
     }
 }
