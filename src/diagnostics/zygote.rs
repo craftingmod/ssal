@@ -7,11 +7,16 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::{Child, ExitStatus};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Mutex, OnceLock, Weak,
+};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const LIMIT: usize = 1024 * 1024;
+const SESSION_LOG_LIMIT: u64 = 100 * 1024 * 1024;
 static SESSION_LOG: OnceLock<File> = OnceLock::new();
+static SESSION_LOG_BYTES: AtomicU64 = AtomicU64::new(0);
 static DRAINER: OnceLock<LogDrainer> = OnceLock::new();
 
 struct LogDrainer {
@@ -170,13 +175,20 @@ impl StreamState {
                     // shortcut: keep the first bytes, add a tail ring if boot exceeds the cap.
                     let keep = n.min(self.limit.saturating_sub(self.saved));
                     self.output.write_all(&buffer[..keep])?;
-                    if self
-                        .session_log
-                        .is_some_and(|mut log| log.write_all(&buffer[..keep]).is_err())
-                    {
-                        self.session_log = None;
-                    }
                     self.saved += keep;
+                    if let Some(mut log) = self.session_log {
+                        let written = SESSION_LOG_BYTES.load(Ordering::Relaxed);
+                        let keep_session =
+                            n.min(SESSION_LOG_LIMIT.saturating_sub(written) as usize);
+                        if keep_session > 0 {
+                            if log.write_all(&buffer[..keep_session]).is_err() {
+                                self.session_log = None;
+                            } else {
+                                SESSION_LOG_BYTES
+                                    .fetch_add(keep_session as u64, Ordering::Relaxed);
+                            }
+                        }
+                    }
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -305,7 +317,8 @@ impl Diagnostics {
                     .take()
                     .ok_or_else(|| io::Error::other("stdout pipe missing"))?,
                 File::create(directory.join("stdout.log"))?,
-            )?,
+            )?
+            .with_session_log(),
             stderr: Stream::new(
                 child
                     .stderr

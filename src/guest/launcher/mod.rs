@@ -3,7 +3,9 @@ mod net;
 use crate::diagnostics::launcher::{
     fork_probe, system_server_preflight, system_server_runtime_sid,
 };
-use crate::guest::concurrent::{gatekeeper, graphics, health, keymint, sensors, system_suspend, thermal};
+use crate::guest::concurrent::{
+    gatekeeper, graphics, health, keymint, sensors, system_suspend, thermal, vibrator,
+};
 use crate::guest::hwbinder;
 use crate::guest::environment::start_property_service;
 use crate::guest::init::{wait_for_system_server, Service};
@@ -46,6 +48,7 @@ pub(in crate::guest) fn uses_own_diagnostics(executable: &str) -> bool {
         crate::guest::init::binder_service::APEX.executable,
         crate::guest::init::binder_service::VOLD.executable,
         crate::guest::init::binder_service::NETD.executable,
+        crate::guest::init::binder_service::BLUETOOTH_MANAGER.executable,
         "/run/ssal/ssal-virtual-audio",
         "/run/ssal/ssal-lmkd",
         system_suspend::SERVICE.executable,
@@ -54,6 +57,7 @@ pub(in crate::guest) fn uses_own_diagnostics(executable: &str) -> bool {
         keymint::SERVICE.executable,
         sensors::SERVICE.executable,
         thermal::SERVICE.executable,
+        vibrator::SERVICE.executable,
         hwbinder::COMPOSER,
         "/vendor/bin/hw/vendor.qti.hardware.display.allocator-service",
     ]
@@ -84,15 +88,25 @@ fn mapped_exec_domain(executable: &str, exec_context: Option<&[u8]>) -> &'static
             "/run/ssal/ssal-apexservice" => crate::guest::init::binder_service::APEX.domain,
             "/run/ssal/ssal-vold" => crate::guest::init::binder_service::VOLD.domain,
             "/run/ssal/ssal-netd" => crate::guest::init::binder_service::NETD.domain,
+            "/run/ssal/ssal-bluetooth-manager" => {
+                crate::guest::init::binder_service::BLUETOOTH_MANAGER.domain
+            }
             "/run/ssal/ssal-virtual-audio" => "audioserver",
             "/run/ssal/ssal-lmkd" => "lmkd",
+            "/system/bin/storaged" => "storaged",
+            "/apex/com.android.os.statsd/bin/statsd" => "statsd",
             "/system/bin/audioserver" => "audioserver",
+            "/system/bin/mediaserver64" => "mediaserver",
+            "/system/bin/mediaextractor" => "mediaextractor",
+            "/system/bin/mediametrics" => "mediametrics",
+            "/apex/com.android.media.swcodec/bin/mediaswcodec" => "mediaswcodec",
             "/run/ssal/ssal-system-suspend" => system_suspend::SERVICE.domain,
             "/run/ssal/ssal-health" => health::SERVICE.domain,
             "/run/ssal/ssal-gatekeeper" => gatekeeper::SERVICE.domain,
             "/run/ssal/ssal-keymint" => keymint::SERVICE.domain,
             "/run/ssal/ssal-sensors" => sensors::SERVICE.domain,
             "/run/ssal/ssal-thermal" => thermal::SERVICE.domain,
+            "/run/ssal/ssal-vibrator" => vibrator::SERVICE.domain,
             "/apex/com.android.adbd/bin/adbd" => "adbd",
             "/system/bin/gatekeeperd" => "gatekeeperd",
             "/system/bin/keystore2" => "keystore",
@@ -1479,11 +1493,16 @@ pub(crate) fn verify(
             .map_err(|error| io::Error::other(format!("install Guest Thermal HAL: {error}")))?;
         sensors::SERVICE.install(mounts, root, &bin)
             .map_err(|error| io::Error::other(format!("install Guest Sensors HAL: {error}")))?;
+        vibrator::SERVICE.install(mounts, root, &bin)
+            .map_err(|error| io::Error::other(format!("install Guest Vibrator HAL: {error}")))?;
         if bin.join("ssal-vold").is_file() {
             crate::guest::init::binder_service::VOLD.install(mounts, root, &bin)?;
         }
         if bin.join("ssal-netd").is_file() {
             crate::guest::init::binder_service::NETD.install(mounts, root, &bin)?;
+        }
+        if bin.join("ssal-bluetooth-manager").is_file() {
+            crate::guest::init::binder_service::BLUETOOTH_MANAGER.install(mounts, root, &bin)?;
         }
         if bin.join("ssal-lmkd").is_file() {
             let plan = ssal::guest_policy::runtime::load(root)?
@@ -1875,6 +1894,7 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
             health::start(root, &bin, guest_binder, &mut boot_services)?;
             thermal::start(root, &bin, guest_binder, &mut boot_services)?;
             sensors::start(root, &bin, guest_binder, &mut boot_services)?;
+            vibrator::start(root, &bin, guest_binder, &mut boot_services)?;
             let auth_token_key = keymint::random_bytes::<32>()?;
             keymint::start(root, guest_binder, &auth_token_key, &mut boot_services)?;
             gatekeeper::start(root, guest_binder, &auth_token_key, &mut boot_services)?;
@@ -2016,29 +2036,72 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
                     )?,
                 );
             }
+            if bin.join("ssal-bluetooth-manager").is_file() {
+                boot_services.push(
+                    crate::guest::init::binder_service::BLUETOOTH_MANAGER
+                        .start(root, guest_binder)?,
+                );
+            }
             if bin.join("ssal-lmkd").is_file() {
                 boot_services.push(start_lmkd(root)?);
             }
-            struct ChildGuard(Option<std::process::Child>);
-            impl Drop for ChildGuard {
-                fn drop(&mut self) {
-                    if let Some(mut child) = self.0.take() {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                    }
-                }
+            if root.join("system/bin/storaged").is_file() {
+                prepare_security_daemon_dir(
+                    root,
+                    "data/misc/storaged",
+                    0,
+                    1000,
+                    0o700,
+                    "storaged_data_file",
+                )?;
+                boot_services.push(Service::start(
+                    root,
+                    "/system/bin/storaged",
+                    &[],
+                    "storaged",
+                    0,
+                    Some(GUEST_PROBE_CONTEXT),
+                    &[],
+                )?);
             }
-            let mut _host_audio_bridge = ChildGuard(None);
+            if root.join("apex/com.android.os.statsd/bin/statsd").is_file() {
+                for (rel, label) in [
+                    ("data/misc/stats-active-metric", "stats_data_file"),
+                    ("data/misc/stats-data", "stats_data_file"),
+                    ("data/misc/stats-metadata", "stats_data_file"),
+                    ("data/misc/stats-service", "stats_config_data_file"),
+                ] {
+                    prepare_security_daemon_dir(root, rel, 1066, 1000, 0o770, label)?;
+                }
+                boot_services.push(start_statsd(root)?);
+            }
             if bin.join("ssal-virtual-audio").is_file() {
                 let audio_host_bin = bin.join("ssal-audio-host");
                 if audio_host_bin.is_file() {
                     let sock_path = root.join("run/ssal/audio.sock");
-                    let mut child = Command::new(&audio_host_bin)
+                    let log = root.join("run/ssal/audio-host.log");
+                    let parent = std::process::id() as libc::pid_t;
+                    let mut command = Command::new(&audio_host_bin);
+                    command
+                        .env_clear()
                         .arg("serve")
                         .arg(&sock_path)
                         .stdout(Stdio::piped())
-                        .stderr(Stdio::inherit())
-                        .spawn()?;
+                        .stderr(File::create(&log)?);
+                    unsafe {
+                        use std::os::unix::process::CommandExt;
+                        command.pre_exec(move || {
+                            ssal::unix::cloexec_unexpected_fds()?;
+                            crate::guest::process::command::isolate_process_group(false)?;
+                            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0
+                                || libc::getppid() != parent
+                            {
+                                return Err(io::Error::other("Host audio bridge parent disappeared"));
+                            }
+                            Ok(())
+                        });
+                    }
+                    let mut child = command.spawn()?;
                     if let Some(stdout) = child.stdout.take() {
                         use std::io::{BufRead, BufReader};
                         let mut line = String::new();
@@ -2047,7 +2110,7 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
                             println!("Host audio bridge ready: {}", sock_path.display());
                         }
                     }
-                    _host_audio_bridge.0 = Some(child);
+                    boot_services.push(Service::from_child(child, log));
                 }
                 let hw_rdev_str = hwbinder_rdev.to_string();
                 let mut vaudio = Service::start(
@@ -2072,6 +2135,24 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
                     Some(GUEST_PROBE_CONTEXT),
                     &[],
                 )?);
+                for (exe, name, uid) in [
+                    ("/system/bin/mediametrics", "mediametrics", 1013),
+                    ("/system/bin/mediaextractor", "mediaextractor", 1040),
+                    ("/apex/com.android.media.swcodec/bin/mediaswcodec", "mediaswcodec", 1046),
+                    ("/system/bin/mediaserver64", "mediaserver", 1013),
+                ] {
+                    if root.join(exe.trim_start_matches('/')).is_file() {
+                        boot_services.push(Service::start(
+                            root,
+                            exe,
+                            &[],
+                            name,
+                            uid,
+                            Some(GUEST_PROBE_CONTEXT),
+                            &[],
+                        )?);
+                    }
+                }
             }
         }
         if installd_probe {
@@ -2776,69 +2857,120 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
     }
 }
 
-fn start_lmkd(root: &Path) -> io::Result<Service> {
+struct SocketServiceSpec<'a> {
+    exe: &'a str,
+    log_name: &'a str,
+    uid: u32,
+    exec_context: Option<&'a [u8]>,
+    ld_preload: bool,
+    domain: &'a str,
+    socket_type_name: &'a str,
+    env_var: &'a str,
+    sock_rel: &'a str,
+    sock_kind: libc::c_int,
+    passcred: bool,
+    sock_uid: u32,
+    sock_gid: u32,
+    sock_mode: u32,
+    ready_text: Option<&'a str>,
+}
+
+fn start_socket_service(root: &Path, spec: SocketServiceSpec<'_>) -> io::Result<Service> {
     use std::os::fd::{FromRawFd, OwnedFd};
 
     let contexts = ssal::guest_policy::runtime::load(root)?
         .map(|plan| -> io::Result<_> {
             Ok((
-                plan.context("lmkd", true)?,
-                plan.context("lmkd_socket", false)?,
+                plan.context(spec.domain, true)?,
+                plan.context(spec.socket_type_name, false)?,
             ))
         })
         .transpose()?;
 
-    let raw = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0) };
+    let log = root.join("run/ssal").join(spec.log_name);
+    File::create(&log)?;
+    // Snapshot inherited_fds inside command() before opening the service socket
+    // so close_inherited_fds() in pre_exec does not close it.
+    let mut cmd = command(root, spec.exe, spec.uid, spec.exec_context)?;
+
+    if let Some((sock_ctx, file_ctx)) = &contexts {
+        fs::write("/proc/thread-self/attr/sockcreate", format!("{sock_ctx}\0"))?;
+        fs::write("/proc/thread-self/attr/fscreate", format!("{file_ctx}\0"))?;
+    }
+    let raw = unsafe { libc::socket(libc::AF_UNIX, spec.sock_kind | libc::SOCK_CLOEXEC, 0) };
     if raw < 0 {
-        return Err(io::Error::last_os_error());
+        let err = io::Error::last_os_error();
+        if contexts.is_some() {
+            let _ = fs::write("/proc/thread-self/attr/sockcreate", b"\0");
+            let _ = fs::write("/proc/thread-self/attr/fscreate", b"\0");
+        }
+        return Err(err);
     }
     let socket = unsafe { OwnedFd::from_raw_fd(raw) };
     let fd = socket.as_raw_fd();
 
-    let log = root.join("run/ssal/lmkd.log");
-    File::create(&log)?;
-    let mut cmd = command(root, "/run/ssal/ssal-lmkd", 0, None)?;
-    cmd.env("ANDROID_SOCKET_lmkd", fd.to_string())
+    if spec.passcred {
+        let enable: libc::c_int = 1;
+        let rc = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_PASSCRED,
+                (&raw const enable).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if rc != 0 {
+            let err = io::Error::last_os_error();
+            if contexts.is_some() {
+                let _ = fs::write("/proc/thread-self/attr/sockcreate", b"\0");
+                let _ = fs::write("/proc/thread-self/attr/fscreate", b"\0");
+            }
+            return Err(err);
+        }
+    }
+
+    let guest_sock_path = root.join(spec.sock_rel);
+    let sock_cpath = std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(
+        guest_sock_path.as_os_str(),
+    ))
+    .map_err(io::Error::other)?;
+    let bytes = sock_cpath.to_bytes_with_nul();
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    if bytes.len() > addr.sun_path.len() {
+        return Err(io::Error::other("Guest socket path exceeds sockaddr_un limit"));
+    }
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (dst, &src) in addr.sun_path.iter_mut().zip(bytes.iter()) {
+        *dst = src as libc::c_char;
+    }
+    let addr_len = (std::mem::size_of::<libc::sa_family_t>() + bytes.len()) as libc::socklen_t;
+
+    let bind_rc = unsafe {
+        let _ = libc::unlink(sock_cpath.as_ptr());
+        libc::bind(fd, (&raw const addr).cast(), addr_len)
+    };
+    if contexts.is_some() {
+        fs::write("/proc/thread-self/attr/sockcreate", b"\0")?;
+        fs::write("/proc/thread-self/attr/fscreate", b"\0")?;
+    }
+    if bind_rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe { libc::chown(sock_cpath.as_ptr(), spec.sock_uid, spec.sock_gid) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    fs::set_permissions(&guest_sock_path, fs::Permissions::from_mode(spec.sock_mode))?;
+
+    if spec.ld_preload {
+        cmd.env("LD_PRELOAD", "/run/ssal/ssal-phase2-log.so");
+    }
+    cmd.env(spec.env_var, fd.to_string())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
     unsafe {
         cmd.pre_exec(move || {
-            if let Some((sock_ctx, file_ctx)) = &contexts {
-                fs::write("/proc/thread-self/attr/sockcreate", format!("{sock_ctx}\0"))?;
-                fs::write("/proc/thread-self/attr/fscreate", format!("{file_ctx}\0"))?;
-            }
-            let bound = libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0);
-            if bound < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            let bound_guard = OwnedFd::from_raw_fd(bound);
-            let sock_path = c"/dev/socket/lmkd";
-            let _ = libc::unlink(sock_path.as_ptr());
-            let mut addr: libc::sockaddr_un = std::mem::zeroed();
-            addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
-            let bytes = sock_path.to_bytes_with_nul();
-            for (dst, &src) in addr.sun_path.iter_mut().zip(bytes.iter()) {
-                *dst = src as libc::c_char;
-            }
-            let addr_len = (std::mem::size_of::<libc::sa_family_t>() + bytes.len()) as libc::socklen_t;
-            let bind_rc = libc::bind(bound_guard.as_raw_fd(), (&raw const addr).cast(), addr_len);
-            if contexts.is_some() {
-                fs::write("/proc/thread-self/attr/sockcreate", b"\0")?;
-                fs::write("/proc/thread-self/attr/fscreate", b"\0")?;
-            }
-            if bind_rc != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            if libc::chown(sock_path.as_ptr(), 0, 1000) != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            fs::set_permissions(Path::new("/dev/socket/lmkd"), fs::Permissions::from_mode(0o660))?;
-            if bound_guard.as_raw_fd() == fd {
-                std::mem::forget(bound_guard);
-            } else if libc::dup2(bound_guard.as_raw_fd(), fd) < 0 {
-                return Err(io::Error::last_os_error());
-            }
             if libc::fcntl(fd, libc::F_SETFD, 0) != 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -2848,10 +2980,13 @@ fn start_lmkd(root: &Path) -> io::Result<Service> {
 
     let mut service = Service::from_child(cmd.spawn()?, log);
     drop(socket);
-    service.output.push(crate::diagnostics::zygote::Stream::new(
-        service.child.stdout.take().unwrap(),
-        File::options().append(true).open(&service.log)?,
-    )?);
+    service.output.push(
+        crate::diagnostics::zygote::Stream::new(
+            service.child.stdout.take().unwrap(),
+            File::options().append(true).open(&service.log)?,
+        )?
+        .with_session_log(),
+    );
     service.output.push(
         crate::diagnostics::zygote::Stream::new(
             service.child.stderr.take().unwrap(),
@@ -2859,8 +2994,56 @@ fn start_lmkd(root: &Path) -> io::Result<Service> {
         )?
         .with_session_log(),
     );
-    service.wait_text("guest_lmkd_ready=1")?;
+    if let Some(ready) = spec.ready_text {
+        service.wait_text(ready)?;
+    }
     Ok(service)
+}
+
+fn start_lmkd(root: &Path) -> io::Result<Service> {
+    start_socket_service(
+        root,
+        SocketServiceSpec {
+            exe: "/run/ssal/ssal-lmkd",
+            log_name: "lmkd.log",
+            uid: 0,
+            exec_context: None,
+            ld_preload: false,
+            domain: "lmkd",
+            socket_type_name: "lmkd_socket",
+            env_var: "ANDROID_SOCKET_lmkd",
+            sock_rel: "dev/socket/lmkd",
+            sock_kind: libc::SOCK_SEQPACKET,
+            passcred: false,
+            sock_uid: 0,
+            sock_gid: 1000,
+            sock_mode: 0o660,
+            ready_text: Some("guest_lmkd_ready=1"),
+        },
+    )
+}
+
+fn start_statsd(root: &Path) -> io::Result<Service> {
+    start_socket_service(
+        root,
+        SocketServiceSpec {
+            exe: "/apex/com.android.os.statsd/bin/statsd",
+            log_name: "statsd.log",
+            uid: 1066,
+            exec_context: Some(GUEST_PROBE_CONTEXT),
+            ld_preload: true,
+            domain: "statsd",
+            socket_type_name: "statsdw_socket",
+            env_var: "ANDROID_SOCKET_statsdw",
+            sock_rel: "dev/socket/statsdw",
+            sock_kind: libc::SOCK_DGRAM,
+            passcred: true,
+            sock_uid: 1066,
+            sock_gid: 1066,
+            sock_mode: 0o222,
+            ready_text: None,
+        },
+    )
 }
 
 #[cfg(test)]

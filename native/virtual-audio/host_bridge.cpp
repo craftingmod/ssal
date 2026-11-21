@@ -1,6 +1,7 @@
 // Host AAudio bridge for Guest ssal-virtual-audio.
 #include <aaudio/AAudio.h>
 #include <errno.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -34,6 +35,7 @@ struct AudioHeader {
 };
 
 int main(int argc, char** argv) {
+    signal(SIGPIPE, SIG_IGN);
     if (argc != 3 || strcmp(argv[1], "serve") != 0) {
         fprintf(stderr, "usage: ssal-audio-host serve <unix-socket-path>\n");
         return 2;
@@ -107,7 +109,12 @@ int main(int argc, char** argv) {
         if (AAudioStream_getSampleRate(stream) != static_cast<int32_t>(hdr.sampleRateHz) ||
             AAudioStream_getChannelCount(stream) != static_cast<int32_t>(hdr.channelCount) ||
             AAudioStream_getFormat(stream) != (hdr.bytesPerSample == 4 ? AAUDIO_FORMAT_PCM_FLOAT : AAUDIO_FORMAT_PCM_I16)) {
-            fprintf(stderr, "ssal-audio-host: negotiated PCM configuration mismatch\n");
+            fprintf(stderr,
+                    "ssal-audio-host: negotiated PCM configuration mismatch "
+                    "(req rate=%u ch=%u bps=%u, got rate=%d ch=%d fmt=%d)\n",
+                    hdr.sampleRateHz, hdr.channelCount, hdr.bytesPerSample,
+                    AAudioStream_getSampleRate(stream), AAudioStream_getChannelCount(stream),
+                    AAudioStream_getFormat(stream));
             AAudioStream_close(stream);
             close(client);
             continue;

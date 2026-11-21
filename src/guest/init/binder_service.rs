@@ -31,6 +31,13 @@ pub(crate) const NETD: BinderService = BinderService {
     exec_type: "netd_exec",
 };
 
+pub(crate) const BLUETOOTH_MANAGER: BinderService = BinderService {
+    name: "bluetooth_manager",
+    executable: "/run/ssal/ssal-bluetooth-manager",
+    domain: "ssal_bluetooth_manager",
+    exec_type: "ssal_bluetooth_manager_exec",
+};
+
 impl BinderService {
     pub fn install(&self, mounts: &mut Mounts, root: &Path, bin: &Path) -> io::Result<()> {
         let plan = ssal::guest_policy::runtime::load(root)?.ok_or_else(|| {

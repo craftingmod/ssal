@@ -13,7 +13,7 @@ pub mod native;
 pub mod runtime;
 mod symbols;
 
-const VERSION: u32 = 69;
+const VERSION: u32 = 75;
 
 type Names = BTreeMap<String, String>;
 
@@ -716,6 +716,7 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
         "properties_serial",
         "property_socket",
         "lmkd_socket",
+        "statsdw_socket",
     ] {
         plan.shared_types.remove(private);
     }
@@ -1282,6 +1283,8 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
         "vold",
         "netd",
         "lmkd",
+        "storaged",
+        "statsd",
         "audioserver",
         "gatekeeperd",
         "keystore",
@@ -1294,6 +1297,9 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
         "hal_graphics_composer_default",
         "hal_graphics_allocator_default",
         "mediaswcodec",
+        "mediaserver",
+        "mediaextractor",
+        "mediametrics",
         "bootanim",
     ] {
         if let Some(domain) = plan.types.get(original) {
@@ -1328,7 +1334,12 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
             }
         }
     }
-    for domain_name in ["system_server", "servicemanager", "hwservicemanager"] {
+    for domain_name in [
+        "system_server",
+        "servicemanager",
+        "hwservicemanager",
+        "audioserver",
+    ] {
         if let Some(domain) = plan.types.get(domain_name) {
             for (target, class, permissions) in [
                 ("vendor_file", "dir", &["search", "getattr"][..]),
@@ -1522,7 +1533,14 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
         );
         plan.rules.insert(rule);
     }
-    for exec_name in ["vold_exec", "netd_exec", "lmkd_exec", "lmkd_socket", "audioserver_exec"] {
+    for exec_name in [
+        "vold_exec",
+        "netd_exec",
+        "lmkd_exec",
+        "lmkd_socket",
+        "statsdw_socket",
+        "audioserver_exec",
+    ] {
         if let Some(exec_type) = plan.types.get(exec_name) {
             let rule = format!("allow {exec_type} tmpfs filesystem {{ associate }}");
             if plan.rules.insert(rule.clone()) {
@@ -1558,6 +1576,20 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
             let rule = format!("allow {audioserver} {target} {class} {{ {perm} }}");
             if plan.rules.insert(rule.clone()) {
                 native::record(&mut native_rules, rule, 1, 1, &[audioserver, target, class, perm]);
+            }
+        }
+        if let Some(system_file) = plan.types.get("system_file") {
+            for perm in ["write", "getattr"] {
+                let rule = format!("allow {audioserver} {system_file} sock_file {{ {perm} }}");
+                if plan.rules.insert(rule.clone()) {
+                    native::record(
+                        &mut native_rules,
+                        rule,
+                        1,
+                        1,
+                        &[audioserver, system_file, "sock_file", perm],
+                    );
+                }
             }
         }
     }
@@ -1676,6 +1708,8 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
     concurrent::add_keymint_rules(&mut plan, &mut native_rules)?;
     concurrent::add_thermal_rules(&mut plan, &mut native_rules)?;
     concurrent::add_sensors_rules(&mut plan, &mut native_rules)?;
+    concurrent::add_vibrator_rules(&mut plan, &mut native_rules)?;
+    concurrent::add_bluetooth_manager_rules(&mut plan, &mut native_rules)?;
     plan.native_rules = native_rules;
     // Partial offline fixtures remain supported; mounted preparation requires these types.
     if ["init", "socket_device", "property_socket"]

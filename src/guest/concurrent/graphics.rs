@@ -130,6 +130,7 @@ pub(in crate::guest) fn apply_surfaceflinger_graphics_access(
     apply_graphics_client_access(plan, "surfaceflinger")?;
     for domain in [
         "bootanim",
+        "mediaswcodec",
         "zygote",
         "system_server",
         "system_app",
@@ -243,6 +244,7 @@ pub(in crate::guest) fn install_vintf(
         (health, "ssal_keymint.xml", super::keymint::VINTF),
         (health, "ssal_thermal.xml", super::thermal::VINTF),
         (health, "ssal_sensors.xml", super::sensors::VINTF),
+        (health, "ssal_vibrator.xml", super::vibrator::VINTF),
     ] {
         if enabled {
             let fragment = staging.join(name);

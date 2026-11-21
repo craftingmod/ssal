@@ -44,6 +44,10 @@ fn on_transact(
     service.handle_transact(code, data, reply)
 }
 
+const VOLUME_TYPE_EMULATED: i32 = 2;
+const VOLUME_STATE_UNMOUNTED: i32 = 0;
+const VOLUME_STATE_MOUNTED: i32 = 2;
+
 struct GuestVold {
     listener: Mutex<Option<SIBinder>>,
 }
@@ -55,6 +59,58 @@ impl GuestVold {
         Self {
             listener: Mutex::new(None),
         }
+    }
+
+    fn emit_listener<F>(&self, tx_code: TransactionCode, build: F)
+    where
+        F: FnOnce(&mut Parcel),
+    {
+        let listener = self.listener.lock().unwrap().clone();
+        if let Some(listener) = listener {
+            if let Some(tr) = listener.__transport() {
+                if let Ok(mut req) = tr.prepare_request("android.os.IVoldListener") {
+                    build(&mut req);
+                    let _ = tr.submit_transact(tx_code, req, FLAG_ONEWAY);
+                }
+            }
+        }
+    }
+
+    fn emit_emulated_created(&self, user_id: i32) {
+        let vol_id = format!("emulated;{user_id}");
+        self.emit_listener(5, |req| {
+            let _ = req.write(&vol_id);
+            let _ = req.write(&VOLUME_TYPE_EMULATED);
+            let _ = req.write(&"");
+            let _ = req.write(&"");
+            let _ = req.write(&user_id);
+        });
+        eprintln!("guest_vold_emit=onVolumeCreated volId={vol_id} userId={user_id}");
+    }
+
+    fn emit_emulated_mounted(&self, vol_id: &str, user_id: i32) {
+        self.emit_listener(8, |req| {
+            let _ = req.write(&vol_id);
+            let _ = req.write(&"/storage/emulated");
+        });
+        self.emit_listener(9, |req| {
+            let _ = req.write(&vol_id);
+            let _ = req.write(&"/data/media");
+        });
+        self.emit_listener(6, |req| {
+            let _ = req.write(&vol_id);
+            let _ = req.write(&VOLUME_STATE_MOUNTED);
+            let _ = req.write(&user_id);
+        });
+        eprintln!("guest_vold_emit=onVolumeStateChanged volId={vol_id} state=MOUNTED userId={user_id}");
+    }
+
+    fn emit_emulated_unmounted(&self, vol_id: &str, user_id: i32) {
+        self.emit_listener(6, |req| {
+            let _ = req.write(&vol_id);
+            let _ = req.write(&VOLUME_STATE_UNMOUNTED);
+            let _ = req.write(&user_id);
+        });
     }
 }
 
@@ -78,16 +134,51 @@ impl IVold for GuestVold {
                 *self.listener.lock().unwrap() = listener;
                 reply.write(&Status::ok())?;
             }
-            2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 29 | 30 | 37 | 38 | 42 | 43 | 44
+            6 => {
+                // onUserAdded(int userId, int userSerial)
+                let user_id = data.read::<i32>().unwrap_or(0);
+                eprintln!("guest_vold_call=onUserAdded userId={user_id} pid={pid} uid={uid}");
+                reply.write(&Status::ok())?;
+            }
+            8 => {
+                // onUserStarted(int userId)
+                let user_id = data.read::<i32>().unwrap_or(0);
+                eprintln!("guest_vold_call=onUserStarted userId={user_id} pid={pid} uid={uid}");
+                reply.write(&Status::ok())?;
+                let vol_id = format!("emulated;{user_id}");
+                self.emit_emulated_created(user_id);
+                self.emit_emulated_mounted(&vol_id, user_id);
+            }
+            15 => {
+                // mount(String volId, int mountFlags, int mountUserId, IVoldMountCallback callback)
+                let vol_id = data
+                    .read::<String>()
+                    .unwrap_or_else(|_| "emulated;0".to_string());
+                let _mount_flags = data.read::<i32>().unwrap_or(0);
+                let mount_user_id = data.read::<i32>().unwrap_or(0);
+                eprintln!(
+                    "guest_vold_call=mount volId={vol_id} userId={mount_user_id} pid={pid} uid={uid}"
+                );
+                reply.write(&Status::ok())?;
+                self.emit_emulated_mounted(&vol_id, mount_user_id);
+            }
+            16 => {
+                // unmount(String volId)
+                let vol_id = data
+                    .read::<String>()
+                    .unwrap_or_else(|_| "emulated;0".to_string());
+                eprintln!("guest_vold_call=unmount volId={vol_id} pid={pid} uid={uid}");
+                reply.write(&Status::ok())?;
+                self.emit_emulated_unmounted(&vol_id, 0);
+            }
+            2 | 3 | 4 | 5 | 7 | 9 | 10 | 11 | 12 | 29 | 30 | 37 | 38 | 42 | 43 | 44
             | 47 | 48 | 49 | 66 => {
                 let name = match code {
                     2 => "abortFuse",
                     3 => "monitor",
                     4 => "reset",
                     5 => "shutdown",
-                    6 => "onUserAdded",
                     7 => "onUserRemoved",
-                    8 => "onUserStarted",
                     9 => "onUserStopped",
                     10 => "addAppIds",
                     11 => "addSandboxIds",

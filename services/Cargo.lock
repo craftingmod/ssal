@@ -1120,6 +1120,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ssal-bluetooth-manager"
+version = "0.1.0"
+dependencies = [
+ "rsbinder",
+ "ssal-binder-service",
+]
+
+[[package]]
 name = "ssal-gatekeeper"
 version = "0.1.0"
 dependencies = [
@@ -1194,6 +1202,18 @@ dependencies = [
 name = "ssal-thermal"
 version = "0.1.0"
 dependencies = [
+ "rsbinder",
+ "rsbinder-aidl",
+ "serde",
+ "serde_json",
+ "ssal-binder-service",
+]
+
+[[package]]
+name = "ssal-vibrator"
+version = "0.1.0"
+dependencies = [
+ "libc",
  "rsbinder",
  "rsbinder-aidl",
  "serde",

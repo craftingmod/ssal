@@ -259,7 +259,10 @@ public:
         if (code >= IBinder::FIRST_HIDL_TRANSACTION) {
             return handleIBase(code, data, reply, kChain, 3, cb);
         }
-        if (!data.enforceInterface(kChain[code <= 19 ? 1 : 0])) return ssal::BAD_TYPE;
+        if (!data.enforceInterface(kChain[code <= 19 ? 1 : 0])) {
+            fprintf(stderr, "guest_virtual_audio=stream_bad_type code=%u\n", code);
+            return ssal::BAD_TYPE;
+        }
         std::lock_guard<std::mutex> lock(mutex_);
         writeToParcel(Status::ok(), reply);
         switch (code) {
@@ -292,15 +295,22 @@ public:
             case 23: { // prepareForWriting(frameSize, framesCount)
                 uint32_t frameSize = 0, framesCount = 0;
                 if (data.readUint32(&frameSize) != OK || data.readUint32(&framesCount) != OK) {
+                    fprintf(stderr, "guest_virtual_audio=prepareForWriting_read_failed\n");
                     return ssal::BAD_VALUE;
                 }
                 int32_t result = 0;
                 if (writer_) result = 4; // INVALID_STATE
-                else if (frameSize != params_.frameSize() || !framesCount ||
-                         framesCount > 1024 * 1024 / frameSize) result = 2; // INVALID_ARGUMENTS
-                else {
+                else if ((frameSize != 1 && frameSize != params_.frameSize()) || !framesCount ||
+                         framesCount > 1024 * 1024 / frameSize ||
+                         (static_cast<uint64_t>(frameSize) * framesCount) % params_.frameSize() != 0) {
+                    result = 2; // INVALID_ARGUMENTS
+                } else {
                     writer_ = std::make_unique<Writer>(params_, frameSize * framesCount);
                     if (!writer_->start()) { writer_.reset(); result = 4; }
+                }
+                if (result != 0) {
+                    fprintf(stderr, "guest_virtual_audio=prepareForWriting_err result=%d frameSize=%u expected=%llu framesCount=%u\n",
+                            result, frameSize, static_cast<unsigned long long>(params_.frameSize()), framesCount);
                 }
                 reply->writeInt32(result);
                 if (result == 0) {
@@ -336,6 +346,7 @@ public:
                 rc = reply->writeBool(false);
                 break;
             default:
+                fprintf(stderr, "guest_virtual_audio=stream_unhandled_tx code=%u\n", code);
                 rc = reply->writeInt32(0 /* Result::OK */);
                 break;
         }
@@ -487,7 +498,12 @@ public:
                 if (spParams.sampleRateHz < 8000 || spParams.sampleRateHz > 192000 ||
                     (spParams.format != "AUDIO_FORMAT_PCM_16_BIT" && spParams.format != "AUDIO_FORMAT_PCM_FLOAT") ||
                     (spParams.channelMask != "AUDIO_CHANNEL_OUT_MONO" && spParams.channelMask != "AUDIO_CHANNEL_OUT_STEREO") ||
-                    spParams.frameCount > 1024 * 1024 / spParams.frameSize()) return ssal::BAD_VALUE;
+                    spParams.frameCount > 1024 * 1024 / spParams.frameSize()) {
+                    StreamParams suggested;
+                    reply->writeInt32(2 /* INVALID_ARGUMENTS */);
+                    reply->writeStrongBinder(nullptr);
+                    return writeAudioConfig(reply, suggested, cb);
+                }
                 fprintf(stderr, "guest_virtual_audio=openOutputStream rate=%u fmt=%s ch=%s frames=%llu\n",
                         spParams.sampleRateHz, spParams.format.c_str(), spParams.channelMask.c_str(),
                         static_cast<unsigned long long>(spParams.frameCount));

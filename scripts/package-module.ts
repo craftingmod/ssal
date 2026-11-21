@@ -41,6 +41,8 @@ const entries: { name: string; path: string; mode: number }[] = [
     "ssal-thermal",
     "ssal-sensors",
     "ssal-sensor-host",
+    "ssal-vibrator",
+    "ssal-bluetooth-manager",
     "ssal-hwbinder-probe.sh",
     "ssal-apexservice",
     "ssal-system-suspend",

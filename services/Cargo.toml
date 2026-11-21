@@ -1,3 +1,3 @@
 [workspace]
-members = ["apexservice", "binder-service", "gatekeeper", "health", "keymint", "netd", "sensors", "system-suspend", "thermal", "virtual-composer", "vold"]
+members = ["apexservice", "binder-service", "bluetooth-manager", "gatekeeper", "health", "keymint", "netd", "sensors", "system-suspend", "thermal", "vibrator", "virtual-composer", "vold"]
 resolver = "2"

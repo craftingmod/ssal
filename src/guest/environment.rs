@@ -249,10 +249,13 @@ pub(crate) fn start_property_service(
         command.env("LD_PRELOAD", "/run/ssal/ssal-context-map.so");
     }
     let mut service = Service::from_child(command.spawn()?, log);
-    service.output.push(crate::diagnostics::zygote::Stream::new(
-        service.child.stdout.take().unwrap(),
-        File::options().append(true).open(&service.log)?,
-    )?);
+    service.output.push(
+        crate::diagnostics::zygote::Stream::new(
+            service.child.stdout.take().unwrap(),
+            File::options().append(true).open(&service.log)?,
+        )?
+        .with_session_log(),
+    );
     service.output.push(
         crate::diagnostics::zygote::Stream::new(
             service.child.stderr.take().unwrap(),

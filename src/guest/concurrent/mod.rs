@@ -10,3 +10,4 @@ pub(in crate::guest) mod sensors;
 pub(crate) mod service_contract;
 pub(in crate::guest) mod system_suspend;
 pub(in crate::guest) mod thermal;
+pub(in crate::guest) mod vibrator;

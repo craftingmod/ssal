@@ -236,10 +236,13 @@ impl Service {
         }
         if !diagnostic {
             // The parent writes logs; Guest daemons need not write a system_file.
-            service.output.push(crate::diagnostics::zygote::Stream::new(
-                service.child.stdout.take().unwrap(),
-                File::options().append(true).open(&service.log)?,
-            )?);
+            service.output.push(
+                crate::diagnostics::zygote::Stream::new(
+                    service.child.stdout.take().unwrap(),
+                    File::options().append(true).open(&service.log)?,
+                )?
+                .with_session_log(),
+            );
             service.output.push(
                 crate::diagnostics::zygote::Stream::new(
                     service.child.stderr.take().unwrap(),

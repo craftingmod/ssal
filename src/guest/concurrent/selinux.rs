@@ -197,7 +197,7 @@ pub(super) fn add_health_rules(
         "ssal_health",
         "ssal_health_exec",
         &["hal_health_service"],
-        &["system_server"],
+        &["system_server", "storaged"],
     )
 }
 
@@ -312,4 +312,52 @@ pub(super) fn add_sensors_rules(
         }
     }
     Ok(())
+}
+
+pub(super) fn add_vibrator_rules(
+    plan: &mut Plan,
+    native_rules: &mut BTreeMap<String, Vec<native::PolicyCommand>>,
+) -> std::io::Result<()> {
+    add_private_hal_rules(
+        plan,
+        native_rules,
+        "ssal_vibrator",
+        "ssal_vibrator_exec",
+        &["hal_vibrator_service"],
+        &["system_server"],
+    )?;
+    if let Some(domain) = plan.types.get("ssal_vibrator").cloned() {
+        let rule = format!("allow {domain} ksu unix_stream_socket {{ read write shutdown }}");
+        for permission in ["read", "write", "shutdown"] {
+            native::record(
+                native_rules,
+                rule.clone(),
+                1,
+                1,
+                &[&domain, "ksu", "unix_stream_socket", permission],
+            );
+        }
+        plan.rules.insert(rule);
+    }
+    Ok(())
+}
+
+pub(super) fn add_bluetooth_manager_rules(
+    plan: &mut Plan,
+    native_rules: &mut BTreeMap<String, Vec<native::PolicyCommand>>,
+) -> std::io::Result<()> {
+    add_private_hal_rules(
+        plan,
+        native_rules,
+        "ssal_bluetooth_manager",
+        "ssal_bluetooth_manager_exec",
+        &["bluetooth_manager_service"],
+        &[
+            "system_server",
+            "system_app",
+            "platform_app",
+            "priv_app",
+            "untrusted_app",
+        ],
+    )
 }
