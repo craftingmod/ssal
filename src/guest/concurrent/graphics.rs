@@ -136,6 +136,9 @@ pub(in crate::guest) fn apply_surfaceflinger_graphics_access(
         "system_app",
         "platform_app",
         "priv_app",
+        "mediaprovider",
+        "mediaprovider_app",
+        "permissioncontroller_app",
         "untrusted_app",
     ] {
         if plan.types.contains_key(domain) {
@@ -353,6 +356,9 @@ pub(in crate::guest) fn apply_virtual_composer_access(
         "system_app",
         "platform_app",
         "priv_app",
+        "mediaprovider",
+        "mediaprovider_app",
+        "permissioncontroller_app",
         "untrusted_app",
     ] {
         let Some(client_type) = plan.types.get(client) else {
@@ -443,6 +449,9 @@ pub(in crate::guest) fn apply_graphics_allocator_access(
         "system_app",
         "platform_app",
         "priv_app",
+        "mediaprovider",
+        "mediaprovider_app",
+        "permissioncontroller_app",
         "untrusted_app",
     ]
     .into_iter()

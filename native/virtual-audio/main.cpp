@@ -305,7 +305,8 @@ public:
                          (static_cast<uint64_t>(frameSize) * framesCount) % params_.frameSize() != 0) {
                     result = 2; // INVALID_ARGUMENTS
                 } else {
-                    writer_ = std::make_unique<Writer>(params_, frameSize * framesCount);
+                    writer_ = std::make_unique<Writer>(
+                        params_, frameSize * framesCount, &totalFrames_, &lastWriteNs_);
                     if (!writer_->start()) { writer_.reset(); result = 4; }
                 }
                 if (result != 0) {
@@ -324,20 +325,30 @@ public:
                 if (rc == OK && cb) cb(*reply);
                 return rc;
             }
-            case 24: // getRenderPosition
+            case 24: { // getRenderPosition
                 reply->writeInt32(0);
-                rc = reply->writeUint32(0);
+                uint64_t frames = totalFrames_.load(std::memory_order_acquire);
+                rc = reply->writeUint32(static_cast<uint32_t>(frames));
                 break;
+            }
             case 25: // getNextWriteTimestamp
                 reply->writeInt32(5 /* NOT_SUPPORTED */);
                 rc = reply->writeInt64(0);
                 break;
-            case 35: // getPresentationPosition (Host DAC position is not available)
-                reply->writeInt32(5);
-                reply->writeUint64(0);
-                reply->writeUint64(0);
-                rc = reply->writeUint64(0);
+            case 35: { // getPresentationPosition
+                uint64_t frames = totalFrames_.load(std::memory_order_acquire);
+                int64_t ns = lastWriteNs_.load(std::memory_order_acquire);
+                if (ns <= 0) {
+                    timespec ts{};
+                    clock_gettime(CLOCK_MONOTONIC, &ts);
+                    ns = static_cast<int64_t>(ts.tv_sec) * 1000000000LL + ts.tv_nsec;
+                }
+                reply->writeInt32(0 /* Result::OK */);
+                reply->writeUint64(frames);
+                reply->writeUint64(static_cast<uint64_t>(ns / 1000000000LL));
+                rc = reply->writeUint64(static_cast<uint64_t>(ns % 1000000000LL));
                 break;
+            }
             case 29: // supportsPauseAndResume
                 reply->writeBool(true);
                 rc = reply->writeBool(true);
@@ -362,12 +373,21 @@ private:
         std::atomic<int32_t> tid{0};
         std::atomic<bool> stopped{false};
         int hostFd;
+        uint64_t frameBytes;
+        std::atomic<uint64_t>* totalFrames;
+        std::atomic<int64_t>* lastWriteNs;
         pthread_t thread{};
         bool running = false;
         std::mutex socketMutex;
-        explicit Writer(const StreamParams& params, size_t bytes)
-            : data(bytes, 1, true), hostFd(connectHostAudioBridge(
-                params.sampleRateHz, params.channelCount, params.bytesPerSample)) {}
+        explicit Writer(const StreamParams& params, size_t bytes,
+                        std::atomic<uint64_t>* framesOut,
+                        std::atomic<int64_t>* writeNsOut)
+            : data(bytes, 1, true),
+              hostFd(connectHostAudioBridge(
+                  params.sampleRateHz, params.channelCount, params.bytesPerSample)),
+              frameBytes(params.frameSize()),
+              totalFrames(framesOut),
+              lastWriteNs(writeNsOut) {}
         bool start() {
             if (!command.valid() || !data.valid() || !status.valid()) return false;
             int rc = pthread_create(&thread, nullptr, [](void* raw) -> void* {
@@ -407,10 +427,31 @@ private:
                     std::lock_guard<std::mutex> lock(socketMutex);
                     uint32_t length = static_cast<uint32_t>(size);
                     if (hostFd >= 0 && writeExact(hostFd, &length, sizeof(length)) &&
-                        writeExact(hostFd, pcm.data(), size)) response.value = size;
-                    else response.result = 4; // INVALID_STATE
+                        writeExact(hostFd, pcm.data(), size)) {
+                        response.value = size;
+                        if (frameBytes > 0) {
+                            totalFrames->fetch_add(size / frameBytes, std::memory_order_release);
+                        }
+                        timespec ts{};
+                        clock_gettime(CLOCK_MONOTONIC, &ts);
+                        lastWriteNs->store(
+                            static_cast<int64_t>(ts.tv_sec) * 1000000000LL + ts.tv_nsec,
+                            std::memory_order_release);
+                    } else {
+                        response.result = 4; // INVALID_STATE
+                    }
+                } else if (op == 1) { // GET_PRESENTATION_POSITION
+                    response.value = totalFrames->load(std::memory_order_acquire);
+                    int64_t ns = lastWriteNs->load(std::memory_order_acquire);
+                    if (ns <= 0) {
+                        timespec ts{};
+                        clock_gettime(CLOCK_MONOTONIC, &ts);
+                        ns = static_cast<int64_t>(ts.tv_sec) * 1000000000LL + ts.tv_nsec;
+                    }
+                    response.seconds = ns / 1000000000LL;
+                    response.nanos = ns % 1000000000LL;
                 } else if (op == 2) response.value = 20; // GET_LATENCY, milliseconds
-                else response.result = 5; // NOT_SUPPORTED (including Host presentation position)
+                else response.result = 5; // NOT_SUPPORTED
                 if (!status.write(&response, sizeof(response))) break;
                 data.wake(2); // audio MessageQueueFlagBits::NOT_FULL
             }
@@ -419,6 +460,8 @@ private:
     void stopWriter() { writer_.reset(); }
     StreamParams params_;
     std::unique_ptr<Writer> writer_;
+    std::atomic<uint64_t> totalFrames_{0};
+    std::atomic<int64_t> lastWriteNs_{0};
     std::mutex mutex_;
 };
 

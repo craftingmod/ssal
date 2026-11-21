@@ -409,8 +409,8 @@ pub(super) fn verify(
                 root.join(format!("mnt/runtime/{view}/self/primary")),
             )?;
         }
-        owned_directory(&root.join("data"), "media", 0o770, 1023, 1023)?;
-        owned_directory(&root.join("data"), "media/0", 0o770, 1023, 1023)?;
+        owned_directory(&root.join("data"), "media", 0o2770, 1023, 1015)?;
+        owned_directory(&root.join("data"), "media/0", 0o2770, 1023, 1015)?;
         for (path, mode, uid, gid) in [
             ("anr", 0o775, 1000, 1000),
             ("misc", 0o1771, 1000, 9998),

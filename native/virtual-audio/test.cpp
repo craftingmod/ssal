@@ -89,7 +89,7 @@ int main() {
             response.readPtr().fetch_add(sizeof(actual), std::memory_order_release);
             assert(actual.replyTo == op);
             if (op == 2) assert(actual.result == 0 && actual.value == 20);
-            else if (op == 1) assert(actual.result == 5);
+            else if (op == 1) assert(actual.result == 0 && actual.seconds > 0);
             else assert(actual.result == 4); // No Host bridge in this unit test.
         }
         Parcel close, closed;
