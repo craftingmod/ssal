@@ -671,7 +671,7 @@ impl IComposer for VirtualComposer {
     }
 
     fn r#getCapabilities(&self) -> BinderResult<Vec<Capability>> {
-        Ok(Vec::new())
+        Ok(vec![Capability::PRESENT_FENCE_IS_NOT_RELIABLE])
     }
 }
 
