@@ -13,7 +13,7 @@ pub mod native;
 pub mod runtime;
 mod symbols;
 
-const VERSION: u32 = 67;
+const VERSION: u32 = 69;
 
 type Names = BTreeMap<String, String>;
 
@@ -1328,28 +1328,29 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
             }
         }
     }
-    if let Some(system_server_domain) = plan.types.get("system_server") {
-        for (target, class, permissions) in [
-            ("vendor_file", "dir", &["search", "getattr"][..]),
-            (
-                "vendor_configs_file",
-                "dir",
-                &["read", "open", "search", "getattr"][..],
-            ),
-            ("vendor_configs_file", "file", &["read", "open", "getattr"][..]),
-            ("vendor_configs_file", "lnk_file", &["read", "getattr"][..]),
-        ] {
-            for permission in permissions {
-                let rule =
-                    format!("allow {system_server_domain} {target} {class} {{ {permission} }}");
-                native::record(
-                    &mut native_rules,
-                    rule.clone(),
-                    1,
-                    1,
-                    &[system_server_domain, target, class, permission],
-                );
-                plan.rules.insert(rule);
+    for domain_name in ["system_server", "servicemanager", "hwservicemanager"] {
+        if let Some(domain) = plan.types.get(domain_name) {
+            for (target, class, permissions) in [
+                ("vendor_file", "dir", &["search", "getattr"][..]),
+                (
+                    "vendor_configs_file",
+                    "dir",
+                    &["read", "open", "search", "getattr"][..],
+                ),
+                ("vendor_configs_file", "file", &["read", "open", "getattr"][..]),
+                ("vendor_configs_file", "lnk_file", &["read", "getattr"][..]),
+            ] {
+                for permission in permissions {
+                    let rule = format!("allow {domain} {target} {class} {{ {permission} }}");
+                    native::record(
+                        &mut native_rules,
+                        rule.clone(),
+                        1,
+                        1,
+                        &[domain, target, class, permission],
+                    );
+                    plan.rules.insert(rule);
+                }
             }
         }
     }
@@ -1673,6 +1674,8 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
     concurrent::add_health_rules(&mut plan, &mut native_rules)?;
     concurrent::add_gatekeeper_rules(&mut plan, &mut native_rules)?;
     concurrent::add_keymint_rules(&mut plan, &mut native_rules)?;
+    concurrent::add_thermal_rules(&mut plan, &mut native_rules)?;
+    concurrent::add_sensors_rules(&mut plan, &mut native_rules)?;
     plan.native_rules = native_rules;
     // Partial offline fixtures remain supported; mounted preparation requires these types.
     if ["init", "socket_device", "property_socket"]

@@ -57,6 +57,10 @@ fn property_service_definitions(
             .join("apex/com.android.media.swcodec/bin/mediaswcodec")
             .is_file()
     {
+        let autostart = std::env::args_os().nth(1).as_deref()
+            == Some(std::ffi::OsStr::new("--guest-start-worker"))
+            && crate::guest::system_server_enabled()
+            && !crate::guest::disabled("MEDIASWCODEC");
         services.push(ssal::guest_properties::ServiceDefinition {
             name: "mediaswcodec".into(),
             executable: "/apex/com.android.media.swcodec/bin/mediaswcodec".into(),
@@ -72,7 +76,7 @@ fn property_service_definitions(
             domain: "mediaswcodec".into(),
             oneshot: Some(false),
             restart_period: Some(5),
-            autostart: false,
+            autostart,
         });
     }
     services
@@ -127,12 +131,15 @@ pub(crate) fn start_property_service(
         "ro.zygote.disable_gl_preload=1",
         "service.adb.tcp.port=5555",
         "ro.adb.secure=0",
+        "ro.radio.noril=yes",
+        "config.disable_cameraservice=true",
     ];
     if crate::guest::concurrent::graphics::requested() {
         build_props.extend([
             "qemu.hw.mainkeys=0",
             "ro.hardware.egl=adreno",
             "ro.board.platform=taro",
+            "ro.boot.product.vendor.sku=taro",
             "ro.sf.lcd_density=320",
             "ro.vndk.version=32",
             "ro.board.api_level=31",
@@ -179,6 +186,13 @@ pub(crate) fn start_property_service(
                 fs::write(runtime.join(&name), text)?;
                 paths.push(format!("/run/ssal/{name}"));
             }
+        }
+        if let Ok(exported_prop) = plan.context("exported_default_prop", false) {
+            fs::write(
+                runtime.join("vendor_gralloc_property_contexts"),
+                format!("vendor.gralloc. {exported_prop}\n"),
+            )?;
+            paths.push("/run/ssal/vendor_gralloc_property_contexts".to_owned());
         }
         config["property_contexts"] = serde_json::to_value(paths)?;
         config["selinux_types"] = serde_json::to_value(&plan.types)?;

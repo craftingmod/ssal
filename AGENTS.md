@@ -27,6 +27,7 @@ vendor, node_modules has huge codebase so don't read unless explicit request.
 - Preserve existing Host policy. Do not remove, overwrite, weaken, or disable existing Host SELinux rules, types, or security constraints.
 - Do not reject Guest SELinux domain creation merely because it requires adding rules to the shared kernel policy.
 - Since KernelSU cannot remove dynamically added SELinux policies, modify or reuse existing Guest policies instead of attempting to delete and recreate them.
+- When modifying Guest SELinux policy generation, bump `VERSION` in `src/guest/selinux/mod.rs` so cached `plan.json` files are regenerated.
 
 ## Security
 Guest processes MUST NOT access Host:

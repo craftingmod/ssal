@@ -241,6 +241,8 @@ pub(in crate::guest) fn install_vintf(
         (health, "ssal_health.xml", super::health::VINTF),
         (health, "ssal_gatekeeper.xml", super::gatekeeper::VINTF),
         (health, "ssal_keymint.xml", super::keymint::VINTF),
+        (health, "ssal_thermal.xml", super::thermal::VINTF),
+        (health, "ssal_sensors.xml", super::sensors::VINTF),
     ] {
         if enabled {
             let fragment = staging.join(name);

@@ -252,3 +252,64 @@ pub(super) fn add_system_suspend_rules(
         plan.rules.insert(rule);
     }
 }
+
+pub(super) fn add_thermal_rules(
+    plan: &mut Plan,
+    native_rules: &mut BTreeMap<String, Vec<native::PolicyCommand>>,
+) -> std::io::Result<()> {
+    add_private_hal_rules(
+        plan,
+        native_rules,
+        "ssal_thermal",
+        "ssal_thermal_exec",
+        &["hal_thermal_service"],
+        &["system_server"],
+    )
+}
+
+pub(super) fn add_sensors_rules(
+    plan: &mut Plan,
+    native_rules: &mut BTreeMap<String, Vec<native::PolicyCommand>>,
+) -> std::io::Result<()> {
+    add_private_hal_rules(
+        plan,
+        native_rules,
+        "ssal_sensors",
+        "ssal_sensors_exec",
+        &["hal_sensors_service"],
+        &["system_server"],
+    )?;
+    if let Some(domain) = plan.types.get("ssal_sensors").cloned() {
+        let mut extra: Vec<(String, &'static str, &'static [&'static str])> = vec![
+            ("ksu".into(), "unix_stream_socket", &["read", "write", "shutdown"]),
+            ("tmpfs".into(), "file", &["read", "write", "map", "getattr"]),
+        ];
+        for (target, class, perms) in [
+            ("system_server", "fd", &["use"][..]),
+            ("system_server_tmpfs", "file", &["read", "write", "map", "getattr"]),
+            ("ashmem_device", "chr_file", &["read", "write", "map", "getattr"]),
+            ("ashmem_libcutils_device", "chr_file", &["read", "write", "map", "getattr"]),
+        ] {
+            if let Some(resolved) = plan.types.get(target).cloned() {
+                extra.push((resolved, class, perms));
+            }
+        }
+        for (target, class, permissions) in extra {
+            let rule = format!(
+                "allow {domain} {target} {class} {{ {} }}",
+                permissions.join(" ")
+            );
+            for permission in permissions {
+                native::record(
+                    native_rules,
+                    rule.clone(),
+                    1,
+                    1,
+                    &[&domain, &target, class, permission],
+                );
+            }
+            plan.rules.insert(rule);
+        }
+    }
+    Ok(())
+}

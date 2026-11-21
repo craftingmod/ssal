@@ -1169,11 +1169,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "ssal-sensors"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "rsbinder",
+ "rsbinder-aidl",
+ "rsbinder-fmq",
+ "serde",
+ "serde_json",
+ "ssal-binder-service",
+]
+
+[[package]]
 name = "ssal-system-suspend"
 version = "0.1.0"
 dependencies = [
  "rsbinder",
  "rsbinder-aidl",
+ "ssal-binder-service",
+]
+
+[[package]]
+name = "ssal-thermal"
+version = "0.1.0"
+dependencies = [
+ "rsbinder",
+ "rsbinder-aidl",
+ "serde",
+ "serde_json",
  "ssal-binder-service",
 ]
 

@@ -6,7 +6,28 @@ use std::io;
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::Path;
 
-const HIDDEN_HAL_TOKENS: &[&str] = &["weaver", "usb", "camera", "nfc", "radio", "fingerprint"];
+const HIDDEN_HAL_TOKENS: &[&str] = &[
+    "weaver",
+    "usb",
+    "camera",
+    "nfc",
+    "radio",
+    "fingerprint",
+    "power",
+    "keymaster",
+    "light",
+    "vibrator",
+    "thermal",
+    "sensors",
+    "soundtrigger",
+    "bluetooth",
+    "wifi",
+    "atrace",
+    "boot",
+    "cas",
+    "drm",
+    "c2",
+];
 const DEVICE_VINTF_PARTITIONS: &[&str] = &["vendor", "odm"];
 const UNAVAILABLE_FEATURES_XML: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 <permissions>
@@ -411,6 +432,8 @@ mod tests {
         assert!(is_hidden_hal_name("vendor.samsung.hardware.usb"));
         assert!(is_hidden_hal_name("vendor.samsung.hardware.usb_ext"));
         assert!(is_hidden_hal_name("vendor.qti.hardware.bluetooth_hci"));
+        assert!(is_hidden_hal_name("android.hardware.media.c2"));
+        assert!(is_hidden_hal_name("vendor.qti.media.c2"));
 
         assert!(!is_hidden_hal_name("android.hardware.bluetooth.audio"));
         assert!(!is_hidden_hal_name("android.hardware.broadcastradio"));

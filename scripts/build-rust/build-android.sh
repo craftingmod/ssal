@@ -26,6 +26,7 @@ if [[ "$build_target" == clean ]]; then
         out/bin/ssal-gatekeeper out/bin/ssal-keymint out/bin/ssal-virtual-composer \
         out/bin/ssal-vold out/bin/ssal-netd out/bin/ssal-hwbinder-probe.sh \
         out/bin/ssal-hwbinder-probe out/bin/ssal-virtual-audio out/bin/ssal-audio-host \
+        out/bin/ssal-thermal out/bin/ssal-sensors out/bin/ssal-sensor-host \
         out/bin/ssal-context-map.so out/bin/ssal-phase2-log.so \
         out/bin/ssal-binder-ipc out/bin/ssal-zygote-diag.so out/bin/ssal-zygote-fd-reopen.so \
         out/bin/ssal-zygote-selinux-noop.so out/bin/fork-probe.jar out/bin/input-injector.jar
@@ -58,11 +59,14 @@ if [[ "$build_target" == all || "$build_target" == services ]]; then
     install -m 755 "$CARGO_TARGET_DIR/aarch64-linux-android/release/ssal-virtual-composer" out/bin/ssal-virtual-composer
     install -m 755 "$CARGO_TARGET_DIR/aarch64-linux-android/release/ssal-vold" out/bin/ssal-vold
     install -m 755 "$CARGO_TARGET_DIR/aarch64-linux-android/release/ssal-netd" out/bin/ssal-netd
+    install -m 755 "$CARGO_TARGET_DIR/aarch64-linux-android/release/ssal-thermal" out/bin/ssal-thermal
+    install -m 755 "$CARGO_TARGET_DIR/aarch64-linux-android/release/ssal-sensors" out/bin/ssal-sensors
 fi
 if [[ "$build_target" == all || "$build_target" == native ]]; then
     install -m 755 scripts/ssal-hwbinder-probe.sh out/bin/ssal-hwbinder-probe.sh
     bash scripts/build-rust/build-hwbinder-probe.sh
     bash scripts/build-rust/build-virtual-audio.sh
+    bash scripts/build-rust/build-sensor-host.sh
     bash scripts/build-rust/build-jars.sh
     cargo build --locked --release --manifest-path tools/rsbinder/Cargo.toml --target aarch64-linux-android
     install -m 755 "$CARGO_TARGET_DIR/aarch64-linux-android/release/ssal-binder-ipc" out/bin/ssal-binder-ipc

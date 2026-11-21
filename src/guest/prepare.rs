@@ -19,6 +19,9 @@ const BOOT_BINARIES: &[&str] = &[
     "ssal-netd",
     "ssal-virtual-audio",
     "ssal-audio-host",
+    "ssal-thermal",
+    "ssal-sensors",
+    "ssal-sensor-host",
 ];
 
 pub(crate) fn check_boot_binaries(bin: &Path) -> io::Result<()> {

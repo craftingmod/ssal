@@ -3,7 +3,7 @@ mod net;
 use crate::diagnostics::launcher::{
     fork_probe, system_server_preflight, system_server_runtime_sid,
 };
-use crate::guest::concurrent::{gatekeeper, graphics, health, keymint, system_suspend};
+use crate::guest::concurrent::{gatekeeper, graphics, health, keymint, sensors, system_suspend, thermal};
 use crate::guest::hwbinder;
 use crate::guest::environment::start_property_service;
 use crate::guest::init::{wait_for_system_server, Service};
@@ -52,6 +52,8 @@ pub(in crate::guest) fn uses_own_diagnostics(executable: &str) -> bool {
         health::SERVICE.executable,
         gatekeeper::SERVICE.executable,
         keymint::SERVICE.executable,
+        sensors::SERVICE.executable,
+        thermal::SERVICE.executable,
         hwbinder::COMPOSER,
         "/vendor/bin/hw/vendor.qti.hardware.display.allocator-service",
     ]
@@ -89,6 +91,8 @@ fn mapped_exec_domain(executable: &str, exec_context: Option<&[u8]>) -> &'static
             "/run/ssal/ssal-health" => health::SERVICE.domain,
             "/run/ssal/ssal-gatekeeper" => gatekeeper::SERVICE.domain,
             "/run/ssal/ssal-keymint" => keymint::SERVICE.domain,
+            "/run/ssal/ssal-sensors" => sensors::SERVICE.domain,
+            "/run/ssal/ssal-thermal" => thermal::SERVICE.domain,
             "/apex/com.android.adbd/bin/adbd" => "adbd",
             "/system/bin/gatekeeperd" => "gatekeeperd",
             "/system/bin/keystore2" => "keystore",
@@ -1471,6 +1475,10 @@ pub(crate) fn verify(
             .map_err(|error| io::Error::other(format!("install Guest GateKeeper HAL: {error}")))?;
         keymint::SERVICE.install(mounts, root, &bin)
             .map_err(|error| io::Error::other(format!("install Guest KeyMint HAL: {error}")))?;
+        thermal::SERVICE.install(mounts, root, &bin)
+            .map_err(|error| io::Error::other(format!("install Guest Thermal HAL: {error}")))?;
+        sensors::SERVICE.install(mounts, root, &bin)
+            .map_err(|error| io::Error::other(format!("install Guest Sensors HAL: {error}")))?;
         if bin.join("ssal-vold").is_file() {
             crate::guest::init::binder_service::VOLD.install(mounts, root, &bin)?;
         }
@@ -1865,6 +1873,8 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
         if start_system_server {
             prepare_aconfig_storage(root)?;
             health::start(root, &bin, guest_binder, &mut boot_services)?;
+            thermal::start(root, &bin, guest_binder, &mut boot_services)?;
+            sensors::start(root, &bin, guest_binder, &mut boot_services)?;
             let auth_token_key = keymint::random_bytes::<32>()?;
             keymint::start(root, guest_binder, &auth_token_key, &mut boot_services)?;
             gatekeeper::start(root, guest_binder, &auth_token_key, &mut boot_services)?;
