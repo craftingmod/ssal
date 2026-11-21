@@ -93,6 +93,19 @@ impl Service {
             crate::diagnostics::zygote::Diagnostics::prepare(&diagnostic_dir)?;
         }
         if is_zygote {
+            unsafe {
+                command.pre_exec(|| {
+                    // Android init normally supplies these limits to Zygote and its children.
+                    let limit = libc::rlimit {
+                        rlim_cur: 40,
+                        rlim_max: 40,
+                    };
+                    if libc::setrlimit(libc::RLIMIT_NICE, &limit) != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
             if std::env::var_os("SSAL_CONTEXT_MAP_AVC_RESET").is_some() {
                 command.env("SSAL_CONTEXT_MAP_AVC_RESET", "1");
             }

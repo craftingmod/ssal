@@ -2733,9 +2733,16 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
             Err(error) => cleanup_errors.push(error.to_string()),
         }
     }
+    drop(property_service);
     if phase7a && std::env::var_os("SSAL_PHASE7FB_FORK").is_some() {
         if let Err(error) = fork_probe::cleanup(root) {
             cleanup_errors.push(error.to_string());
+        }
+    }
+    if phase7a {
+        // Adopted Guest processes may still hold the private Binder aliases open.
+        if let Err(error) = crate::guest::process::supervision::cleanup_descendants(true) {
+            cleanup_errors.push(format!("Guest descendant cleanup: {error}"));
         }
     }
     if let Err(error) = binder.cleanup() {

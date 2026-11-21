@@ -10,7 +10,8 @@ const PRESENTER_ALLOW_FILE: &str = "state/presenter-allow.json";
 const MAX_SCM_FDS: usize = 32;
 const MAX_PAYLOAD_BYTES: usize = 4096;
 const TOUCH_MAGIC_LE: [u8; 4] = 0x53544348u32.to_le_bytes();
-const TOUCH_HEADER_BYTES: usize = 32;
+const KEY_MAGIC_LE: [u8; 4] = 0x534B4559u32.to_le_bytes();
+const INPUT_HEADER_BYTES: usize = 32;
 const MAX_TOUCH_PACKET_BYTES: usize = 512;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -443,6 +444,12 @@ fn composer_pump_loop(relay: RelayHandle) {
     }
 }
 
+fn valid_input_packet(packet: &[u8]) -> bool {
+    packet.len() >= INPUT_HEADER_BYTES
+        && (packet[..4] == TOUCH_MAGIC_LE
+            || (packet.len() == INPUT_HEADER_BYTES && packet[..4] == KEY_MAGIC_LE))
+}
+
 fn input_pump_loop(relay: RelayHandle) {
     let mut buf = [0u8; MAX_TOUCH_PACKET_BYTES];
 
@@ -520,7 +527,7 @@ fn input_pump_loop(relay: RelayHandle) {
             }
 
             let len = n as usize;
-            if len < TOUCH_HEADER_BYTES || buf[..4] != TOUCH_MAGIC_LE {
+            if !valid_input_packet(&buf[..len]) {
                 continue;
             }
 
@@ -552,6 +559,19 @@ fn input_pump_loop(relay: RelayHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accepts_key_and_touch_packets() {
+        let mut packet = [0u8; INPUT_HEADER_BYTES + 16];
+        packet[..4].copy_from_slice(&KEY_MAGIC_LE);
+        assert!(valid_input_packet(&packet[..INPUT_HEADER_BYTES]));
+        assert!(!valid_input_packet(&packet[..INPUT_HEADER_BYTES - 1]));
+        assert!(!valid_input_packet(&packet));
+        packet[..4].copy_from_slice(&TOUCH_MAGIC_LE);
+        assert!(valid_input_packet(&packet));
+        packet[..4].fill(0);
+        assert!(!valid_input_packet(&packet[..INPUT_HEADER_BYTES]));
+    }
 
     #[test]
     fn validates_package_names() {

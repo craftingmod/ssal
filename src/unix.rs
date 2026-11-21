@@ -7,6 +7,7 @@ use std::io;
 use std::os::fd::AsRawFd;
 pub const ROOT: &str = "/data/local/ssal";
 pub const IMAGE_CONTEXT: &str = "u:object_r:ssal_image_file:s0";
+pub const USERDATA_IMAGE_CONTEXT: &str = "u:object_r:ssal_userdata_image_file:s0";
 
 pub fn image_context(file: &File) -> io::Result<String> {
     let mut value = [0u8; 256];
@@ -26,8 +27,10 @@ pub fn image_context(file: &File) -> io::Result<String> {
     String::from_utf8(value.to_vec()).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
-pub fn label_image(file: &File) -> io::Result<()> {
-    let context = c"u:object_r:ssal_image_file:s0";
+fn label_file_context(file: &File, context: &std::ffi::CStr, label_name: &str) -> io::Result<()> {
+    let expected = context
+        .to_str()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     if unsafe {
         libc::fsetxattr(
             file.as_raw_fd(),
@@ -38,13 +41,28 @@ pub fn label_image(file: &File) -> io::Result<()> {
         )
     } != 0
     {
-        return Err(io::Error::other(format!("cannot label system image with {IMAGE_CONTEXT}: {}; ensure ssal SELinux policy is loaded", io::Error::last_os_error())));
+        return Err(io::Error::other(format!(
+            "cannot label {label_name} with {expected}: {}; ensure ssal SELinux policy is loaded",
+            io::Error::last_os_error()
+        )));
     }
     let actual = image_context(file)?;
-    if actual != IMAGE_CONTEXT {
+    if actual != expected {
         return Err(io::Error::other(format!(
-            "unexpected system image SELinux context: {actual}"
+            "unexpected {label_name} SELinux context: {actual}"
         )));
     }
     Ok(())
+}
+
+pub fn label_image(file: &File) -> io::Result<()> {
+    label_file_context(file, c"u:object_r:ssal_image_file:s0", "system image")
+}
+
+pub fn label_userdata_image(file: &File) -> io::Result<()> {
+    label_file_context(
+        file,
+        c"u:object_r:ssal_userdata_image_file:s0",
+        "writable image",
+    )
 }

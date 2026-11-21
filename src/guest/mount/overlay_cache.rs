@@ -138,7 +138,7 @@ fn create_sparse_ext4(path: &Path, size: u64) -> io::Result<()> {
         }
         file.set_len(size)?;
         #[cfg(target_os = "android")]
-        ssal::unix::label_image(&file)?;
+        ssal::unix::label_userdata_image(&file)?;
         mke2fs(path)?;
         file.sync_all()?;
         Ok(())

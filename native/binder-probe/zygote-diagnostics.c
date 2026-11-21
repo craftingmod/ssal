@@ -10,6 +10,7 @@
 #include <unwind.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <sys/resource.h>
 #include <sys/syscall.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -155,6 +156,20 @@ static void segv(int signal_number, siginfo_t *info, void *context) {
 }
 
 __attribute__((constructor)) static void install_crash_capture(void) {
+    if (getenv("ANDROID_SOCKET_zygote")) {
+        // An SELinux exec transition can reset the soft limit while preserving the hard limit.
+        struct rlimit nice_limit;
+        if (getrlimit(RLIMIT_NICE, &nice_limit) == 0) {
+            rlim_t inherited_limit = nice_limit.rlim_max < 40 ? nice_limit.rlim_max : 40;
+            if (nice_limit.rlim_cur < inherited_limit) {
+                nice_limit.rlim_cur = inherited_limit;
+                if (setrlimit(RLIMIT_NICE, &nice_limit) != 0)
+                    number("SSAL_ZYGOTE_NICE_LIMIT_ERRNO", errno);
+            }
+        } else {
+            number("SSAL_ZYGOTE_NICE_LIMIT_ERRNO", errno);
+        }
+    }
 #if defined(__ANDROID__)
     for (unsigned i = 0; i < 2; ++i) {
         const char *path = i ? "/system/framework/voip-common.jar" : "/run/ssal/fork-probe.jar";

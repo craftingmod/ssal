@@ -424,7 +424,13 @@ fn prepare_session(
         root,
         "prepare host namespace residual mount check: verified absent for session path",
     );
-    for scratch in ["rootfs", "apex-cache", "loop-devices", "selinux-overlay"] {
+    for scratch in [
+        "rootfs",
+        "apex-cache",
+        "loop-devices",
+        "selinux-overlay",
+        "overlay-cache",
+    ] {
         let path = base.join(scratch);
         if let Err(e) = fs::remove_dir_all(&path) {
             if e.kind() != io::ErrorKind::NotFound {
@@ -461,7 +467,18 @@ fn cleanup_guest_scratch(base: &Path) -> io::Result<()> {
             base.display()
         )));
     }
-    for scratch in ["rootfs", "apex-cache", "loop-devices", "selinux-overlay", "phase7b"] {
+    for scratch in [
+        "rootfs",
+        "apex-cache",
+        "loop-devices",
+        "selinux-overlay",
+        "overlay-cache",
+        "phase7b",
+        "permissions-overlay",
+        "vendor-vintf-overlay",
+        "odm-vintf-overlay",
+        "vintf-manifest-overlay",
+    ] {
         let path = base.join(scratch);
         if let Err(e) = fs::remove_dir_all(&path) {
             if e.kind() != io::ErrorKind::NotFound {
@@ -734,5 +751,26 @@ mod tests {
         client.read_to_end(&mut rest)?;
         assert_eq!(&rest, b"exit\n");
         follower.join().unwrap()
+    }
+
+    #[test]
+    fn cleanup_guest_scratch_removes_overlay_staging() -> io::Result<()> {
+        let base = std::env::temp_dir().join(format!("ssal-scratch-test-{}", std::process::id()));
+        fs::create_dir(&base)?;
+        for name in [
+            "permissions-overlay",
+            "vendor-vintf-overlay",
+            "odm-vintf-overlay",
+            "vintf-manifest-overlay",
+        ] {
+            let path = base.join(name);
+            fs::create_dir(&path)?;
+            fs::write(path.join("staged.xml"), b"overlay")?;
+        }
+
+        cleanup_guest_scratch(&base)?;
+
+        assert!(!base.exists());
+        Ok(())
     }
 }

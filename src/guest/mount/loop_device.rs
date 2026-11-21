@@ -341,22 +341,30 @@ pub(crate) fn check_loop_read(device: &File, path: &Path, image: &Path) -> io::R
     Ok(())
 }
 pub(crate) fn mount_image(source: &Path, target: &Path, readonly: bool) -> io::Result<()> {
-    let source = cpath(source)?;
-    let target = cpath(target)?;
+    let source_c = cpath(source)?;
+    let target_c = cpath(target)?;
     let filesystem = c"ext4";
     let options = if readonly { c"noload" } else { c"" };
     let flags = libc::MS_NOSUID | libc::MS_NODEV | if readonly { libc::MS_RDONLY } else { 0 };
     if unsafe {
         libc::mount(
-            source.as_ptr(),
-            target.as_ptr(),
+            source_c.as_ptr(),
+            target_c.as_ptr(),
             filesystem.as_ptr(),
             flags,
             options.as_ptr().cast(),
         )
     } != 0
     {
-        return Err(io::Error::last_os_error());
+        let err = io::Error::last_os_error();
+        return Err(io::Error::new(
+            err.kind(),
+            format!(
+                "mount ext4 {} on {}: {err}",
+                source.display(),
+                target.display()
+            ),
+        ));
     }
     Ok(())
 }
