@@ -130,6 +130,7 @@ pub(crate) fn start_property_service(
     ];
     if crate::guest::concurrent::graphics::requested() {
         build_props.extend([
+            "qemu.hw.mainkeys=0",
             "ro.hardware.egl=adreno",
             "ro.board.platform=taro",
             "ro.sf.lcd_density=320",

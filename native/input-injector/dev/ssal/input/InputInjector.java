@@ -3,6 +3,7 @@ package dev.ssal.input;
 import android.net.LocalSocket;
 import android.net.LocalSocketAddress;
 import android.os.IBinder;
+import android.os.SystemClock;
 import android.view.InputDevice;
 import android.view.InputEvent;
 import android.view.KeyEvent;
@@ -47,6 +48,9 @@ public final class InputInjector {
 
         Method injectInputEvent = inputManager.getClass()
                 .getMethod("injectInputEvent", InputEvent.class, int.class);
+        Method powerAsInterface = Class.forName("android.os.IPowerManager$Stub")
+                .getMethod("asInterface", IBinder.class);
+        Object[] powerState = new Object[2]; // [0]: IPowerManager, [1]: isInteractive Method
 
         System.out.println("GUEST_INPUT_INJECTOR_READY=PASS");
         System.out.flush();
@@ -124,6 +128,11 @@ public final class InputInjector {
                     coords[i].pressure = bb.getFloat();
                 }
 
+                if ((action & MotionEvent.ACTION_MASK) == MotionEvent.ACTION_DOWN
+                        && !isGuestInteractive(getService, powerAsInterface, powerState)) {
+                    injectWakeupKey(inputManager, injectInputEvent);
+                }
+
                 MotionEvent ev = MotionEvent.obtain(
                         downTime,
                         eventTime,
@@ -146,6 +155,67 @@ public final class InputInjector {
                     ev.recycle();
                 }
             }
+        }
+    }
+
+    private static boolean isGuestInteractive(
+            Method getService,
+            Method powerAsInterface,
+            Object[] powerState
+    ) {
+        try {
+            if (powerState[0] == null) {
+                IBinder binder = (IBinder) getService.invoke(null, "power");
+                if (binder == null) {
+                    return true;
+                }
+                Object powerManager = powerAsInterface.invoke(null, binder);
+                if (powerManager == null) {
+                    return true;
+                }
+                powerState[1] = powerManager.getClass().getMethod("isInteractive");
+                powerState[0] = powerManager;
+            }
+            return Boolean.TRUE.equals(((Method) powerState[1]).invoke(powerState[0]));
+        } catch (Exception e) {
+            powerState[0] = null;
+            powerState[1] = null;
+            System.err.println("GUEST_INPUT_INJECTOR_POWER_ERR=" + e.getMessage());
+            return true;
+        }
+    }
+
+    private static void injectWakeupKey(Object inputManager, Method injectInputEvent) {
+        try {
+            long now = SystemClock.uptimeMillis();
+            KeyEvent down = new KeyEvent(
+                    now,
+                    now,
+                    KeyEvent.ACTION_DOWN,
+                    KeyEvent.KEYCODE_WAKEUP,
+                    0,
+                    0,
+                    -1,
+                    0,
+                    0,
+                    InputDevice.SOURCE_KEYBOARD
+            );
+            KeyEvent up = new KeyEvent(
+                    now,
+                    now,
+                    KeyEvent.ACTION_UP,
+                    KeyEvent.KEYCODE_WAKEUP,
+                    0,
+                    0,
+                    -1,
+                    0,
+                    0,
+                    InputDevice.SOURCE_KEYBOARD
+            );
+            injectInputEvent.invoke(inputManager, down, INJECT_INPUT_EVENT_MODE_ASYNC);
+            injectInputEvent.invoke(inputManager, up, INJECT_INPUT_EVENT_MODE_ASYNC);
+        } catch (Exception e) {
+            System.err.println("GUEST_INPUT_INJECTOR_WAKE_ERR=" + e.getMessage());
         }
     }
 }

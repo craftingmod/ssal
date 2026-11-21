@@ -683,7 +683,7 @@ pub(super) fn verify(
     if descendants.is_err() {
         cgroups.preserve = true;
     }
-    let cleanup = mounts.cleanup();
+    let cleanup = mounts.cleanup_under(&root);
     let cgroup_cleanup = cgroups.cleanup();
     println!(
         "Guest cgroup cleanup: {}",
@@ -996,7 +996,7 @@ mod tests {
                 .is_err());
             Ok(())
         })();
-        let cleanup = mounts.cleanup();
+        let cleanup = mounts.cleanup_under(&root);
         result?;
         cleanup?;
         assert_eq!(host_dev.ino(), fs::metadata("/dev")?.ino());

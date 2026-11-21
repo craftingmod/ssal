@@ -193,6 +193,17 @@ pub fn guest_terminal(
     let pts = root.join("dev/pts");
     std::fs::create_dir_all(&pts)?;
     let context = plan.context("shell_devpts", false)?;
+    struct PtsMountGuard(std::ffi::CString);
+    impl Drop for PtsMountGuard {
+        fn drop(&mut self) {
+            unsafe {
+                if libc::umount2(self.0.as_ptr(), 0) != 0 {
+                    libc::umount2(self.0.as_ptr(), libc::MNT_DETACH);
+                }
+            }
+        }
+    }
+    let pts_c = std::ffi::CString::new(pts.as_os_str().as_bytes()).map_err(io::Error::other)?;
     crate::namespace_mounts::mount(
         std::path::Path::new("devpts"),
         &pts,
@@ -200,6 +211,7 @@ pub fn guest_terminal(
         libc::MS_NOSUID | libc::MS_NOEXEC,
         &format!("newinstance,gid=2000,mode=620,ptmxmode=666,context={context}"),
     )?;
+    let _pts_guard = PtsMountGuard(pts_c);
     let master = std::fs::OpenOptions::new()
         .read(true)
         .write(true)

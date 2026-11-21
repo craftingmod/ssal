@@ -144,6 +144,45 @@ impl Mounts {
             )))
         }
     }
+
+    pub fn cleanup_under(&mut self, root: &Path) -> io::Result<()> {
+        let first = self.cleanup();
+        let info = fs::read_to_string("/proc/self/mountinfo")?;
+        let mut remaining: Vec<PathBuf> = info
+            .lines()
+            .filter_map(|line| line.split_whitespace().nth(4))
+            .map(PathBuf::from)
+            .filter(|path| path.starts_with(root))
+            .collect();
+        if remaining.is_empty() {
+            self.loops.clear();
+            return Ok(());
+        }
+        // Reverse so stacked mounts at the same path unmount top-down, then deepest-first.
+        remaining.reverse();
+        remaining.sort_by(|a, b| b.components().count().cmp(&a.components().count()));
+        let mut failures = Vec::new();
+        for path in remaining {
+            if unsafe { libc::umount2(cpath(&path)?.as_ptr(), 0) } != 0 {
+                failures.push(format!(
+                    "{}: {}",
+                    path.display(),
+                    io::Error::last_os_error()
+                ));
+            }
+        }
+        if failures.is_empty() {
+            self.loops.clear();
+            Ok(())
+        } else if first.is_err() {
+            Err(io::Error::other(format!(
+                "guest mount cleanup failed: {}",
+                failures.join("; ")
+            )))
+        } else {
+            first
+        }
+    }
 }
 
 // Resolve absolute Android symlinks against the guest root, not the worker's

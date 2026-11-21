@@ -11,6 +11,7 @@
     "build:web": "bun scripts/build-web.ts",
     "build:surface-app": "bun scripts/build-surface-app.ts",
     "package": "bun scripts/package-module.ts",
+    "deploy": "bun scripts/deploy-module.ts",
     "setup:windows": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File ./scripts/dev.ps1 setup",
     "update:windows": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File ./scripts/dev.ps1 update",
     "build:windows": "bun run build",
