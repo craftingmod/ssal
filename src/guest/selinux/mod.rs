@@ -13,7 +13,14 @@ pub mod native;
 pub mod runtime;
 mod symbols;
 
-const VERSION: u32 = 81;
+const VERSION: u32 = 82;
+
+const HOST_MLS_ATTRIBUTES: &[&str] = &[
+    "mlstrustedsubject",
+    "mlstrustedobject",
+    "app_data_file_type",
+    "appdomain_tmpfs",
+];
 
 type Names = BTreeMap<String, String>;
 
@@ -164,6 +171,8 @@ pub struct Plan {
     #[serde(default)]
     pub unsupported_source: BTreeMap<String, String>,
     pub retained_host: Vec<String>,
+    #[serde(default)]
+    pub unmapped_constraint_attributes: BTreeSet<String>,
 }
 
 impl Plan {
@@ -494,6 +503,21 @@ fn members(
     }
 }
 
+fn collect_constraint_attributes(expr: &Expr, attributes: &Names, out: &mut BTreeSet<String>) {
+    match expr {
+        Expr::Atom(name) => {
+            if attributes.contains_key(name) && !HOST_MLS_ATTRIBUTES.contains(&name.as_str()) {
+                out.insert(name.clone());
+            }
+        }
+        Expr::List(items) => {
+            for item in items {
+                collect_constraint_attributes(item, attributes, out);
+            }
+        }
+    }
+}
+
 fn resolve_attribute(
     name: &str,
     expressions: &BTreeMap<String, Vec<Expr>>,
@@ -636,6 +660,7 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
         unsupported: Vec::new(),
         unsupported_source: BTreeMap::new(),
         retained_host: Vec::new(),
+        unmapped_constraint_attributes: BTreeSet::new(),
     };
     let mut statements = Vec::new();
     for (path, text) in inputs.iter().filter(|(p, _)| p.ends_with(".cil")) {
@@ -874,12 +899,7 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
         }
     }
     // Host mlsconstrain rules evaluate against Host MLS attributes.
-    for host_attr in [
-        "mlstrustedsubject",
-        "mlstrustedobject",
-        "app_data_file_type",
-        "appdomain_tmpfs",
-    ] {
+    for &host_attr in HOST_MLS_ATTRIBUTES {
         if let Some(values) = sets.get(host_attr) {
             for original in values {
                 if let Some(name) = plan.types.get(original) {
@@ -1141,6 +1161,18 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
                 | "fsuse"
                 | "genfscon"
         ) {
+            if matches!(
+                op,
+                "mlsconstrain" | "constrain" | "mlsvalidatetrans" | "validatetrans"
+            ) {
+                if let Some(constraint_expr) = l.last() {
+                    collect_constraint_attributes(
+                        constraint_expr,
+                        &plan.attributes,
+                        &mut plan.unmapped_constraint_attributes,
+                    );
+                }
+            }
             plan.retained_host.push(format!("{location}: {op}: active Host constraints/filesystem labels retained; Guest declaration not installed"));
         } else if op == "typepermissive" {
             plan.retained_host.push(format!(
@@ -2701,7 +2733,7 @@ mod tests {
         let mut files = BTreeMap::new();
         files.insert(
             "system/etc/selinux/plat_sepolicy.cil".into(),
-            "(type zygote) (type binder_device) (type app_data_file) (typeattribute mlstrustedsubject) (typeattribute mlstrustedobject) (typeattribute app_data_file_type) (typeattributeset mlstrustedsubject (zygote)) (typeattributeset mlstrustedobject (binder_device)) (typeattributeset app_data_file_type (app_data_file))".into(),
+            "(type zygote) (type binder_device) (type app_data_file) (type custom_file) (typeattribute mlstrustedsubject) (typeattribute mlstrustedobject) (typeattribute app_data_file_type) (typeattribute custom_mls_attr) (typeattributeset mlstrustedsubject (zygote)) (typeattributeset mlstrustedobject (binder_device)) (typeattributeset app_data_file_type (app_data_file)) (typeattributeset custom_mls_attr (custom_file)) (mlsconstrain (file (read)) (or (eq t1 mlstrustedsubject) (or (eq t2 app_data_file_type) (eq t2 custom_mls_attr))))".into(),
         );
         let plan = generate("p0003", &files)?;
         assert!(plan
@@ -2713,6 +2745,10 @@ mod tests {
         assert!(plan
             .rules
             .contains("typeattribute ssal_p0003_app_data_file app_data_file_type"));
+        assert_eq!(
+            plan.unmapped_constraint_attributes,
+            BTreeSet::from(["custom_mls_attr".to_owned()])
+        );
         Ok(())
     }
 }

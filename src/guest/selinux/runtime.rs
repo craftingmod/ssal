@@ -550,6 +550,7 @@ pub fn apply_with_backend(profile: &Path, plan: &Plan, backend: Backend) -> io::
         &directory.join("compatibility.json"),
         &serde_json::to_vec_pretty(
             &serde_json::json!({"boot_id":applied.boot_id,"omitted":omitted,"placeholders":compatible.placeholders,"backend":if backend == Backend::KernelSuNative {"native"} else {"ksud"},"gsi_unsupported":plan.unsupported,
+                "unmapped_constraint_attributes":plan.unmapped_constraint_attributes,
                 "desired_plan_sha256":digest(&serde_json::to_vec_pretty(plan)?),
                 "compatible_plan_sha256":digest(&compatible_bytes),
                 "applied_evidence":"applied.json is a cumulative backend acknowledgement ledger for this boot; additions are not removed",
@@ -763,14 +764,21 @@ pub fn prepare_mounted(
         plan.context(original, false)?;
     }
     println!(
-        "Guest SELinux: id={} input_hash={} regenerated={} types={} rules={} unsupported={}",
+        "Guest SELinux: id={} input_hash={} regenerated={} types={} rules={} unsupported={} unmapped_constraint_attrs={}",
         plan.id,
         plan.input_hash,
         regenerated,
         plan.types.len(),
         plan.rules.len(),
-        plan.unsupported.len()
+        plan.unsupported.len(),
+        plan.unmapped_constraint_attributes.len()
     );
+    if !plan.unmapped_constraint_attributes.is_empty() {
+        println!(
+            "Guest SELinux warning: constraint attributes not mapped to Host: {:?}",
+            plan.unmapped_constraint_attributes
+        );
+    }
     let backend = match std::env::var("SSAL_PREPARE_SEPOLICY_BACKEND").as_deref() {
         Ok("native") => Backend::KernelSuNative,
         Ok("ksud") | Err(_) => Backend::Ksud,
