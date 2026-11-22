@@ -7,7 +7,7 @@ mod server;
 mod services;
 mod triggers;
 
-pub use services::ServiceDefinition;
+pub use services::{ServiceDefinition, SocketDefinition};
 
 use rsproperties::{MatchKeyword, PropertyInfoEntry, SystemProperties};
 use serde::Deserialize;

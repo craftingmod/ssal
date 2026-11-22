@@ -30,6 +30,7 @@ fn property_service_definitions(
             oneshot: Some(true),
             restart_period: None,
             autostart: false,
+            ..Default::default()
         });
     }
     let has_adbd_domain = plan.is_some_and(|p| p.types.contains_key("adbd"));
@@ -49,6 +50,7 @@ fn property_service_definitions(
             oneshot: Some(false),
             restart_period: Some(5),
             autostart,
+            ..Default::default()
         });
     }
     let has_mediaswcodec_domain = plan.is_some_and(|p| p.types.contains_key("mediaswcodec"));
@@ -77,6 +79,47 @@ fn property_service_definitions(
             oneshot: Some(false),
             restart_period: Some(5),
             autostart,
+            ..Default::default()
+        });
+    }
+    let has_webview_zygote_domain = plan.is_some_and(|p| p.types.contains_key("webview_zygote"));
+    if has_webview_zygote_domain && root.join("system/bin/app_process64").is_file() {
+        let env = std::collections::BTreeMap::from([
+            ("ANDROID_ASSETS".into(), "/system/app".into()),
+            (
+                "LD_LIBRARY_PATH".into(),
+                "/run/ssal:/apex/com.android.adbd/lib64:/system/lib64:/apex/com.android.os.statsd/lib64:/apex/com.android.i18n/lib64".into(),
+            ),
+            ("LD_PRELOAD".into(), "/run/ssal/ssal-context-map.so".into()),
+        ]);
+        services.push(ssal::guest_properties::ServiceDefinition {
+            name: "webview_zygote".into(),
+            executable: "/system/bin/app_process64".into(),
+            args: vec![
+                "-Xzygote".into(),
+                "/system/bin".into(),
+                "--zygote".into(),
+                "--socket-name=webview_zygote".into(),
+            ],
+            interfaces: Vec::new(),
+            uid: 1053,
+            gid: 1053,
+            supplementary_gids: vec![3009],
+            capabilities: vec![6, 7, 8], // CAP_SETGID, CAP_SETUID, CAP_SETPCAP
+            domain: "webview_zygote".into(),
+            oneshot: Some(false),
+            restart_period: Some(5),
+            autostart: false,
+            sockets: vec![ssal::guest_properties::SocketDefinition {
+                name: "webview_zygote".into(),
+                mode: 0o660,
+                uid: 1053,
+                gid: 1000,
+                context: plan
+                    .and_then(|p| p.types.contains_key("zygote_socket").then(|| "zygote_socket".into())),
+            }],
+            env,
+            env_file: Some("/run/ssal/webview_zygote.env".into()),
         });
     }
     services
@@ -708,6 +751,55 @@ mod tests {
             .interfaces
             .iter()
             .any(|iface| iface == "android.hardware.media.c2@1.0::IComponentStore/software"));
+
+        fs::remove_dir_all(base)
+    }
+
+    #[test]
+    fn registers_webview_zygote_service_with_socket_and_capabilities() -> io::Result<()> {
+        let base = std::env::temp_dir().join(format!("ssal-wvz-svc-{}", std::process::id()));
+        let bin_dir = base.join("system/bin");
+        fs::create_dir_all(&bin_dir)?;
+        let inputs = std::collections::BTreeMap::from([(
+            "system/etc/selinux/plat_sepolicy.cil".into(),
+            "(type zygote)".into(),
+        )]);
+        let mut plan = ssal::guest_policy::generate("p0001", &inputs)?;
+
+        assert!(property_service_definitions(&base, Some(&plan), false).is_empty());
+
+        fs::write(bin_dir.join("app_process64"), b"stub")?;
+        assert!(property_service_definitions(&base, Some(&plan), false).is_empty());
+
+        plan.types
+            .insert("webview_zygote".into(), "ssal_p0001_webview_zygote".into());
+        plan.types
+            .insert("zygote_socket".into(), "ssal_p0001_zygote_socket".into());
+        let defs = property_service_definitions(&base, Some(&plan), false);
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].name, "webview_zygote");
+        assert_eq!(defs[0].executable, "/system/bin/app_process64");
+        assert_eq!(
+            defs[0].args,
+            ["-Xzygote", "/system/bin", "--zygote", "--socket-name=webview_zygote"]
+        );
+        assert_eq!(defs[0].domain, "webview_zygote");
+        assert_eq!(defs[0].uid, 1053);
+        assert_eq!(defs[0].gid, 1053);
+        assert_eq!(defs[0].supplementary_gids, [3009]);
+        assert_eq!(defs[0].capabilities, [6, 7, 8]);
+        assert_eq!(defs[0].oneshot, Some(false));
+        assert!(!defs[0].autostart);
+        assert_eq!(defs[0].sockets.len(), 1);
+        assert_eq!(defs[0].sockets[0].name, "webview_zygote");
+        assert_eq!(defs[0].sockets[0].mode, 0o660);
+        assert_eq!(defs[0].sockets[0].uid, 1053);
+        assert_eq!(defs[0].sockets[0].gid, 1000);
+        assert_eq!(defs[0].sockets[0].context.as_deref(), Some("zygote_socket"));
+        assert_eq!(
+            defs[0].env_file.as_deref(),
+            Some("/run/ssal/webview_zygote.env")
+        );
 
         fs::remove_dir_all(base)
     }

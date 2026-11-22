@@ -4,15 +4,27 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::{FileExt, OpenOptionsExt};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::fs::{FileExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::net::UnixListener;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 const DEFAULT_RESTART_PERIOD: Duration = Duration::from_secs(5);
 
-#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SocketDefinition {
+    pub name: String,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    #[serde(default)]
+    pub context: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 /// A trusted foreground service. Descendants must remain in its process group.
 pub struct ServiceDefinition {
@@ -25,6 +37,10 @@ pub struct ServiceDefinition {
     pub interfaces: Vec<String>,
     pub uid: u32,
     pub gid: u32,
+    #[serde(default)]
+    pub supplementary_gids: Vec<u32>,
+    #[serde(default)]
+    pub capabilities: Vec<u32>,
     /// Original Guest policy domain, translated using this session's SELinux type map.
     pub domain: String,
     #[serde(default)]
@@ -34,6 +50,12 @@ pub struct ServiceDefinition {
     pub restart_period: Option<u32>,
     #[serde(default)]
     pub autostart: bool,
+    #[serde(default)]
+    pub sockets: Vec<SocketDefinition>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub env_file: Option<String>,
 }
 
 impl ServiceDefinition {
@@ -119,15 +141,63 @@ fn has_memory_cgroup(task_magic: u64, procs: &std::path::Path) -> io::Result<boo
     }
 }
 
+#[derive(Clone)]
+struct ResolvedSocket {
+    name: String,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    context: Option<String>,
+}
+
+#[repr(C)]
+struct CapHeader {
+    version: u32,
+    pid: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct CapData {
+    effective: u32,
+    permitted: u32,
+    inheritable: u32,
+}
+
+fn load_env_file(path: &str, command: &mut Command) -> io::Result<()> {
+    let contents = fs::read_to_string(path)?;
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = trimmed.split_once('=') else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid env line in {path}"),
+            ));
+        };
+        if key.is_empty() || key.contains('\0') || value.contains('\0') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid env entry in {path}"),
+            ));
+        }
+        command.env(key, value);
+    }
+    Ok(())
+}
+
 struct Service {
     definition: ServiceDefinition,
     context: String,
+    sockets: Vec<ResolvedSocket>,
     child: Option<Child>,
     state: &'static str,
     started_at: Instant,
     restart_delay: Option<Duration>,
     restart: Option<Restart>,
-    spawn: fn(&ServiceDefinition, &str) -> io::Result<Child>,
+    spawn: fn(&ServiceDefinition, &str, &[ResolvedSocket]) -> io::Result<Child>,
 }
 
 #[derive(Clone, Copy)]
@@ -139,13 +209,21 @@ enum Restart {
 impl Service {
     fn start(&mut self) -> io::Result<()> {
         let started_at = Instant::now();
-        self.child = Some((self.spawn)(&self.definition, &self.context)?);
+        self.child = Some((self.spawn)(
+            &self.definition,
+            &self.context,
+            &self.sockets,
+        )?);
         self.started_at = started_at;
         self.state = "running";
         Ok(())
     }
 
-    fn spawn(definition: &ServiceDefinition, context: &str) -> io::Result<Child> {
+    fn spawn(
+        definition: &ServiceDefinition,
+        context: &str,
+        sockets: &[ResolvedSocket],
+    ) -> io::Result<Child> {
         let executable = open_executable(
             std::path::Path::new(&definition.executable),
             super::guest_input,
@@ -164,9 +242,32 @@ impl Service {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .process_group(0);
+        if let Some(env_file) = &definition.env_file {
+            load_env_file(env_file, &mut command)?;
+        }
+        for (key, value) in &definition.env {
+            command.env(key, value);
+        }
+        let mut prepared_sockets = Vec::with_capacity(sockets.len());
+        let mut socket_specs = Vec::with_capacity(sockets.len());
+        for socket in sockets {
+            let raw = unsafe {
+                libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0)
+            };
+            if raw < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let listener = unsafe { UnixListener::from_raw_fd(raw) };
+            let fd = listener.as_raw_fd();
+            command.env(format!("ANDROID_SOCKET_{}", socket.name), fd.to_string());
+            socket_specs.push((fd, socket.clone()));
+            prepared_sockets.push(listener);
+        }
         let context = context.to_owned();
         let uid = definition.uid;
         let gid = definition.gid;
+        let supplementary_gids = definition.supplementary_gids.clone();
+        let capabilities = definition.capabilities.clone();
         let parent = std::process::id() as i32;
         let mut groups: Vec<_> = ["/sys/fs/cgroup", "/dev/cpuctl", "/dev/cpuset", "/dev/blkio"]
             .into_iter()
@@ -191,8 +292,46 @@ impl Service {
             command.pre_exec(move || {
                 crate::unix::cloexec_unexpected_fds()?;
                 crate::platform::process::join_cgroups(&groups)?;
+                for (fd, spec) in &socket_specs {
+                    let path = std::path::Path::new("/dev/socket").join(&spec.name);
+                    if let Err(error) = fs::remove_file(&path) {
+                        if error.kind() != io::ErrorKind::NotFound {
+                            return Err(error);
+                        }
+                    }
+                    if let Some(sock_ctx) = &spec.context {
+                        fs::write("/proc/thread-self/attr/sockcreate", format!("{sock_ctx}\0"))?;
+                        fs::write("/proc/thread-self/attr/fscreate", format!("{sock_ctx}\0"))?;
+                    }
+                    let bound = UnixListener::bind(&path)?;
+                    if spec.context.is_some() {
+                        fs::write("/proc/thread-self/attr/sockcreate", b"\0")?;
+                        fs::write("/proc/thread-self/attr/fscreate", b"\0")?;
+                    }
+                    let cpath = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())?;
+                    if libc::chown(cpath.as_ptr(), spec.uid, spec.gid) != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    fs::set_permissions(&path, fs::Permissions::from_mode(spec.mode))?;
+                    if libc::dup2(bound.as_raw_fd(), *fd) < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    if libc::fcntl(*fd, libc::F_SETFD, 0) != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
                 fs::write("/proc/thread-self/attr/exec", context.as_bytes())?;
-                if libc::setgroups(0, std::ptr::null()) != 0
+                if !capabilities.is_empty()
+                    && libc::prctl(libc::PR_SET_KEEPCAPS, 1, 0, 0, 0) != 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                let setgroups_rc = if supplementary_gids.is_empty() {
+                    libc::setgroups(0, std::ptr::null())
+                } else {
+                    libc::setgroups(supplementary_gids.len(), supplementary_gids.as_ptr())
+                };
+                if setgroups_rc != 0
                     || libc::setresgid(gid, gid, gid) != 0
                     || libc::setresuid(uid, uid, uid) != 0
                     // shortcut: secureexec can clear PDEATHSIG; add owner-side monitoring before promising immediate worker-failure cleanup.
@@ -203,10 +342,52 @@ impl Service {
                         "Guest service credentials/parent gate failed",
                     ));
                 }
+                if !capabilities.is_empty() {
+                    let mut mask = 0u64;
+                    for &cap in &capabilities {
+                        mask |= 1u64 << cap;
+                    }
+                    let caps = [
+                        CapData {
+                            effective: mask as u32,
+                            permitted: mask as u32,
+                            inheritable: mask as u32,
+                        },
+                        CapData {
+                            effective: (mask >> 32) as u32,
+                            permitted: (mask >> 32) as u32,
+                            inheritable: (mask >> 32) as u32,
+                        },
+                    ];
+                    if libc::syscall(
+                        libc::SYS_capset,
+                        &CapHeader {
+                            version: 0x20080522,
+                            pid: 0,
+                        },
+                        caps.as_ptr(),
+                    ) != 0
+                    {
+                        return Err(io::Error::last_os_error());
+                    }
+                    for &cap in &capabilities {
+                        if libc::prctl(
+                            libc::PR_CAP_AMBIENT,
+                            libc::PR_CAP_AMBIENT_RAISE,
+                            cap as libc::c_ulong,
+                            0,
+                            0,
+                        ) != 0
+                        {
+                            return Err(io::Error::last_os_error());
+                        }
+                    }
+                }
                 Ok(())
             });
         }
         let result = command.spawn();
+        drop(prepared_sockets);
         drop(executable);
         result
     }
@@ -278,6 +459,18 @@ impl Registry {
                 || definition.args.iter().any(|s| s.contains('\0'))
                 || definition.uid == u32::MAX
                 || definition.gid == u32::MAX
+                || definition.supplementary_gids.contains(&u32::MAX)
+                || definition.capabilities.iter().any(|&c| c > 63)
+                || definition.env.iter().any(|(k, v)| {
+                    k.is_empty() || k.contains('=') || k.contains('\0') || v.contains('\0')
+                })
+                || definition.env_file.as_ref().is_some_and(|env_path| {
+                    let p = std::path::Path::new(env_path);
+                    !p.is_absolute()
+                        || p.components()
+                            .any(|c| matches!(c, std::path::Component::ParentDir))
+                        || env_path.contains('\0')
+                })
                 || definition.domain == "init"
             {
                 return Err(io::Error::new(
@@ -300,6 +493,48 @@ impl Registry {
                         "service needs a mapped Guest SELinux domain",
                     )
                 })?;
+            let mut sockets = Vec::with_capacity(definition.sockets.len());
+            for socket in &definition.sockets {
+                if !valid_name(&socket.name)
+                    || socket.mode > 0o7777
+                    || socket.uid == u32::MAX
+                    || socket.gid == u32::MAX
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "invalid Guest service socket definition",
+                    ));
+                }
+                let context = socket
+                    .context
+                    .as_ref()
+                    .map(|ctx| {
+                        types
+                            .get(ctx)
+                            .filter(|mapped| {
+                                mapped.starts_with("ssal_p")
+                                    && mapped.len() <= 255
+                                    && mapped
+                                        .bytes()
+                                        .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                            })
+                            .map(|mapped| format!("u:object_r:{mapped}:s0"))
+                            .ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidInput,
+                                    "socket needs a mapped Guest SELinux type",
+                                )
+                            })
+                    })
+                    .transpose()?;
+                sockets.push(ResolvedSocket {
+                    name: socket.name.clone(),
+                    mode: socket.mode,
+                    uid: socket.uid,
+                    gid: socket.gid,
+                    context,
+                });
+            }
             let name = definition.name.clone();
             for interface in &definition.interfaces {
                 if !valid_interface(interface)
@@ -315,6 +550,7 @@ impl Registry {
             let service = Service {
                 definition,
                 context: format!("u:r:{target}:s0"),
+                sockets,
                 child: None,
                 state: "stopped",
                 started_at: Instant::now(),
@@ -524,6 +760,7 @@ mod tests {
             oneshot: None,
             restart_period: None,
             autostart: false,
+            ..Default::default()
         }
     }
 
@@ -538,7 +775,11 @@ mod tests {
         registry
     }
 
-    fn mock_spawn(definition: &ServiceDefinition, _: &str) -> io::Result<Child> {
+    fn mock_spawn(
+        definition: &ServiceDefinition,
+        _: &str,
+        _: &[ResolvedSocket],
+    ) -> io::Result<Child> {
         Command::new(&definition.executable)
             .args(&definition.args)
             .process_group(0)

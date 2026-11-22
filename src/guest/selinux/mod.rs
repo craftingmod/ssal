@@ -13,7 +13,7 @@ pub mod native;
 pub mod runtime;
 mod symbols;
 
-const VERSION: u32 = 76;
+const VERSION: u32 = 77;
 
 type Names = BTreeMap<String, String>;
 
@@ -191,7 +191,7 @@ impl Plan {
                 );
             }
         }
-        for original in ["zygote", "installd"] {
+        for original in ["zygote", "installd", "webview_zygote"] {
             if let Some(domain) = self.types.get(original) {
                 let rule = format!("allow {domain} kernel security {{ check_context }}");
                 self.rules.insert(rule.clone());
@@ -1163,7 +1163,7 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
             &[init, init, "fifo_file", "create"],
         );
         plan.rules.insert(rule);
-        for domain in ["shell", "mediaswcodec", "bootanim"] {
+        for domain in ["shell", "mediaswcodec", "bootanim", "webview_zygote"] {
             if let Some(target) = plan.types.get(domain) {
                 // Guest system mounts remain nosuid; permit only the explicit Guest domain transition.
                 let rule = format!("allow {init} {target} process2 {{ nosuid_transition }}");
@@ -1173,6 +1173,19 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
                     1,
                     1,
                     &[init, target, "process2", "nosuid_transition"],
+                );
+                plan.rules.insert(rule);
+            }
+        }
+        if let Some(zygote_socket) = plan.types.get("zygote_socket") {
+            for permission in ["create", "setattr", "unlink", "getattr"] {
+                let rule = format!("allow {init} {zygote_socket} sock_file {{ {permission} }}");
+                native::record(
+                    &mut native_rules,
+                    rule.clone(),
+                    1,
+                    1,
+                    &[init, zygote_socket, "sock_file", permission],
                 );
                 plan.rules.insert(rule);
             }
@@ -1302,6 +1315,7 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
         "mediaextractor",
         "mediametrics",
         "bootanim",
+        "webview_zygote",
     ] {
         if let Some(domain) = plan.types.get(original) {
             for (class, permission) in [("fd", "use"), ("fifo_file", "write")] {

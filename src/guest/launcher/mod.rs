@@ -2172,6 +2172,15 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
             )?;
             println!("Guest Zygote binary preflight:\n{binary}");
             let classpaths = derive_guest_classpath(root)?;
+            {
+                let mut wv_env = format!("BOOTCLASSPATH={}\n", classpaths.boot);
+                if let Some(classpath) = classpaths.dex2oat.as_deref() {
+                    wv_env.push_str(&format!("DEX2OATBOOTCLASSPATH={classpath}\n"));
+                }
+                let env_path = root.join("run/ssal/webview_zygote.env");
+                fs::write(&env_path, wv_env)?;
+                fs::set_permissions(&env_path, fs::Permissions::from_mode(0o644))?;
+            }
             if system_server_graphics && !runtime_sid {
                 preopt_system_apps(root, profile_dir, &classpaths)?;
             }
