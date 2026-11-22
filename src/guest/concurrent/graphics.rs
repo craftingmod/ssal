@@ -457,6 +457,10 @@ pub(in crate::guest) fn apply_graphics_allocator_access(
     .into_iter()
     .filter_map(|name| plan.types.get(name).map(String::as_str))
     .collect();
+    let mapper_hwsvc = plan
+        .types
+        .get("hal_graphics_mapper_hwservice")
+        .map(String::as_str);
     for client in &clients {
         rules.extend([
             (*client, alloc.as_str(), "binder", &["call", "transfer"][..]),
@@ -465,8 +469,28 @@ pub(in crate::guest) fn apply_graphics_allocator_access(
             (alloc.as_str(), *client, "fd", &["use"][..]),
             (*client, alloc_hwsvc.as_str(), "hwservice_manager", &["find"][..]),
             (*client, "hal_graphics_allocator_hwservice", "hwservice_manager", &["find"][..]),
+            (*client, "hal_graphics_mapper_hwservice", "hwservice_manager", &["find"][..]),
             (*client, default_hwsvc.as_str(), "hwservice_manager", &["find"][..]),
         ]);
+        if let Some(mapper_hwsvc) = mapper_hwsvc {
+            rules.push((*client, mapper_hwsvc, "hwservice_manager", &["find"][..]));
+        }
+    }
+    // QSPM HAL is a Qualcomm-specific vendor hwservice; only patch if present in kernel policy.
+    if let Some(first_client) = clients.first() {
+        let qspm_ctx = "u:object_r:vendor_hal_qspmhal_hwservice:s0";
+        if selinux::access_allowed(&format!("u:r:{first_client}:s0"), qspm_ctx, "hwservice_manager", "find")
+            .is_ok()
+        {
+            for client in &clients {
+                rules.push((
+                    *client,
+                    "vendor_hal_qspmhal_hwservice",
+                    "hwservice_manager",
+                    &["find"][..],
+                ));
+            }
+        }
     }
     for (src, dst, class, perms) in rules {
         let src_ctx = format!("u:r:{src}:s0");
