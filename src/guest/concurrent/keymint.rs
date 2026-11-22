@@ -73,7 +73,7 @@ pub(in crate::guest) fn start(
     let plan = ssal::guest_policy::runtime::load(root)?
         .ok_or_else(|| io::Error::other("Guest KeyMint SELinux policy missing"))?;
     let context = plan.context(SERVICE.domain, true)?;
-    crate::diagnostics::selinux::require_enforcing_domain(&context)?;
+    crate::diagnostics::selinux::require_guest_domain_mode(&plan, &context)?;
     let master_key = load_or_create_master_key(root)?;
     let mut keys = [0u8; 64];
     keys[..32].copy_from_slice(auth_token_key);

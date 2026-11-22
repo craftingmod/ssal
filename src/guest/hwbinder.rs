@@ -1,5 +1,5 @@
 //! Standalone Guest HwBinder validation without starting Android init or Host HALs.
-use crate::diagnostics::selinux::{access_allowed, require_enforcing_domain};
+use crate::diagnostics::selinux::{access_allowed, require_guest_domain_mode};
 use crate::guest::{binder, environment, init::Service, launcher, mount, runtime};
 use ssal::namespace_mounts::Mounts;
 use std::fs::{self, File};
@@ -128,6 +128,7 @@ fn register_presenter_pair() -> Option<OwnedFd> {
         profile_name: None,
         force_regen: false,
         native_sepolicy: false,
+        permissive: false,
     };
     if let Err(e) = ssal::unix::send(&mut stream, &req, Some(daemon_fd.as_raw_fd())) {
         eprintln!("GUEST_VIRTUAL_COMPOSER_PRESENTER=WARN ssald_send_err={e}");
@@ -251,8 +252,9 @@ pub(super) fn verify(mounts: &mut Mounts, root: &Path, host_namespace: &Path) ->
         .ok_or_else(|| io::Error::other("Guest HwBinder SELinux plan missing"))?;
     for domain in ["hwservicemanager", "hal_allocator_default", "shell"] {
         let sid = plan.context(domain, true)?;
-        require_enforcing_domain(&sid)?;
-        if Path::new("/dev/hwbinder").exists()
+        require_guest_domain_mode(&plan, &sid)?;
+        if !plan.is_permissive_domain(&sid)
+            && Path::new("/dev/hwbinder").exists()
             && access_allowed(&sid, "u:object_r:hwbinder_device:s0", "chr_file", "open")?
         {
             return Err(io::Error::other(format!("{sid} can open Host HwBinder")));
@@ -484,8 +486,8 @@ pub(super) fn verify(mounts: &mut Mounts, root: &Path, host_namespace: &Path) ->
     properties_stopped?;
     binder_unmounted?;
     unmounted?;
-    require_enforcing_domain(&sid)?;
-    require_enforcing_domain(&allocator_sid)?;
+    require_guest_domain_mode(&plan, &sid)?;
+    require_guest_domain_mode(&plan, &allocator_sid)?;
     println!("GUEST_HWBINDER_CLEANUP=PASS manager_pid={pid} reaped=true mounts=absent");
     check.and(dead)
 }

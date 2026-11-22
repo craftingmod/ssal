@@ -203,7 +203,7 @@ pub(crate) fn enter(root: &Path, words: &[String]) -> io::Result<i32> {
     let plan = ssal::guest_policy::runtime::load(root)?
         .ok_or_else(|| io::Error::other("Guest SELinux mapping required"))?;
     let context = plan.context("shell", true)?;
-    crate::diagnostics::selinux::require_enforcing_domain(&context)?;
+    crate::diagnostics::selinux::require_guest_domain_mode(&plan, &context)?;
     crate::guest::mount::directory(root, "data/local", 0o755)?;
     let home = crate::guest::mount::directory(root, "data/local/ssal-shell", 0o700)?;
     ssal::guest_policy::runtime::set_label(&home, &plan.context("shell_data_file", false)?)?;

@@ -129,7 +129,7 @@ pub fn help(command: Option<&str>) -> String {
         text.push_str("  -V, --version    Display version and exit\n\nUse 'ssal COMMAND --help' for command usage.\n");
     }
     if command == Some("prepare") {
-        text.push_str("      --regen      Regenerate guest preparation artifacts\n      --native     Use the native KernelSU SELinux backend\n");
+        text.push_str("      --regen       Regenerate guest preparation artifacts\n      --native      Use the native KernelSU SELinux backend\n      --permissive  Set Guest domains permissive and skip their Enforcing guards\n");
     }
     if command == Some("logcat") {
         text.push_str("  -d               Dump captured logs and exit\n");
@@ -208,6 +208,7 @@ pub fn parse(args: &[String]) -> Result<Action, String> {
     let mut options = true;
     let mut force_regen = false;
     let mut native_sepolicy = false;
+    let mut permissive = false;
     let mut dump_logs = false;
     for arg in &args[1..] {
         match arg.as_str() {
@@ -215,6 +216,7 @@ pub fn parse(args: &[String]) -> Result<Action, String> {
             "-h" | "--help" if options => return Ok(Action::Help(Some(first.clone()))),
             "--regen" if options && *command == "prepare" => force_regen = true,
             "--native" if options && *command == "prepare" => native_sepolicy = true,
+            "--permissive" if options && *command == "prepare" => permissive = true,
             "-d" if options && *command == "logcat" => dump_logs = true,
             _ if options && arg.starts_with('-') && arg != "-" => {
                 return Err(format!("{command}: unrecognized option '{arg}'"));
@@ -274,6 +276,7 @@ pub fn parse(args: &[String]) -> Result<Action, String> {
         profile_name: None,
         force_regen,
         native_sepolicy,
+        permissive,
     };
     let mut path = None;
     match *command {
@@ -353,13 +356,13 @@ mod tests {
     #[test]
     fn prepare_options_can_follow_operands() {
         for args in [
-            vec!["prepare", "--regen", "--native", "profile1"],
-            vec!["prepare", "profile1", "--native", "--regen"],
+            vec!["prepare", "--regen", "--native", "--permissive", "profile1"],
+            vec!["prepare", "profile1", "--permissive", "--native", "--regen"],
         ] {
             let Action::Request(r, _) = parse_words(&args).unwrap() else {
                 panic!()
             };
-            assert!(r.force_regen && r.native_sepolicy);
+            assert!(r.force_regen && r.native_sepolicy && r.permissive);
             assert_eq!(r.profile_name.as_deref(), Some("profile1"));
         }
     }
@@ -386,6 +389,7 @@ mod tests {
             vec!["create", "../image"],
             vec!["remove", "bad/name"],
             vec!["status", "--native"],
+            vec!["start", "--permissive", "profile1"],
             vec!["logcat", "profile1"],
             vec!["logs", "-d"],
             vec!["prepare", "--regen"],

@@ -13,7 +13,7 @@ pub mod native;
 pub mod runtime;
 mod symbols;
 
-const VERSION: u32 = 77;
+const VERSION: u32 = 79;
 
 type Names = BTreeMap<String, String>;
 
@@ -142,6 +142,10 @@ pub struct Input {
 pub struct Plan {
     pub version: u32,
     pub id: String,
+    #[serde(default)]
+    pub permissive: bool,
+    #[serde(default)]
+    pub domains: BTreeSet<String>,
     pub input_hash: String,
     pub inputs: Vec<Input>,
     pub types: Names,
@@ -161,6 +165,14 @@ pub struct Plan {
 }
 
 impl Plan {
+    pub fn is_permissive_domain(&self, context: &str) -> bool {
+        self.permissive
+            && context
+                .strip_prefix("u:r:")
+                .and_then(|context| context.split_once(':'))
+                .is_some_and(|(name, _)| self.domains.contains(name))
+    }
+
     fn ensure_kernel_av_access(&mut self) -> io::Result<()> {
         // selinuxfs computes decisions against the live kernel SID, not its Guest copy.
         for original in ["init", "servicemanager"] {
@@ -247,6 +259,9 @@ impl Plan {
     }
 
     pub fn usable(&self) -> io::Result<()> {
+        if self.permissive && self.domains.is_empty() {
+            return Err(invalid("permissive plan has no Guest process domains"));
+        }
         if self.types.len() >= 8192 {
             return Err(invalid(
                 "GSI exceeds native context-map capacity (8191 types)",
@@ -594,6 +609,8 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
     let mut plan = Plan {
         version: VERSION,
         id: id.into(),
+        permissive: false,
+        domains: BTreeSet::new(),
         input_hash: digest(&serde_json::to_vec(&hashes)?),
         inputs: hashes,
         types: Names::new(),
@@ -693,6 +710,10 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
         ) {
             plan.unsupported.push(e.to_string());
         }
+    }
+    if let Some(domains) = sets.get("domain") {
+        plan.domains
+            .extend(domains.iter().map(|name| plan.types[name].clone()));
     }
     for (path, text) in inputs.iter().filter(|(p, _)| p.ends_with("file_contexts")) {
         for raw in text.lines() {
@@ -1769,12 +1790,13 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
     Ok(plan)
 }
 
-/// Hash first: unchanged GSI input never invokes the parser or rewrites generated artifacts.
+/// Reuse the generated policy when only its Guest domain mode changes.
 pub fn prepare(
     profile: &Path,
     id: &str,
     files: &BTreeMap<String, String>,
     force_regen: bool,
+    permissive: Option<bool>,
 ) -> io::Result<(Plan, bool)> {
     let directory = profile.join("selinux");
     fs::create_dir_all(&directory)?;
@@ -1787,33 +1809,54 @@ pub fn prepare(
         })
         .collect();
     let hash = digest(&serde_json::to_vec(&hashes)?);
-    if !force_regen && path.is_file() {
-        let plan: Plan = serde_json::from_slice(&fs::read(&path)?)?;
-        if plan.version == VERSION && plan.id == id && plan.input_hash == hash {
-            return Ok((plan, false));
-        }
-    }
-    let plan = match generate(id, files) {
-        Ok(plan) => plan,
-        Err(error) => {
-            atomic(
-                &directory.join("generation-error.json"),
-                &serde_json::to_vec_pretty(
-                    &serde_json::json!({"id":id,"input_hash":hash,"inputs":hashes,"error":error.to_string()}),
-                )?,
-            )?;
-            return Err(error);
+    let cached: Option<Plan> = if force_regen && permissive.is_some() {
+        None
+    } else {
+        match fs::read(&path) {
+            Ok(bytes) => Some(serde_json::from_slice(&bytes)?),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
         }
     };
+    let permissive = permissive.unwrap_or_else(|| {
+        cached
+            .as_ref()
+            .is_some_and(|plan| plan.id == id && plan.permissive)
+    });
+    let cached = cached.filter(|plan| {
+        !force_regen && plan.version == VERSION && plan.id == id && plan.input_hash == hash
+    });
+    let regenerated = cached.is_none();
+    let mut plan = match cached {
+        Some(plan) if plan.permissive == permissive => return Ok((plan, false)),
+        Some(plan) => plan,
+        None => match generate(id, files) {
+            Ok(plan) => plan,
+            Err(error) => {
+                atomic(
+                    &directory.join("generation-error.json"),
+                    &serde_json::to_vec_pretty(
+                        &serde_json::json!({"id":id,"input_hash":hash,"inputs":hashes,"error":error.to_string()}),
+                    )?,
+                )?;
+                return Err(error);
+            }
+        },
+    };
+    plan.permissive = permissive;
     let bytes = serde_json::to_vec_pretty(&plan)?;
     let history = directory.join("plans");
     fs::create_dir_all(&history)?;
     atomic(
-        &history.join(format!("v{VERSION}-{}.json", plan.input_hash)),
+        &history.join(format!(
+            "v{VERSION}-{}{}.json",
+            plan.input_hash,
+            if permissive { "-permissive" } else { "" }
+        )),
         &bytes,
     )?;
     atomic(&path, &bytes)?;
-    Ok((plan, true))
+    Ok((plan, regenerated))
 }
 
 #[cfg(test)]
@@ -2368,27 +2411,51 @@ mod tests {
         let profile = root.join("profile");
         fs::create_dir(&profile)?;
         let files = fixture();
-        assert!(prepare(&profile, &id, &files, false)?.1);
-        assert!(!prepare(&profile, &id, &files, false)?.1);
-        assert!(prepare(&profile, &id, &files, true)?.1);
-        assert!(!prepare(&profile, &id, &files, false)?.1);
+        assert!(prepare(&profile, &id, &files, false, None)?.1);
+        assert!(!prepare(&profile, &id, &files, false, None)?.1);
+        assert!(prepare(&profile, &id, &files, true, None)?.1);
+        assert!(!prepare(&profile, &id, &files, false, None)?.1);
         let mut stale = generate(&id, &files)?;
         stale.version = 1;
         atomic(
             &profile.join("selinux/plan.json"),
             &serde_json::to_vec(&stale)?,
         )?;
-        assert!(prepare(&profile, &id, &files, false)?.1);
+        assert!(prepare(&profile, &id, &files, false, None)?.1);
         let mut changed = files;
         changed
             .get_mut("system/etc/selinux/plat_seapp_contexts")
             .unwrap()
             .push_str("# changed\n");
-        assert!(prepare(&profile, &id, &changed, false)?.1);
+        assert!(prepare(&profile, &id, &changed, false, None)?.1);
         assert_eq!(fs::read_dir(profile.join("selinux/plans"))?.count(), 2);
         fs::remove_dir_all(&profile)?;
         assert_eq!(allocate_id(&root)?, "p0002");
         fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn prepare_permissive_applies_only_to_guest_domains_and_can_be_reset() -> io::Result<()> {
+        let profile = std::env::temp_dir()
+            .join(format!("ssal-permissive-{}", std::process::id()));
+        let files = fixture();
+        let (plan, _) = prepare(&profile, "p0001", &files, false, Some(true))?;
+        assert!(plan.is_permissive_domain("u:r:ssal_p0001_zygote:s0"));
+        assert!(!plan.is_permissive_domain("u:r:zygote:s0"));
+        assert!(!plan.is_permissive_domain("u:object_r:ssal_p0001_system_file:s0"));
+        let statements: BTreeSet<_> = runtime::encode_native(&plan)?
+            .into_iter()
+            .flat_map(|batch| batch.statements)
+            .filter(|statement| statement.starts_with("permissive "))
+            .collect();
+        assert_eq!(statements, [
+            "permissive ssal_p0001_system_server".into(),
+            "permissive ssal_p0001_zygote".into(),
+        ].into());
+        assert!(prepare(&profile, "p0001", &files, false, None)?.0.permissive);
+        assert!(!prepare(&profile, "p0001", &files, false, Some(false))?.0.permissive);
+        fs::remove_dir_all(profile)?;
         Ok(())
     }
 
@@ -2418,9 +2485,9 @@ mod tests {
         );
         let generated = generate("p0001", &files)?;
         let expected = serde_json::to_vec_pretty(&generated)?;
-        let (miss, regenerated) = prepare(&root, "p0001", &files, false)?;
+        let (miss, regenerated) = prepare(&root, "p0001", &files, false, None)?;
         assert!(regenerated);
-        let (hit, regenerated) = prepare(&root, "p0001", &files, false)?;
+        let (hit, regenerated) = prepare(&root, "p0001", &files, false, None)?;
         assert!(!regenerated);
         for plan in [&miss, &hit] {
             assert_eq!(serde_json::to_vec_pretty(plan)?, expected);
@@ -2449,7 +2516,7 @@ mod tests {
             &root.join("selinux/plan.json"),
             &serde_json::to_vec(&legacy)?,
         )?;
-        let (upgraded, regenerated) = prepare(&root, "p0001", &files, false)?;
+        let (upgraded, regenerated) = prepare(&root, "p0001", &files, false, None)?;
         assert!(regenerated);
         assert_eq!(serde_json::to_vec_pretty(&upgraded)?, expected);
         // Reproduce the old mounted-only correction without changing its rule/command set.

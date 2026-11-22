@@ -69,7 +69,13 @@ fn select_backend(plan: &Plan, requested: Backend) -> Backend {
 }
 
 pub fn encode_native(plan: &Plan) -> io::Result<Vec<native::EncodedBatch>> {
-    native::encode(plan, &delta(plan, &Applied::default())?)
+    let mut ordered = delta(plan, &Applied::default())?;
+    if !plan.permissive {
+        return native::encode(plan, &ordered);
+    }
+    let mut plan = plan.clone();
+    add_domain_mode_commands(&mut plan, &mut ordered, &BTreeSet::new(), &BTreeSet::new());
+    native::encode(&plan, &ordered)
 }
 
 /// Offline validation only: never acquires a driver FD or calls an ioctl.
@@ -310,6 +316,44 @@ fn delta(plan: &Plan, applied: &Applied) -> io::Result<Vec<String>> {
         .collect())
 }
 
+fn domain_mode_changes<'a>(
+    plan: &'a Plan,
+    current: &'a BTreeSet<String>,
+    owned: &'a BTreeSet<String>,
+) -> impl Iterator<Item = (&'a String, bool)> {
+    let prefix = format!("ssal_{}_", plan.id);
+    current
+        .intersection(owned)
+        .filter(move |name| name.starts_with(&prefix))
+        .filter(|name| !plan.permissive || !plan.domains.contains(*name))
+        .map(|name| (name, false))
+        .chain(
+            plan.domains
+                .difference(current)
+                .filter(|_| plan.permissive)
+                .map(|name| (name, true)),
+        )
+}
+
+fn add_domain_mode_commands(
+    plan: &mut Plan,
+    ordered: &mut Vec<String>,
+    current: &BTreeSet<String>,
+    owned: &BTreeSet<String>,
+) {
+    let commands: Vec<_> = domain_mode_changes(plan, current, owned)
+        .map(|(name, permissive)| {
+            let action = if permissive { "permissive" } else { "enforce" };
+            let subcmd = if permissive { 1 } else { 2 };
+            (format!("{action} {name}"), name.clone(), subcmd)
+        })
+        .collect();
+    for (statement, name, subcmd) in commands {
+        native::record(&mut plan.native_rules, statement.clone(), 3, subcmd, &[&name]);
+        ordered.push(statement);
+    }
+}
+
 fn compatible_plan(
     plan: &Plan,
     symbols: &BTreeSet<String>,
@@ -483,8 +527,12 @@ pub fn apply_with_backend(profile: &Path, plan: &Plan, backend: Backend) -> io::
     let policy =
         read_policy_with_recovery(|| fs::read("/sys/fs/selinux/policy"), recover_policy_export)?;
     let symbols = super::symbols::read(&policy)?;
-    let (compatible, omitted) =
-        compatible_plan(plan, &symbols, &applied, Path::new("/sys/fs/selinux/class"))?;
+    let (mut compatible, omitted) = compatible_plan(
+        plan,
+        &symbols.names,
+        &applied,
+        Path::new("/sys/fs/selinux/class"),
+    )?;
     let backend = select_backend(&compatible, backend);
     let compatible_bytes = serde_json::to_vec_pretty(&compatible)?;
     atomic(&directory.join("compatible-plan.json"), &compatible_bytes)?;
@@ -498,11 +546,18 @@ pub fn apply_with_backend(profile: &Path, plan: &Plan, backend: Backend) -> io::
                 "rule_readback_verified":false}),
         )?,
     )?;
-    let ordered = delta(&compatible, &applied)?;
+    let mut ordered = delta(&compatible, &applied)?;
+    let rule_count = ordered.len();
+    add_domain_mode_commands(
+        &mut compatible,
+        &mut ordered,
+        &symbols.permissive,
+        &applied.symbols,
+    );
     applied.rule_readback_verified = false;
     for declaration in &compatible.declarations {
         let name = declaration.split_whitespace().nth(1).unwrap();
-        if symbols.contains(name) && !applied.symbols.contains(name) {
+        if symbols.names.contains(name) && !applied.symbols.contains(name) {
             return Err(invalid(format!(
                 "unowned active policy symbol collision: {name}"
             )));
@@ -569,12 +624,26 @@ pub fn apply_with_backend(profile: &Path, plan: &Plan, backend: Backend) -> io::
                 return Err(invalid(&applied.result));
             }
         }
-        for statement in &ordered {
+        // Domain modes can change again this boot, so only ledger additive rules.
+        for statement in &ordered[..rule_count] {
             applied.statements.insert(statement.clone());
             if statement.starts_with("type ") || statement.starts_with("attribute ") {
                 applied
                     .symbols
                     .insert(statement.split_whitespace().nth(1).unwrap().into());
+            }
+        }
+        if ordered.len() != rule_count {
+            let policy = read_policy_with_recovery(
+                || fs::read("/sys/fs/selinux/policy"),
+                recover_policy_export,
+            )?;
+            let active = super::symbols::read(&policy)?;
+            if domain_mode_changes(plan, &active.permissive, &applied.symbols)
+                .next()
+                .is_some()
+            {
+                return Err(invalid("Guest SELinux domain mode readback failed; reboot before prepare"));
             }
         }
         applied.pending = false;
@@ -636,6 +705,15 @@ pub fn load_applied_for_probe(system: &Path, profile: &Path) -> io::Result<Plan>
         return Err(invalid("Guest probe requires an already applied plan for this image and boot"));
     }
     plan.usable()?;
+    if plan.permissive {
+        let active = super::symbols::read(&fs::read("/sys/fs/selinux/policy")?)?;
+        if domain_mode_changes(&plan, &active.permissive, &applied.symbols)
+            .next()
+            .is_some()
+        {
+            return Err(invalid("Guest probe requires the prepared SELinux domain mode"));
+        }
+    }
     Ok(plan)
 }
 
@@ -644,6 +722,7 @@ pub fn prepare_mounted(
     system_image: &Path,
     profile: &Path,
     force_regen: bool,
+    permissive: Option<bool>,
 ) -> io::Result<Plan> {
     fs::create_dir_all(profile.join("selinux"))?;
     let prepare_lock = File::create(profile.join("selinux/prepare.lock"))?;
@@ -668,7 +747,7 @@ pub fn prepare_mounted(
     };
     drop(registry_lock);
     let files = inputs(system)?;
-    let (plan, regenerated) = prepare(profile, &id, &files, force_regen)?;
+    let (plan, regenerated) = prepare(profile, &id, &files, force_regen, permissive)?;
     for original in ["init", "servicemanager", "socket_device", "property_socket"] {
         plan.context(original, false)?;
     }
@@ -687,6 +766,9 @@ pub fn prepare_mounted(
         Ok(value) => return Err(invalid(format!("unknown prepare SELinux backend: {value}"))),
     };
     apply_with_backend(profile, &plan, backend)?;
+    if plan.permissive {
+        println!("Guest SELinux permissive=1; Guest Enforcing guards excluded");
+    }
     Ok(plan)
 }
 
@@ -1083,6 +1165,22 @@ pub fn load(root: &Path) -> io::Result<Option<Plan>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn domain_mode_delta_can_restore_only_owned_guest_types() -> io::Result<()> {
+        let mut plan = generate("p0001", &BTreeMap::from([(
+            "test.cil".into(),
+            "(type init) (typeattribute domain) (typeattributeset domain (init))".into(),
+        )]))?;
+        let current = BTreeSet::from(["ssal_p0001_init".into(), "ssal_p0002_init".into(), "ksu".into()]);
+        let mut ordered = Vec::new();
+        add_domain_mode_commands(&mut plan, &mut ordered, &current, &BTreeSet::new());
+        assert!(ordered.is_empty());
+        add_domain_mode_commands(&mut plan, &mut ordered, &current, &current);
+        assert_eq!(ordered, ["enforce ssal_p0001_init"]);
+        native::encode(&plan, &ordered)?;
+        Ok(())
+    }
     #[test]
     fn upper_root_copies_metadata_and_refuses_reuse() -> io::Result<()> {
         use std::os::unix::fs::PermissionsExt;

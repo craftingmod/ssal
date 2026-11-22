@@ -36,7 +36,7 @@ pub(in crate::guest) fn start(
     let plan = ssal::guest_policy::runtime::load(root)?
         .ok_or_else(|| io::Error::other("Guest Thermal SELinux policy missing"))?;
     let context = plan.context(SERVICE.domain, true)?;
-    crate::diagnostics::selinux::require_enforcing_domain(&context)?;
+    crate::diagnostics::selinux::require_guest_domain_mode(&plan, &context)?;
     let source = std::env::var("SSAL_GUEST_THERMAL_SOURCE").unwrap_or_else(|_| "host".into());
     let input = match source.as_str() {
         "diagnostic" => Stdio::null(),

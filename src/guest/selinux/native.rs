@@ -36,6 +36,7 @@ impl PolicyCommand {
         let valid = match self.cmd {
             1 => self.args.len() == 4 && matches!(self.subcmd, 1 | 3 | 4),
             2 => self.args.len() == 5 && (1..=3).contains(&self.subcmd),
+            3 => self.args.len() == 1 && matches!(self.subcmd, 1 | 2),
             4 | 5 => self.args.len() == 2 && self.subcmd == 0,
             6 => self.args.len() == 1 && self.subcmd == 0,
             7 => self.args.len() == 5 && self.subcmd == 0,
@@ -89,7 +90,7 @@ impl PolicyCommand {
                             "mlstrustedsubject" | "mlstrustedobject"
                         ))
             } // Shared Host labels may join a Guest target attribute; Guest types may join Host MLS trusted attributes.
-            6 => guest(0),
+            3 | 6 => guest(0),
             7 => {
                 guest(0)
                     && guest(3)
@@ -148,6 +149,8 @@ fn statement_text(commands: &[PolicyCommand]) -> io::Result<String> {
                 2 => "auditallowxperm",
                 _ => "dontauditxperm",
             },
+            3 if first.subcmd == 1 => "permissive",
+            3 => "enforce",
             4 => "type",
             5 => "typeattribute",
             6 => "attribute",
@@ -229,6 +232,12 @@ pub fn encode(plan: &Plan, ordered: &[String]) -> io::Result<Vec<EncodedBatch>> 
                 }
                 if !placeholder && !command.owned(&prefix) {
                     return Err(invalid("command modifies non-Guest policy"));
+                }
+                if command.cmd == 3
+                    && command.subcmd == 1
+                    && (!plan.permissive || !plan.domains.contains(&command.args[0]))
+                {
+                    return Err(invalid("permissive requires an opted-in Guest domain"));
                 }
                 let next_phase = match command.cmd {
                     6 => 0,

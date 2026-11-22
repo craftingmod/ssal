@@ -33,7 +33,7 @@ pub(in crate::guest) fn start(
     let plan = ssal::guest_policy::runtime::load(root)?
         .ok_or_else(|| io::Error::other("Guest Sensors SELinux policy missing"))?;
     let context = plan.context(SERVICE.domain, true)?;
-    crate::diagnostics::selinux::require_enforcing_domain(&context)?;
+    crate::diagnostics::selinux::require_guest_domain_mode(&plan, &context)?;
 
     let (guest_sock, host_sock) = UnixStream::pair()?;
     let parent = std::process::id() as libc::pid_t;

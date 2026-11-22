@@ -1010,7 +1010,7 @@ mod tests {
             since: service.started_at,
             delay: Duration::ZERO,
         });
-        service.spawn = |_, _| Err(io::Error::other("simulated exec failure"));
+        service.spawn = |_, _, _| Err(io::Error::other("simulated exec failure"));
         registry.tick(&mut properties).unwrap();
         let service = &registry.0["mock"];
         assert!(
@@ -1101,7 +1101,7 @@ service single /bin/sleep 60
             .is_none());
 
         registry.0.get_mut("mock").unwrap().spawn =
-            |_, _| Command::new("/bin/true").process_group(0).spawn();
+            |_, _, _| Command::new("/bin/true").process_group(0).spawn();
         let success = rsproperties::wire::PROP_SUCCESS as u32;
         assert_eq!(
             request(&mut registry, &mut properties, "start", "mock", true),

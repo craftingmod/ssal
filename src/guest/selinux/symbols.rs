@@ -18,6 +18,10 @@ impl<'a> Reader<'a> {
     }
 
     fn bitmap(&mut self) -> io::Result<()> {
+        self.bitmap_nodes().map(|_| ())
+    }
+
+    fn bitmap_nodes(&mut self) -> io::Result<&[u8]> {
         let size = self.word()?;
         let highbit = self.word()?;
         let count = self.word()? as usize;
@@ -28,8 +32,7 @@ impl<'a> Reader<'a> {
             count
                 .checked_mul(12)
                 .ok_or_else(|| invalid("bitmap size overflow"))?,
-        )?;
-        Ok(())
+        )
     }
 
     fn permissions(&mut self, count: u32) -> io::Result<()> {
@@ -66,7 +69,12 @@ impl<'a> Reader<'a> {
     }
 }
 
-pub(super) fn read(policy: &[u8]) -> io::Result<BTreeSet<String>> {
+pub(super) struct Symbols {
+    pub names: BTreeSet<String>,
+    pub permissive: BTreeSet<String>,
+}
+
+pub(super) fn read(policy: &[u8]) -> io::Result<Symbols> {
     let mut r = Reader(policy);
     if r.word()? != 0xf97cff8c {
         return Err(invalid("not a SELinux kernel policy"));
@@ -88,8 +96,18 @@ pub(super) fn read(policy: &[u8]) -> io::Result<BTreeSet<String>> {
     }
     r.word()?;
     r.bitmap()?; // policy capabilities
-    r.bitmap()?; // permissive types
-    let mut symbols = BTreeSet::new();
+    let permissive_nodes = r.bitmap_nodes()?;
+    let permissive_bits: BTreeMap<_, _> = permissive_nodes
+        .chunks_exact(12)
+        .map(|node| {
+            (
+                u32::from_le_bytes(node[..4].try_into().unwrap()),
+                u64::from_le_bytes(node[4..].try_into().unwrap()),
+            )
+        })
+        .collect();
+    let mut names = BTreeSet::new();
+    let mut permissive = BTreeSet::new();
     for table in 0..4 {
         let primary = r.word()?;
         let count = r.word()?;
@@ -140,15 +158,21 @@ pub(super) fn read(policy: &[u8]) -> io::Result<BTreeSet<String>> {
                         || value == 0
                         || value > primary
                         || properties & !3 != 0
-                        || !symbols.insert(name.into())
+                        || !names.insert(name.into())
                     {
                         return Err(invalid(format!("invalid SELinux type/attribute symbol: {name:?}, value={value}/{primary}, properties={properties}")));
+                    }
+                    if permissive_bits
+                        .get(&(value / 64 * 64))
+                        .is_some_and(|bits| bits & (1 << (value % 64)) != 0)
+                    {
+                        permissive.insert(name.into());
                     }
                 }
             }
         }
     }
-    Ok(symbols)
+    Ok(Symbols { names, permissive })
 }
 
 #[cfg(test)]
@@ -159,7 +183,7 @@ mod tests {
     #[ignore = "set SSAL_HOST_POLICY_FIXTURE to a saved active binary policy"]
     fn saved_host_policy_symbols() -> io::Result<()> {
         let policy = fs::read(std::env::var("SSAL_HOST_POLICY_FIXTURE").unwrap())?;
-        let symbols = read(&policy)?;
+        let symbols = read(&policy)?.names;
         assert!(symbols.contains("init"));
         assert!(symbols.contains("domain"));
         assert!(!symbols.contains("object_r"));
@@ -183,7 +207,8 @@ mod tests {
             };
             words(&mut bytes, &[0xf97cff8c, 8]);
             bytes.extend(b"SE Linux");
-            words(&mut bytes, &[version, 1, 8, 9, 64, 0, 0, 64, 0, 0]);
+            words(&mut bytes, &[version, 1, 8, 9, 64, 0, 0, 64, 64, 1]);
+            words(&mut bytes, &[0, 1 << 1, 0]); // type value 1 is permissive
             words(&mut bytes, &[1, 1, 7, 1, 0, 0]);
             bytes.extend(b"iso9660"); // common name, not a type
             words(&mut bytes, &[0, 0, 0, 0, 2, 2]); // empty classes/roles, two types
@@ -191,10 +216,12 @@ mod tests {
             bytes.extend(b"ssal_p0001_x");
             words(&mut bytes, &[6, 2, 2, 0]);
             bytes.extend(b"domain");
+            let symbols = read(&bytes)?;
             assert_eq!(
-                read(&bytes)?,
+                symbols.names,
                 BTreeSet::from(["ssal_p0001_x".into(), "domain".into()])
             );
+            assert_eq!(symbols.permissive, BTreeSet::from(["ssal_p0001_x".into()]));
             for end in 0..bytes.len() {
                 assert!(read(&bytes[..end]).is_err());
             }

@@ -38,7 +38,7 @@ pub(in crate::guest) fn apply_vendor_access(
     applied_only: bool,
 ) -> io::Result<()> {
     let shell = plan.context("shell", true)?;
-    selinux::require_enforcing_domain(&shell)?;
+    selinux::require_guest_domain_mode(plan, &shell)?;
     let domain = &plan.types["shell"];
     for (target, class, permissions) in VENDOR_ACCESS {
         let context = format!("u:object_r:{target}:s0");
@@ -93,7 +93,7 @@ fn apply_graphics_client_access(
     original_domain: &str,
 ) -> io::Result<()> {
     let sid = plan.context(original_domain, true)?;
-    selinux::require_enforcing_domain(&sid)?;
+    selinux::require_guest_domain_mode(plan, &sid)?;
     let domain = plan
         .types
         .get(original_domain)
@@ -271,7 +271,7 @@ pub(in crate::guest) fn apply_virtual_composer_access(
     plan: &ssal::guest_policy::Plan,
 ) -> io::Result<()> {
     let composer_sid = plan.context("hal_graphics_composer_default", true)?;
-    selinux::require_enforcing_domain(&composer_sid)?;
+    selinux::require_guest_domain_mode(plan, &composer_sid)?;
     let composer = plan
         .types
         .get("hal_graphics_composer_default")
@@ -386,7 +386,7 @@ pub(in crate::guest) fn apply_graphics_allocator_access(
     plan: &ssal::guest_policy::Plan,
 ) -> io::Result<()> {
     let alloc_sid = plan.context("hal_graphics_allocator_default", true)?;
-    selinux::require_enforcing_domain(&alloc_sid)?;
+    selinux::require_guest_domain_mode(plan, &alloc_sid)?;
     let alloc = plan
         .types
         .get("hal_graphics_allocator_default")
@@ -504,7 +504,7 @@ pub(in crate::guest) fn apply_hwbinder_vintf_access(
     plan: &ssal::guest_policy::Plan,
 ) -> io::Result<()> {
     let manager = plan.context("hwservicemanager", true)?;
-    selinux::require_enforcing_domain(&manager)?;
+    selinux::require_guest_domain_mode(plan, &manager)?;
     let domain = plan
         .types
         .get("hwservicemanager")

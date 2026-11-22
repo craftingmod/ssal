@@ -45,6 +45,7 @@ fn add_private_hal_rules(
     };
     let domain = declare(domain_name)?;
     let exec = declare(exec_name)?;
+    plan.domains.insert(domain.clone());
     let mut rules: Vec<(String, String, &'static str, &'static [&'static str])> = vec![
         (exec.clone(), "labeledfs".into(), "filesystem", &["associate"]),
         (exec.clone(), "tmpfs".into(), "filesystem", &["associate"]),

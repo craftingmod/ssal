@@ -298,6 +298,8 @@ mod tests {
         Plan {
             version: 1,
             id: id.into(),
+            permissive: false,
+            domains: BTreeSet::new(),
             input_hash: "hash".into(),
             inputs: Vec::new(),
             types: types

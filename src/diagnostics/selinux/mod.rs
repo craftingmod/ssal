@@ -75,12 +75,19 @@ fn parse_av(reply: &str, requested: u32) -> io::Result<(bool, bool, u32)> {
     ))
 }
 
-pub(crate) fn require_enforcing_domain(context: &str) -> io::Result<()> {
-    if fs::read_to_string("/sys/fs/selinux/enforce")?.trim() != "1"
-        || query(context, context, "process", "fork")?.permissive_domain
-    {
+pub(crate) fn require_guest_domain_mode(
+    plan: &ssal::guest_policy::Plan,
+    context: &str,
+) -> io::Result<()> {
+    if fs::read_to_string("/sys/fs/selinux/enforce")?.trim() != "1" {
+        return Err(io::Error::other("Host global Enforcing required"));
+    }
+    if plan.is_permissive_domain(context) {
+        return Ok(());
+    }
+    if query(context, context, "process", "fork")?.permissive_domain {
         return Err(io::Error::other(format!(
-            "Shell requires an enforcing Guest domain: {context}"
+            "Guest domain must be enforcing: {context}"
         )));
     }
     Ok(())

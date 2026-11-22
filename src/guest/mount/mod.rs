@@ -181,6 +181,8 @@ pub(super) fn verify(
             system_image,
             profile_dir,
             force_regen,
+            (mode == "--prepare-worker")
+                .then(|| std::env::var("SSAL_PREPARE_PERMISSIVE").as_deref() == Ok("1")),
         )?)
     } else {
         None

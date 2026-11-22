@@ -3,7 +3,7 @@ use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 #[derive(Serialize, Deserialize)]
 pub struct Request {
     pub version: u32,
@@ -16,6 +16,8 @@ pub struct Request {
     pub force_regen: bool,
     #[serde(default)]
     pub native_sepolicy: bool,
+    #[serde(default)]
+    pub permissive: bool,
 }
 
 pub fn valid_image_name(name: &str) -> bool {

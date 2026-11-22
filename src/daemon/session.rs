@@ -70,8 +70,8 @@ fn handle(
     if req.version != VERSION {
         return reply(&mut stream, false, "unsupported protocol version");
     }
-    if (req.force_regen || req.native_sepolicy) && req.command != "prepare" {
-        return reply(&mut stream, false, "--regen is only supported by prepare");
+    if (req.force_regen || req.native_sepolicy || req.permissive) && req.command != "prepare" {
+        return reply(&mut stream, false, "--regen, --native and --permissive require prepare");
     }
     match req.command.as_str() {
         "logcat" | "logcat-dump" => {
@@ -124,7 +124,10 @@ fn handle(
             let Some(name) = req.profile_name.as_deref().filter(|name| valid_image_name(name)) else { return reply(&mut stream, false, "invalid profile name"); };
             let guard = busy.lock().unwrap();
             if *guard { return reply(&mut stream, false, "another operation is running"); }
-            let result = prepare_session(&root, name, &req.command, req.force_regen, req.native_sepolicy);
+            if req.command == "prepare" && active_guest.lock().unwrap().is_some() {
+                return reply(&mut stream, false, "stop the running Guest before prepare");
+            }
+            let result = prepare_session(&root, name, &req.command, req.force_regen, req.native_sepolicy, req.permissive);
             match result { Ok(message) => { log(&root, &message); reply(&mut stream, true, message) }, Err(e) => { let message = format!("prepare failed: {e}"); log(&root, &message); reply(&mut stream, false, message) } }
         }
         "start" => {
@@ -352,6 +355,7 @@ fn prepare_session(
     mode: &str,
     force_regen: bool,
     native_sepolicy: bool,
+    permissive: bool,
 ) -> io::Result<String> {
     let exe = daemon_exe()?;
     if mode == "prepare" {
@@ -389,6 +393,7 @@ fn prepare_session(
             "SSAL_PREPARE_SEPOLICY_BACKEND",
             if native_sepolicy { "native" } else { "ksud" },
         );
+        worker.env("SSAL_PREPARE_PERMISSIVE", if permissive { "1" } else { "0" });
         let output = worker.output()?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
