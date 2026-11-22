@@ -84,6 +84,11 @@ const UNAVAILABLE_FEATURES_XML: &str = r#"<?xml version="1.0" encoding="utf-8"?>
     <unavailable-feature name="android.hardware.wifi.rtt" />
 </permissions>
 "#;
+const AVAILABLE_FEATURES_XML: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<permissions>
+    <feature name="android.hardware.ethernet" />
+</permissions>
+"#;
 
 #[derive(Default, Debug, PartialEq, Eq)]
 struct OverlayStats {
@@ -156,6 +161,11 @@ pub(in crate::guest) fn install_unavailable_features(
     fs::write(&fragment, UNAVAILABLE_FEATURES_XML)?;
     fs::set_permissions(&fragment, fs::Permissions::from_mode(0o644))?;
     ssal::guest_policy::runtime::set_label(&fragment, &file_context)?;
+
+    let available_fragment = staging.join("ssal_available_features.xml");
+    fs::write(&available_fragment, AVAILABLE_FEATURES_XML)?;
+    fs::set_permissions(&available_fragment, fs::Permissions::from_mode(0o644))?;
+    ssal::guest_policy::runtime::set_label(&available_fragment, &file_context)?;
 
     mounts.bind(&staging, &permissions_dir, true, true)?;
     println!(

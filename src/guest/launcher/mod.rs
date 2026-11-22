@@ -960,34 +960,6 @@ fn isolated(root: &Path, userdata: &Path) -> io::Result<()> {
 }
 
 fn prepare_aconfig_storage(root: &Path) -> io::Result<()> {
-    let plan = ssal::guest_policy::runtime::load(root)?;
-    for (rel, mode, label_type) in [
-        ("metadata/aconfig", 0o775, "aconfig_storage_metadata_file"),
-        (
-            "metadata/aconfig/flags",
-            0o770,
-            "aconfig_storage_flags_metadata_file",
-        ),
-        (
-            "metadata/aconfig/maps",
-            0o775,
-            "aconfig_storage_metadata_file",
-        ),
-        (
-            "metadata/aconfig/boot",
-            0o775,
-            "aconfig_storage_metadata_file",
-        ),
-    ] {
-        let dir = crate::guest::mount::directory(root, rel, mode)?;
-        std::os::unix::fs::chown(&dir, Some(0), Some(1000))?;
-        fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(mode))?;
-        if let Some(plan) = &plan {
-            if plan.types.contains_key(label_type) {
-                ssal::guest_policy::runtime::set_label(&dir, &plan.context(label_type, false)?)?;
-            }
-        }
-    }
     if root.join("system/bin/aconfigd-system").is_file() {
         for subcmd in ["early-platform-init", "platform-init"] {
             match run(root, "/system/bin/aconfigd-system", &[subcmd], 1000) {
@@ -1007,40 +979,40 @@ fn prepare_aconfig_storage(root: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn prepare_security_daemon_dir(
-    root: &Path,
-    rel: &str,
-    uid: u32,
-    gid: u32,
-    mode: u32,
-    label_type: &str,
-) -> io::Result<()> {
-    let dir = crate::guest::mount::directory(root, rel, mode)?;
-    std::os::unix::fs::chown(&dir, Some(uid), Some(gid))?;
-    fs::set_permissions(&dir, fs::Permissions::from_mode(mode))?;
-    if let Some(plan) = ssal::guest_policy::runtime::load(root)? {
-        ssal::guest_policy::runtime::set_label(&dir, &plan.context(label_type, false)?)?;
+fn prepare_initrc_directories(root: &Path) -> io::Result<()> {
+    let label = ssal::guest_policy::runtime::load(root)?.is_some();
+    let props = read_initrc_properties(root).unwrap_or_default();
+    let plan = initrc::Plan::load(root, &props)?;
+    let created = initrc::fs::apply_mkdirs(
+        root,
+        &plan,
+        &["early-init", "init", "post-fs", "post-fs-data", "boot"],
+        &props,
+        &["/data/", "/metadata/"],
+        label,
+    )?;
+    if !root.join("data/misc/profiles/cur/0").is_dir() {
+        let fc = if label {
+            Some(initrc::file_contexts::FileContexts::load_from_guest_root(
+                root,
+            )?)
+        } else {
+            None
+        };
+        initrc::fs::ensure_directory(
+            root,
+            "/data/misc/profiles/cur/0",
+            0o771,
+            0,
+            0,
+            fc.as_ref(),
+        )?;
     }
+    println!("Guest initrc boot mkdirs applied={created} label={label}");
     Ok(())
 }
 
 fn start_data_service(root: &Path, exe: &str, name: &str) -> io::Result<Service> {
-    if exe == INSTALLD {
-        let plan = if installd_probe_requested() || graphics_system_server_requested() {
-            ssal::guest_policy::runtime::load(root)?
-        } else {
-            None
-        };
-        for (path, label) in [
-            ("data/misc/user", "misc_user_data_file"),
-            ("data/misc/installd", "install_data_file"),
-        ] {
-            let path = crate::guest::mount::directory(root, path, 0o755)?;
-            if let Some(plan) = &plan {
-                ssal::guest_policy::runtime::set_label(&path, &plan.context(label, false)?)?;
-            }
-        }
-    }
     Service::start(root, exe, &[], name, 0, Some(GUEST_PROBE_CONTEXT), &[])
 }
 
@@ -1889,6 +1861,9 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
             .then(|| system_suspend::start(root, &bin, guest_binder))
             .transpose()?;
         let mut boot_services = Vec::new();
+        if start_system_server || adbd_enabled || installd_probe || phase6a {
+            prepare_initrc_directories(root)?;
+        }
         if start_system_server {
             prepare_aconfig_storage(root)?;
             health::start(root, &bin, guest_binder, &mut boot_services)?;
@@ -1898,22 +1873,6 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
             let auth_token_key = keymint::random_bytes::<32>()?;
             keymint::start(root, guest_binder, &auth_token_key, &mut boot_services)?;
             gatekeeper::start(root, guest_binder, &auth_token_key, &mut boot_services)?;
-            prepare_security_daemon_dir(
-                root,
-                "data/misc/gatekeeper",
-                1000,
-                1000,
-                0o700,
-                "gatekeeper_data_file",
-            )?;
-            prepare_security_daemon_dir(
-                root,
-                "data/misc/adb",
-                1000,
-                2000,
-                0o2750,
-                "adb_data_file",
-            )?;
             boot_services.push(Service::start(
                 root,
                 "/system/bin/gatekeeperd",
@@ -1923,15 +1882,6 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
                 None,
                 &[],
             )?);
-        } else if adbd_enabled {
-            prepare_security_daemon_dir(
-                root,
-                "data/misc/adb",
-                1000,
-                2000,
-                0o2750,
-                "adb_data_file",
-            )?;
         }
         if adbd_enabled {
             if let Some((listener, port)) = adb_host_listener.take() {
@@ -1953,14 +1903,6 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
             hwbinder::wait_manager(root, &mut hwmanager, &plan, host_mount_namespace, hwbinder_rdev)?;
             boot_services.push(hwmanager);
             if start_system_server {
-                prepare_security_daemon_dir(
-                    root,
-                    "data/misc/keystore",
-                    1017,
-                    1017,
-                    0o700,
-                    "keystore_data_file",
-                )?;
                 boot_services.push(Service::start(
                     root,
                     "/system/bin/keystore2",
@@ -2028,13 +1970,7 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
                 );
             }
             if bin.join("ssal-netd").is_file() {
-                boot_services.push(
-                    crate::guest::init::binder_service::NETD.start_with_hwbinder(
-                        root,
-                        guest_binder,
-                        Some(hwbinder_rdev),
-                    )?,
-                );
+                boot_services.push(start_netd(root, guest_binder, hwbinder_rdev)?);
             }
             if bin.join("ssal-bluetooth-manager").is_file() {
                 boot_services.push(
@@ -2046,14 +1982,6 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
                 boot_services.push(start_lmkd(root)?);
             }
             if root.join("system/bin/storaged").is_file() {
-                prepare_security_daemon_dir(
-                    root,
-                    "data/misc/storaged",
-                    0,
-                    1000,
-                    0o700,
-                    "storaged_data_file",
-                )?;
                 boot_services.push(Service::start(
                     root,
                     "/system/bin/storaged",
@@ -2065,14 +1993,6 @@ echo SSAL_GUEST_SHELL_PROPERTY_FD=PASS
                 )?);
             }
             if root.join("apex/com.android.os.statsd/bin/statsd").is_file() {
-                for (rel, label) in [
-                    ("data/misc/stats-active-metric", "stats_data_file"),
-                    ("data/misc/stats-data", "stats_data_file"),
-                    ("data/misc/stats-metadata", "stats_data_file"),
-                    ("data/misc/stats-service", "stats_config_data_file"),
-                ] {
-                    prepare_security_daemon_dir(root, rel, 1066, 1000, 0o770, label)?;
-                }
                 boot_services.push(start_statsd(root)?);
             }
             if bin.join("ssal-virtual-audio").is_file() {
@@ -2875,29 +2795,33 @@ struct SocketServiceSpec<'a> {
     ready_text: Option<&'a str>,
 }
 
-fn start_socket_service(root: &Path, spec: SocketServiceSpec<'_>) -> io::Result<Service> {
+fn create_service_socket(
+    root: &Path,
+    domain: &str,
+    socket_type_name: &str,
+    sock_rel: &str,
+    sock_kind: libc::c_int,
+    passcred: bool,
+    sock_uid: u32,
+    sock_gid: u32,
+    sock_mode: u32,
+) -> io::Result<std::os::fd::OwnedFd> {
     use std::os::fd::{FromRawFd, OwnedFd};
 
     let contexts = ssal::guest_policy::runtime::load(root)?
         .map(|plan| -> io::Result<_> {
             Ok((
-                plan.context(spec.domain, true)?,
-                plan.context(spec.socket_type_name, false)?,
+                plan.context(domain, true)?,
+                plan.context(socket_type_name, false)?,
             ))
         })
         .transpose()?;
-
-    let log = root.join("run/ssal").join(spec.log_name);
-    File::create(&log)?;
-    // Snapshot inherited_fds inside command() before opening the service socket
-    // so close_inherited_fds() in pre_exec does not close it.
-    let mut cmd = command(root, spec.exe, spec.uid, spec.exec_context)?;
 
     if let Some((sock_ctx, file_ctx)) = &contexts {
         fs::write("/proc/thread-self/attr/sockcreate", format!("{sock_ctx}\0"))?;
         fs::write("/proc/thread-self/attr/fscreate", format!("{file_ctx}\0"))?;
     }
-    let raw = unsafe { libc::socket(libc::AF_UNIX, spec.sock_kind | libc::SOCK_CLOEXEC, 0) };
+    let raw = unsafe { libc::socket(libc::AF_UNIX, sock_kind | libc::SOCK_CLOEXEC, 0) };
     if raw < 0 {
         let err = io::Error::last_os_error();
         if contexts.is_some() {
@@ -2909,7 +2833,7 @@ fn start_socket_service(root: &Path, spec: SocketServiceSpec<'_>) -> io::Result<
     let socket = unsafe { OwnedFd::from_raw_fd(raw) };
     let fd = socket.as_raw_fd();
 
-    if spec.passcred {
+    if passcred {
         let enable: libc::c_int = 1;
         let rc = unsafe {
             libc::setsockopt(
@@ -2930,7 +2854,7 @@ fn start_socket_service(root: &Path, spec: SocketServiceSpec<'_>) -> io::Result<
         }
     }
 
-    let guest_sock_path = root.join(spec.sock_rel);
+    let guest_sock_path = root.join(sock_rel);
     let sock_cpath = std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(
         guest_sock_path.as_os_str(),
     ))
@@ -2957,15 +2881,26 @@ fn start_socket_service(root: &Path, spec: SocketServiceSpec<'_>) -> io::Result<
     if bind_rc != 0 {
         return Err(io::Error::last_os_error());
     }
-    if unsafe { libc::chown(sock_cpath.as_ptr(), spec.sock_uid, spec.sock_gid) } != 0 {
+    if unsafe { libc::chown(sock_cpath.as_ptr(), sock_uid, sock_gid) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    fs::set_permissions(&guest_sock_path, fs::Permissions::from_mode(spec.sock_mode))?;
+    fs::set_permissions(&guest_sock_path, fs::Permissions::from_mode(sock_mode))?;
+    Ok(socket)
+}
 
-    if spec.ld_preload {
+fn spawn_with_socket(
+    mut cmd: Command,
+    log: std::path::PathBuf,
+    env_var: &str,
+    socket: std::os::fd::OwnedFd,
+    ld_preload: bool,
+    ready_text: Option<&str>,
+) -> io::Result<Service> {
+    let fd = socket.as_raw_fd();
+    if ld_preload {
         cmd.env("LD_PRELOAD", "/run/ssal/ssal-phase2-log.so");
     }
-    cmd.env(spec.env_var, fd.to_string())
+    cmd.env(env_var, fd.to_string())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
@@ -2994,10 +2929,73 @@ fn start_socket_service(root: &Path, spec: SocketServiceSpec<'_>) -> io::Result<
         )?
         .with_session_log(),
     );
-    if let Some(ready) = spec.ready_text {
+    if let Some(ready) = ready_text {
         service.wait_text(ready)?;
     }
     Ok(service)
+}
+
+fn start_netd(root: &Path, guest_binder: u64, hwbinder_rdev: u64) -> io::Result<Service> {
+    let plan = ssal::guest_policy::runtime::load(root)?
+        .ok_or_else(|| io::Error::other("Guest Binder policy missing"))?;
+    let netd = crate::guest::init::binder_service::NETD;
+    let context = plan.context(netd.domain, true)?;
+    let log = root.join("run/ssal").join("netd.log");
+    File::create(&log)?;
+
+    let mut cmd = command(root, netd.executable, 0, Some(GUEST_PROBE_CONTEXT))?;
+    cmd.args([
+        "serve",
+        &guest_binder.to_string(),
+        &context,
+        &hwbinder_rdev.to_string(),
+    ]);
+    let socket = create_service_socket(
+        root,
+        netd.domain,
+        "dnsproxyd_socket",
+        "dev/socket/dnsproxyd",
+        libc::SOCK_STREAM,
+        false,
+        0,
+        3003,
+        0o660,
+    )?;
+    spawn_with_socket(
+        cmd,
+        log,
+        "ANDROID_SOCKET_dnsproxyd",
+        socket,
+        false,
+        Some("guest_binder_registered=netd"),
+    )
+}
+
+fn start_socket_service(root: &Path, spec: SocketServiceSpec<'_>) -> io::Result<Service> {
+    let log = root.join("run/ssal").join(spec.log_name);
+    File::create(&log)?;
+    // Snapshot inherited_fds inside command() before opening the service socket
+    // so close_inherited_fds() in pre_exec does not close it.
+    let cmd = command(root, spec.exe, spec.uid, spec.exec_context)?;
+    let socket = create_service_socket(
+        root,
+        spec.domain,
+        spec.socket_type_name,
+        spec.sock_rel,
+        spec.sock_kind,
+        spec.passcred,
+        spec.sock_uid,
+        spec.sock_gid,
+        spec.sock_mode,
+    )?;
+    spawn_with_socket(
+        cmd,
+        log,
+        spec.env_var,
+        socket,
+        spec.ld_preload,
+        spec.ready_text,
+    )
 }
 
 fn start_lmkd(root: &Path) -> io::Result<Service> {

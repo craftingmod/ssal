@@ -1,17 +1,12 @@
-//! Executes the service-start subset of Android init through the Guest launcher.
-use crate::platform::mount::guest_path;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::fs::{self, File};
-use std::io::{self, Read};
-use std::path::Path;
+//! Executes the service-start and directory-creation subset of Android init through the Guest launcher.
+pub mod aid;
+pub mod file_contexts;
+pub mod fs;
+mod parser;
 
-const PRIMARY: &str = "/system/etc/init/hw/init.rc";
-const DIRECTORIES: &[&str] = &[
-    "/system/etc/init",
-    "/system_ext/etc/init",
-    "/product/etc/init",
-];
-const RESOLVED_DIRECTORIES: &[&str] = &["/system/system_ext/etc/init", "/system/product/etc/init"];
+pub(crate) use parser::expand;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::io;
 
 pub type Properties = BTreeMap<String, String>;
 
@@ -31,18 +26,18 @@ impl Line {
     }
 }
 
-struct Service {
-    declaration: Line,
-    classes: Vec<String>,
-    disabled: bool,
-    overrides: bool,
-    oneshot: bool,
-    restart_period: Option<u32>,
+pub(super) struct Service {
+    pub(super) declaration: Line,
+    pub(super) classes: Vec<String>,
+    pub(super) disabled: bool,
+    pub(super) overrides: bool,
+    pub(super) oneshot: bool,
+    pub(super) restart_period: Option<u32>,
 }
 
-struct Action {
-    trigger: Line,
-    commands: Vec<Line>,
+pub(super) struct Action {
+    pub(super) trigger: Line,
+    pub(super) commands: Vec<Line>,
 }
 
 impl Action {
@@ -77,10 +72,10 @@ impl Action {
 
 #[derive(Default)]
 pub struct Plan {
-    services: BTreeMap<String, Service>,
-    service_order: Vec<String>,
-    actions: Vec<Action>,
-    loaded: BTreeSet<std::path::PathBuf>,
+    pub(super) services: BTreeMap<String, Service>,
+    pub(super) service_order: Vec<String>,
+    pub(super) actions: Vec<Action>,
+    pub(super) loaded: BTreeSet<std::path::PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -124,172 +119,7 @@ pub struct BootQueue<'a> {
 }
 
 impl Plan {
-    pub fn load(root: &Path, properties: &Properties) -> io::Result<Self> {
-        let mut plan = Self::default();
-        plan.load_path(root, PRIMARY, properties)?;
-        for directory in DIRECTORIES {
-            plan.load_path(root, directory, properties)?;
-        }
-        Ok(plan)
-    }
-
-    fn load_path(&mut self, root: &Path, path: &str, properties: &Properties) -> io::Result<()> {
-        let allowed = |path: &Path| {
-            DIRECTORIES
-                .iter()
-                .chain(RESOLVED_DIRECTORIES)
-                .any(|prefix| path.starts_with(prefix))
-        };
-        if !allowed(Path::new(path)) {
-            return Err(io::Error::other("outside Guest system init directories"));
-        }
-        let resolved = match guest_path(root, path.trim_start_matches('/')) {
-            Ok(resolved) => resolved,
-            Err(error)
-                if error.kind() == io::ErrorKind::NotFound && DIRECTORIES.contains(&path) =>
-            {
-                return Ok(());
-            }
-            Err(error) => return Err(error),
-        };
-        let relative = resolved.strip_prefix(root).map_err(io::Error::other)?;
-        if !allowed(&Path::new("/").join(relative)) {
-            return Err(io::Error::other(
-                "resolved outside Guest system init directories",
-            ));
-        }
-        if !self.loaded.insert(resolved.clone()) {
-            return Ok(());
-        }
-        if self.loaded.len() > 1024 {
-            return Err(io::Error::other("too many Guest initrc inputs"));
-        }
-        let metadata = fs::metadata(&resolved)?;
-        if metadata.is_dir() {
-            let mut files = fs::read_dir(resolved)?.collect::<io::Result<Vec<_>>>()?;
-            files.sort_by_key(|file| file.file_name());
-            for file in files {
-                if file
-                    .path()
-                    .extension()
-                    .is_some_and(|extension| extension == "rc")
-                {
-                    let name = file.file_name();
-                    let name = name
-                        .to_str()
-                        .ok_or_else(|| io::Error::other("non-UTF-8 rc filename"))?;
-                    self.load_path(root, &format!("{path}/{name}"), properties)?;
-                }
-            }
-            return Ok(());
-        }
-        const MAX_RC_SIZE: u64 = 1024 * 1024;
-        if !metadata.is_file() {
-            return Err(io::Error::other(
-                "Guest initrc input must be a regular file",
-            ));
-        }
-        let mut source = String::new();
-        File::open(resolved)?
-            .take(MAX_RC_SIZE + 1)
-            .read_to_string(&mut source)?;
-        if source.len() as u64 > MAX_RC_SIZE {
-            return Err(io::Error::other("Guest initrc input exceeds 1 MiB"));
-        }
-        for import in self.parse(path, &source)? {
-            let Some(path) = import
-                .words
-                .get(1)
-                .filter(|_| import.words.len() == 2)
-                .and_then(|path| expand(path, properties))
-            else {
-                import.skip("invalid import or missing Guest property");
-                continue;
-            };
-            if !allowed(Path::new(&path)) {
-                import.skip("outside Guest system init directories");
-                continue;
-            }
-            match self.load_path(root, &path, properties) {
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    import.skip("import missing")
-                }
-                result => result.map_err(|error| {
-                    io::Error::other(format!("{} import {path}: {error}", import.source))
-                })?,
-            }
-        }
-        Ok(())
-    }
-
-    fn parse(&mut self, path: &str, source: &str) -> io::Result<Vec<Line>> {
-        let mut service: Option<Service> = None;
-        let mut action = None;
-        let mut imports = Vec::new();
-        for line in tokenize(path, source)? {
-            let words = &line.words;
-            let Some(keyword) = words.first().map(String::as_str) else {
-                continue;
-            };
-            if matches!(keyword, "on" | "service" | "import") {
-                if let Some(service) = service.take() {
-                    self.register(service);
-                }
-                action = None;
-            }
-            match keyword {
-                "on" if words.len() >= 2 => {
-                    action = Some(self.actions.len());
-                    self.actions.push(Action {
-                        trigger: line,
-                        commands: Vec::new(),
-                    });
-                }
-                "import" => imports.push(line),
-                "service" if words.len() >= 3 => {
-                    service = Some(Service {
-                        declaration: line,
-                        classes: vec!["default".into()],
-                        disabled: false,
-                        overrides: false,
-                        oneshot: false,
-                        restart_period: None,
-                    });
-                }
-                "on" | "service" => line.skip("invalid declaration"),
-                _ => {
-                    if let Some(service) = &mut service {
-                        match keyword {
-                            "class" if words.len() > 1 => service.classes = words[1..].to_vec(),
-                            "disabled" if words.len() == 1 => service.disabled = true,
-                            "override" if words.len() == 1 => service.overrides = true,
-                            "oneshot" if words.len() == 1 => service.oneshot = true,
-                            "restart_period" if words.len() == 2 => match words[1].parse() {
-                                Ok(seconds) => service.restart_period = Some(seconds),
-                                Err(_) => line.skip("invalid restart_period"),
-                            },
-                            _ if matches!(
-                                service.declaration.words[1].as_str(),
-                                "servicemanager" | "zygote"
-                            ) =>
-                            {
-                                line.skip("service credentials, sockets and runtime options use the Guest launcher contract");
-                            }
-                            _ => {}
-                        }
-                    } else if let Some(index) = action {
-                        self.actions[index].commands.push(line);
-                    }
-                }
-            }
-        }
-        if let Some(service) = service {
-            self.register(service);
-        }
-        Ok(imports)
-    }
-
-    fn register(&mut self, service: Service) {
+    pub(super) fn register(&mut self, service: Service) {
         let name = &service.declaration.words[1];
         if self.services.contains_key(name) {
             if !service.overrides {
@@ -332,6 +162,22 @@ impl Plan {
         let words = &service.declaration.words;
         (words[2] == executable && words[3..] == *args)
             .then_some((service.oneshot, service.restart_period))
+    }
+
+    pub fn mkdir_specs(&self, triggers: &[&str], properties: &Properties) -> Vec<fs::MkdirSpec> {
+        let mut specs = Vec::new();
+        for event in triggers {
+            for action in &self.actions {
+                if action.matches(Some(event), None, properties) {
+                    for line in &action.commands {
+                        if let Some(spec) = fs::parse_mkdir(line, properties) {
+                            specs.push(spec);
+                        }
+                    }
+                }
+            }
+        }
+        specs
     }
 }
 
@@ -486,94 +332,13 @@ impl PropertyTriggers {
     }
 }
 
-pub(crate) fn expand(value: &str, properties: &Properties) -> Option<String> {
-    let mut remaining = value;
-    let mut result = String::new();
-    while let Some((prefix, substitution)) = remaining.split_once("${") {
-        let (expression, suffix) = substitution.split_once('}')?;
-        let (key, default) = expression.split_once(":-").unwrap_or((expression, ""));
-        result.push_str(prefix);
-        result.push_str(
-            match properties.get(key).filter(|value| !value.is_empty()) {
-                Some(value) => value,
-                None if !default.is_empty() => default,
-                None => return None,
-            },
-        );
-        remaining = suffix;
-    }
-    result.push_str(remaining);
-    Some(result)
-}
-
-fn tokenize(path: &str, source: &str) -> io::Result<Vec<Line>> {
-    let mut lines = Vec::new();
-    let mut words = Vec::new();
-    let source = source.replace("\r\n", "\n");
-    let mut chars = source.chars().peekable();
-    let mut word = None;
-    let mut quoted = false;
-    let mut physical_line = 1;
-    let mut logical_line = 1;
-    let malformed = |line| io::Error::other(format!("{path}:{line} malformed initrc token"));
-    while let Some(ch) = chars.next() {
-        match ch {
-            '"' => {
-                quoted = !quoted;
-                word.get_or_insert_with(String::new);
-            }
-            '\\' if chars.next_if_eq(&'\n').is_some() => {
-                physical_line += 1;
-                while chars.next_if(|ch| matches!(ch, ' ' | '\t')).is_some() {}
-            }
-            '\\' => word.get_or_insert_with(String::new).push(
-                match chars.next().ok_or_else(|| malformed(logical_line))? {
-                    'n' => '\n',
-                    'r' => '\r',
-                    't' => '\t',
-                    ch => ch,
-                },
-            ),
-            '#' if !quoted && word.is_none() && words.is_empty() => {
-                while chars.next_if(|ch| *ch != '\n').is_some() {}
-            }
-            '\n' => {
-                physical_line += 1;
-                if quoted {
-                    word.get_or_insert_with(String::new).push(ch);
-                } else {
-                    words.extend(word.take());
-                    if !words.is_empty() {
-                        lines.push(Line {
-                            source: format!("{path}:{logical_line}"),
-                            words: std::mem::take(&mut words),
-                        });
-                    }
-                    logical_line = physical_line;
-                }
-            }
-            ch if ch.is_ascii_whitespace() && !quoted => {
-                words.extend(word.take());
-            }
-            ch => word.get_or_insert_with(String::new).push(ch),
-        }
-    }
-    words.extend(word);
-    if quoted {
-        return Err(malformed(logical_line));
-    }
-    if !words.is_empty() {
-        lines.push(Line {
-            source: format!("{path}:{logical_line}"),
-            words,
-        });
-    }
-    Ok(lines)
-}
-
 #[cfg(test)]
 mod tests {
+    use super::file_contexts::FileContexts;
+    use super::parser::PRIMARY;
     use super::*;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    use std::path::Path;
 
     #[test]
     fn boot_follows_guest_events_and_only_starts_reviewed_services() -> io::Result<()> {
@@ -616,7 +381,10 @@ on property:servicemanager.ready=true
         let mut ready = props;
         ready.insert("servicemanager.ready".into(), "true".into());
         let mut boot = plan.boot(false);
-        assert_eq!(boot.next_start(&Properties::new())?, Some(BootService::Servicemanager));
+        assert_eq!(
+            boot.next_start(&Properties::new())?,
+            Some(BootService::Servicemanager)
+        );
         assert_eq!(boot.next_start(&ready)?, Some(BootService::Zygote));
         assert_eq!(boot.next_start(&ready)?, None);
         Ok(())
@@ -657,11 +425,243 @@ on property:servicemanager.ready=true
         props.insert("servicemanager.ready".into(), "true".into());
         assert_eq!(boot.next_start(&props)?, Some(BootService::Apexd));
         let mut blocked = plan.boot(true);
-        assert_eq!(blocked.next_start(&props)?, Some(BootService::Servicemanager));
+        assert_eq!(
+            blocked.next_start(&props)?,
+            Some(BootService::Servicemanager)
+        );
         assert_eq!(blocked.next_start(&props)?, Some(BootService::Apexd));
         assert!(blocked.next_start(&props).is_err());
         props.insert("apexd.status".into(), "activated".into());
         assert_eq!(boot.next_start(&props)?, Some(BootService::Zygote));
+        Ok(())
+    }
+
+    #[test]
+    fn aid_lookup_resolves_names_and_numeric_ids() {
+        assert_eq!(aid::lookup("root"), Some(0));
+        assert_eq!(aid::lookup("system"), Some(1000));
+        assert_eq!(aid::lookup("shared_relro"), Some(1037));
+        assert_eq!(aid::lookup("statsd"), Some(1066));
+        assert_eq!(aid::lookup("shell"), Some(2000));
+        assert_eq!(aid::lookup("1037"), Some(1037));
+        assert_eq!(aid::lookup("0"), Some(0));
+        assert_eq!(aid::lookup("nonexistent_aid"), None);
+        assert_eq!(aid::lookup(""), None);
+    }
+
+    #[test]
+    fn file_contexts_lookup_respects_kind_and_last_match_wins() {
+        let plat = r#"
+# comment
+/data/misc(/.*)?               u:object_r:ssal_p0001_system_data_file:s0
+/data/misc/installd(/.*)?      u:object_r:ssal_p0001_install_data_file:s0
+/data/misc/installd/file   --  u:object_r:ssal_p0001_other_file:s0
+/data/misc/shared_relro    -d  u:object_r:ssal_p0001_shared_relro_file:s0
+/data/misc/shared_relro    --  u:object_r:ssal_p0001_wrong_file:s0
+/data/misc/none            <<none>>
+"#;
+        let product = "/data/misc/installd(/.*)? u:object_r:ssal_p0001_product_override:s0\n";
+        let fc = FileContexts::parse(&[plat, product]);
+        assert_eq!(
+            fc.lookup_dir("/data/misc/shared_relro"),
+            Some("u:object_r:ssal_p0001_shared_relro_file:s0")
+        );
+        assert_eq!(
+            fc.lookup_dir("/data/misc/installd"),
+            Some("u:object_r:ssal_p0001_product_override:s0")
+        );
+        assert_eq!(
+            fc.lookup_dir("/data/misc/other"),
+            Some("u:object_r:ssal_p0001_system_data_file:s0")
+        );
+        assert_eq!(fc.lookup_dir("/data/misc/none"), None);
+    }
+
+    #[test]
+    fn parse_mkdir_handles_defaults_options_and_expansion() {
+        let props = Properties::from([("ro.user".into(), "0".into())]);
+        let line = |words: &[&str]| Line {
+            source: "init.rc:1".into(),
+            words: words.iter().map(|s| (*s).to_owned()).collect(),
+        };
+        assert_eq!(
+            fs::parse_mkdir(&line(&["mkdir", "/data/misc/user"]), &props),
+            Some(fs::MkdirSpec {
+                path: "/data/misc/user".into(),
+                mode: 0o755,
+                uid: 0,
+                gid: 0,
+                source: "init.rc:1".into(),
+            })
+        );
+        assert_eq!(
+            fs::parse_mkdir(
+                &line(&[
+                    "mkdir",
+                    "/data/misc/profiles/cur/${ro.user}/",
+                    "2750",
+                    "system",
+                    "shell",
+                    "encryption=Require"
+                ]),
+                &props
+            ),
+            Some(fs::MkdirSpec {
+                path: "/data/misc/profiles/cur/0".into(),
+                mode: 0o2750,
+                uid: 1000,
+                gid: 2000,
+                source: "init.rc:1".into(),
+            })
+        );
+        assert_eq!(
+            fs::parse_mkdir(
+                &line(&["mkdir", "/data/misc/foo", "encryption=Require"]),
+                &props
+            ),
+            Some(fs::MkdirSpec {
+                path: "/data/misc/foo".into(),
+                mode: 0o755,
+                uid: 0,
+                gid: 0,
+                source: "init.rc:1".into(),
+            })
+        );
+        assert_eq!(
+            fs::parse_mkdir(&line(&["mkdir", "/data/misc/bad", "not_octal"]), &props),
+            None
+        );
+        assert_eq!(
+            fs::parse_mkdir(
+                &line(&["mkdir", "/data/misc/bad", "0755", "unknown_user"]),
+                &props
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn apply_mkdirs_filters_allowlist_preserves_modes_and_rejects_symlinks() -> io::Result<()> {
+        let temp = std::env::temp_dir().join(format!("ssal-initrc-fs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(temp.join("data/misc"))?;
+        symlink("target", temp.join("data/misc/linkdir"))?;
+
+        let mut plan = Plan::default();
+        plan.parse(
+            PRIMARY,
+            r#"
+on post-fs-data
+    mkdir /data/misc/user 0755
+    mkdir /data/misc/profiles 0711
+    mkdir /data/misc/profiles/cur 0711
+    mkdir /data/misc/linkdir/child 0755
+    mkdir /dev/forbidden 0755
+    mkdir /data/other/ignored 0755
+"#,
+        )?;
+        let props = Properties::new();
+        assert!(fs::apply_mkdirs(
+            &temp,
+            &plan,
+            &["post-fs-data"],
+            &props,
+            &["/dev/"],
+            false
+        )
+        .is_err());
+
+        let count = fs::apply_mkdirs(
+            &temp,
+            &plan,
+            &["post-fs-data"],
+            &props,
+            &["/data/misc/"],
+            false,
+        )?;
+        assert_eq!(count, 3);
+        assert_eq!(
+            std::fs::metadata(temp.join("data/misc/user"))?
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o755
+        );
+        assert_eq!(
+            std::fs::metadata(temp.join("data/misc/profiles/cur"))?
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o711
+        );
+        assert!(!temp.join("dev/forbidden").exists());
+        assert!(!temp.join("data/other/ignored").exists());
+        assert!(!temp.join("data/misc/linkdir/child").exists());
+
+        std::fs::remove_dir_all(&temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn load_scans_apex_etc_rc_and_skips_versioned_dirs() -> io::Result<()> {
+        let temp = std::env::temp_dir().join(format!("ssal-initrc-apex-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(temp.join("system/etc/init/hw"))?;
+        std::fs::write(temp.join("system/etc/init/hw/init.rc"), "")?;
+        std::fs::create_dir_all(temp.join("apex/com.android.os.statsd/etc"))?;
+        std::fs::write(
+            temp.join("apex/com.android.os.statsd/etc/init.rc"),
+            "on post-fs-data\n    mkdir /data/misc/stats-data 0770\n",
+        )?;
+        std::fs::create_dir_all(temp.join("apex/com.android.os.statsd@340000000/etc"))?;
+        std::fs::write(
+            temp.join("apex/com.android.os.statsd@340000000/etc/init.rc"),
+            "on post-fs-data\n    mkdir /data/misc/should-skip 0700\n",
+        )?;
+
+        let props = Properties::new();
+        let plan = Plan::load(&temp, &props)?;
+        let specs = plan.mkdir_specs(&["post-fs-data"], &props);
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].path, "/data/misc/stats-data");
+
+        std::fs::remove_dir_all(&temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn apply_mkdirs_preserves_existing_directory_mode() -> io::Result<()> {
+        let temp = std::env::temp_dir().join(format!("ssal-initrc-eexist-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        let existing = temp.join("data/local/tmp");
+        std::fs::create_dir_all(&existing)?;
+        std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o1771))?;
+
+        let mut plan = Plan::default();
+        plan.parse(
+            PRIMARY,
+            r#"
+on post-fs-data
+    mkdir /data/local/tmp 0771 shell shell
+    mkdir /data/local/newdir 0700
+"#,
+        )?;
+        let props = Properties::new();
+        let count = fs::apply_mkdirs(&temp, &plan, &["post-fs-data"], &props, &["/data/"], false)?;
+        assert_eq!(count, 2);
+        assert_eq!(
+            std::fs::metadata(&existing)?.permissions().mode() & 0o7777,
+            0o1771
+        );
+        assert_eq!(
+            std::fs::metadata(temp.join("data/local/newdir"))?
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o700
+        );
+
+        std::fs::remove_dir_all(&temp)?;
         Ok(())
     }
 }

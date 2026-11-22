@@ -13,7 +13,7 @@ pub mod native;
 pub mod runtime;
 mod symbols;
 
-const VERSION: u32 = 75;
+const VERSION: u32 = 76;
 
 type Names = BTreeMap<String, String>;
 
@@ -717,6 +717,7 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
         "property_socket",
         "lmkd_socket",
         "statsdw_socket",
+        "dnsproxyd_socket",
     ] {
         plan.shared_types.remove(private);
     }
@@ -1539,6 +1540,7 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
         "lmkd_exec",
         "lmkd_socket",
         "statsdw_socket",
+        "dnsproxyd_socket",
         "audioserver_exec",
     ] {
         if let Some(exec_type) = plan.types.get(exec_name) {
@@ -1550,6 +1552,32 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
                     1,
                     1,
                     &[exec_type, "tmpfs", "filesystem", "associate"],
+                );
+            }
+        }
+    }
+    if let Some(network_stack) = plan.types.get("network_stack") {
+        for (target, permission) in [("node", "node_bind"), ("port", "name_bind")] {
+            let rule = format!("allow {network_stack} {target} udp_socket {{ {permission} }}");
+            if plan.rules.insert(rule.clone()) {
+                native::record(
+                    &mut native_rules,
+                    rule,
+                    1,
+                    1,
+                    &[network_stack, target, "udp_socket", permission],
+                );
+            }
+        }
+        for cap in ["net_bind_service", "net_admin", "net_raw"] {
+            let rule = format!("allow {network_stack} {network_stack} capability {{ {cap} }}");
+            if plan.rules.insert(rule.clone()) {
+                native::record(
+                    &mut native_rules,
+                    rule,
+                    1,
+                    1,
+                    &[network_stack, network_stack, "capability", cap],
                 );
             }
         }

@@ -202,27 +202,29 @@ pub(super) fn prepare_guest_ashmem(root: &Path, plan: &ssal::guest_policy::Plan)
             "unsafe Host ashmem device identity or permissions",
         ));
     }
-    let target = root.join("dev").join(&name);
-    // A private inode allows Guest labeling without relabeling either Host ashmem node.
-    if unsafe { libc::mknod(cpath(&target)?.as_ptr(), libc::S_IFCHR | 0o666, host.rdev()) } != 0 {
-        return Err(io::Error::last_os_error());
+    for (node_name, label_name) in [(name.as_str(), "ashmem_libcutils_device"), ("ashmem", "ashmem_device")] {
+        let target = root.join("dev").join(node_name);
+        // A private inode allows Guest labeling without relabeling either Host ashmem node.
+        if unsafe { libc::mknod(cpath(&target)?.as_ptr(), libc::S_IFCHR | 0o666, host.rdev()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o666))?;
+        let context = plan.context(label_name, false)?;
+        ssal::guest_policy::runtime::set_label(&target, &context)?;
+        let guest = fs::symlink_metadata(&target)?;
+        if !guest.file_type().is_char_device()
+            || guest.rdev() != host.rdev()
+            || (guest.dev(), guest.ino()) == (host.dev(), host.ino())
+            || (guest.uid(), guest.gid(), guest.mode() & 0o7777) != (0, 0, 0o666)
+        {
+            return Err(io::Error::other(
+                "Guest ashmem identity or permissions mismatch",
+            ));
+        }
+        println!(
+            "Guest /dev/{node_name}: private ashmem node label={context} rdev={}",
+            guest.rdev()
+        );
     }
-    fs::set_permissions(&target, fs::Permissions::from_mode(0o666))?;
-    let context = plan.context("ashmem_libcutils_device", false)?;
-    ssal::guest_policy::runtime::set_label(&target, &context)?;
-    let guest = fs::symlink_metadata(&target)?;
-    if !guest.file_type().is_char_device()
-        || guest.rdev() != host.rdev()
-        || (guest.dev(), guest.ino()) == (host.dev(), host.ino())
-        || (guest.uid(), guest.gid(), guest.mode() & 0o7777) != (0, 0, 0o666)
-    {
-        return Err(io::Error::other(
-            "Guest ashmem identity or permissions mismatch",
-        ));
-    }
-    println!(
-        "Guest /dev/{name}: private ashmem node label={context} rdev={}",
-        guest.rdev()
-    );
     Ok(())
 }
