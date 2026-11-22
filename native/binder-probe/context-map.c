@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/vfs.h>
 #include <unistd.h>
 
@@ -38,7 +39,76 @@ static int (*real_setfscreatecon)(const char *);
 static int (*real_getcon)(char **);
 static int (*real_check_access)(const char *, const char *, const char *, const char *, void *);
 static int (*real_avc_reset)(void);
+static ssize_t (*real_readlink)(const char *, char *, size_t);
+static ssize_t (*real_readlinkat)(int, const char *, char *, size_t);
 static void *libselinux_handle;
+static dev_t ashmem_rdev;
+static int ashmem_rdev_ready;
+static char ashmem_path[128] = "/dev/ashmem";
+
+static void init_ashmem_compat(void) {
+    if (ashmem_rdev_ready) return;
+    struct stat st;
+    if (stat("/dev/ashmem", &st) == 0 && S_ISCHR(st.st_mode)) {
+        ashmem_rdev = st.st_rdev;
+        ashmem_rdev_ready = 1;
+    }
+    int fd = open("/proc/sys/kernel/random/boot_id", O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        char boot_id[64];
+        ssize_t n = read(fd, boot_id, sizeof(boot_id) - 1);
+        close(fd);
+        if (n > 0) {
+            boot_id[n] = '\0';
+            char *nl = strchr(boot_id, '\n');
+            if (nl) *nl = '\0';
+            if (strlen(boot_id) == 36) {
+                snprintf(ashmem_path, sizeof(ashmem_path), "/dev/ashmem%s", boot_id);
+            }
+        }
+    }
+}
+
+static int parse_proc_self_fd(const char *path, int *out_fd) {
+    if (!path) return 0;
+    const char *rest = NULL;
+    if (!strncmp(path, "/proc/self/fd/", 14)) {
+        rest = path + 14;
+    } else if (!strncmp(path, "/proc/thread-self/fd/", 21)) {
+        rest = path + 21;
+    } else {
+        return 0;
+    }
+    if (*rest < '0' || *rest > '9') return 0;
+    long val = 0;
+    for (const char *p = rest; *p; p++) {
+        if (*p < '0' || *p > '9') return 0;
+        val = val * 10 + (*p - '0');
+        if (val > 0x7fffffffL) return 0;
+    }
+    *out_fd = (int)val;
+    return 1;
+}
+
+static ssize_t ashmem_readlink_fallback(int fd, char *buf, size_t bufsiz) {
+    init_ashmem_compat();
+    struct stat st;
+    if (fstat(fd, &st) != 0) return -1;
+    const char *target = NULL;
+    if (ashmem_rdev_ready && S_ISCHR(st.st_mode) && st.st_rdev == ashmem_rdev) {
+        target = ashmem_path;
+#ifdef F_GET_SEALS
+    } else if (S_ISREG(st.st_mode) && fcntl(fd, F_GET_SEALS) >= 0) {
+        target = "/memfd:ssal_compat";
+#endif
+    } else {
+        return -1;
+    }
+    size_t len = strlen(target);
+    size_t copy = len < bufsiz ? len : bufsiz;
+    if (copy > 0) memcpy(buf, target, copy);
+    return (ssize_t)copy;
+}
 
 static int set_context_via_procattr(const char *context) {
     dprintf(2, "SSAL_PROCATTR_OPEN_BEGIN path=/proc/thread-self/attr/current\n");
@@ -80,6 +150,9 @@ __attribute__((constructor)) static void load_map(void) {
     real_getcon = dlsym(RTLD_NEXT, "getcon");
     real_check_access = dlsym(RTLD_NEXT, "selinux_check_access");
     real_avc_reset = dlsym(RTLD_NEXT, "avc_reset");
+    real_readlink = dlsym(RTLD_NEXT, "readlink");
+    real_readlinkat = dlsym(RTLD_NEXT, "readlinkat");
+    init_ashmem_compat();
     if (!real_avc_reset) real_avc_reset = dlsym(RTLD_DEFAULT, "avc_reset");
     if (!real_avc_reset) {
         libselinux_handle = dlopen("libselinux.so", RTLD_NOW | RTLD_NOLOAD);
@@ -153,6 +226,42 @@ __attribute__((constructor)) static void load_map(void) {
 SETTER(setcon)
 SETTER(setexeccon)
 SETTER(setfscreatecon)
+
+ssize_t readlink(const char *pathname, char *buf, size_t bufsiz) {
+    if (!real_readlink) real_readlink = dlsym(RTLD_NEXT, "readlink");
+    if (!real_readlink) { errno = ENOSYS; return -1; }
+    ssize_t ret = real_readlink(pathname, buf, bufsiz);
+    if (ret >= 0) return ret;
+    int saved_errno = errno;
+    int fd = -1;
+    if (saved_errno == EPERM && parse_proc_self_fd(pathname, &fd)) {
+        ssize_t compat = ashmem_readlink_fallback(fd, buf, bufsiz);
+        if (compat >= 0) {
+            errno = 0;
+            return compat;
+        }
+    }
+    errno = saved_errno;
+    return -1;
+}
+
+ssize_t readlinkat(int dirfd, const char *pathname, char *buf, size_t bufsiz) {
+    if (!real_readlinkat) real_readlinkat = dlsym(RTLD_NEXT, "readlinkat");
+    if (!real_readlinkat) { errno = ENOSYS; return -1; }
+    ssize_t ret = real_readlinkat(dirfd, pathname, buf, bufsiz);
+    if (ret >= 0) return ret;
+    int saved_errno = errno;
+    int fd = -1;
+    if (saved_errno == EPERM && dirfd == AT_FDCWD && parse_proc_self_fd(pathname, &fd)) {
+        ssize_t compat = ashmem_readlink_fallback(fd, buf, bufsiz);
+        if (compat >= 0) {
+            errno = 0;
+            return compat;
+        }
+    }
+    errno = saved_errno;
+    return -1;
+}
 
 #else
 #include <assert.h>

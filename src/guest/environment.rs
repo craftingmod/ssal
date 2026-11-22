@@ -96,7 +96,6 @@ fn property_service_definitions(
             name: "webview_zygote".into(),
             executable: "/system/bin/app_process64".into(),
             args: vec![
-                "-Xzygote".into(),
                 "/system/bin".into(),
                 "--zygote".into(),
                 "--socket-name=webview_zygote".into(),
@@ -113,7 +112,7 @@ fn property_service_definitions(
             sockets: vec![ssal::guest_properties::SocketDefinition {
                 name: "webview_zygote".into(),
                 mode: 0o660,
-                uid: 1053,
+                uid: 1000,
                 gid: 1000,
                 context: plan
                     .and_then(|p| p.types.contains_key("zygote_socket").then(|| "zygote_socket".into())),
@@ -781,7 +780,7 @@ mod tests {
         assert_eq!(defs[0].executable, "/system/bin/app_process64");
         assert_eq!(
             defs[0].args,
-            ["-Xzygote", "/system/bin", "--zygote", "--socket-name=webview_zygote"]
+            ["/system/bin", "--zygote", "--socket-name=webview_zygote"]
         );
         assert_eq!(defs[0].domain, "webview_zygote");
         assert_eq!(defs[0].uid, 1053);
@@ -793,7 +792,7 @@ mod tests {
         assert_eq!(defs[0].sockets.len(), 1);
         assert_eq!(defs[0].sockets[0].name, "webview_zygote");
         assert_eq!(defs[0].sockets[0].mode, 0o660);
-        assert_eq!(defs[0].sockets[0].uid, 1053);
+        assert_eq!(defs[0].sockets[0].uid, 1000);
         assert_eq!(defs[0].sockets[0].gid, 1000);
         assert_eq!(defs[0].sockets[0].context.as_deref(), Some("zygote_socket"));
         assert_eq!(
