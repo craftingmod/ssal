@@ -524,6 +524,16 @@ pub fn apply_with_backend(profile: &Path, plan: &Plan, backend: Backend) -> io::
             ..Applied::default()
         };
     }
+    if plan.audit
+        && applied
+            .statements
+            .iter()
+            .any(|s| s.starts_with("dontaudit ") || s.starts_with("dontauditxperm "))
+    {
+        return Err(invalid(
+            "Guest SELinux dontaudit rules were already applied in this boot; reboot before prepare --audit (no live deletion)",
+        ));
+    }
     let policy =
         read_policy_with_recovery(|| fs::read("/sys/fs/selinux/policy"), recover_policy_export)?;
     let symbols = super::symbols::read(&policy)?;
@@ -723,6 +733,7 @@ pub fn prepare_mounted(
     profile: &Path,
     force_regen: bool,
     permissive: Option<bool>,
+    audit: Option<bool>,
 ) -> io::Result<Plan> {
     fs::create_dir_all(profile.join("selinux"))?;
     let prepare_lock = File::create(profile.join("selinux/prepare.lock"))?;
@@ -747,7 +758,7 @@ pub fn prepare_mounted(
     };
     drop(registry_lock);
     let files = inputs(system)?;
-    let (plan, regenerated) = prepare(profile, &id, &files, force_regen, permissive)?;
+    let (plan, regenerated) = prepare(profile, &id, &files, force_regen, permissive, audit)?;
     for original in ["init", "servicemanager", "socket_device", "property_socket"] {
         plan.context(original, false)?;
     }
@@ -768,6 +779,9 @@ pub fn prepare_mounted(
     apply_with_backend(profile, &plan, backend)?;
     if plan.permissive {
         println!("Guest SELinux permissive=1; Guest Enforcing guards excluded");
+    }
+    if plan.audit {
+        println!("Guest SELinux audit=1; Guest dontaudit rules excluded");
     }
     Ok(plan)
 }

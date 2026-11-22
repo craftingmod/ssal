@@ -129,6 +129,7 @@ fn register_presenter_pair() -> Option<OwnedFd> {
         force_regen: false,
         native_sepolicy: false,
         permissive: false,
+        audit: false,
     };
     if let Err(e) = ssal::unix::send(&mut stream, &req, Some(daemon_fd.as_raw_fd())) {
         eprintln!("GUEST_VIRTUAL_COMPOSER_PRESENTER=WARN ssald_send_err={e}");

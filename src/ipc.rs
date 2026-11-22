@@ -18,6 +18,8 @@ pub struct Request {
     pub native_sepolicy: bool,
     #[serde(default)]
     pub permissive: bool,
+    #[serde(default)]
+    pub audit: bool,
 }
 
 pub fn valid_image_name(name: &str) -> bool {

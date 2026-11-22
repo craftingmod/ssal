@@ -200,6 +200,7 @@ fn spawn_input_accept_relay(listener: OwnedFd) {
                     force_regen: false,
                     native_sepolicy: false,
                     permissive: false,
+                    audit: false,
                 };
                 if let Err(e) = ssal::unix::send(&mut stream, &req, Some(peer_fd.as_raw_fd())) {
                     eprintln!("GUEST_INPUT_INJECTOR=WARN ssald_send_err={e}");

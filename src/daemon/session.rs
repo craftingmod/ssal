@@ -70,8 +70,14 @@ fn handle(
     if req.version != VERSION {
         return reply(&mut stream, false, "unsupported protocol version");
     }
-    if (req.force_regen || req.native_sepolicy || req.permissive) && req.command != "prepare" {
-        return reply(&mut stream, false, "--regen, --native and --permissive require prepare");
+    if (req.force_regen || req.native_sepolicy || req.permissive || req.audit)
+        && req.command != "prepare"
+    {
+        return reply(
+            &mut stream,
+            false,
+            "--regen, --native, --permissive and --audit require prepare",
+        );
     }
     match req.command.as_str() {
         "logcat" | "logcat-dump" => {
@@ -127,7 +133,7 @@ fn handle(
             if req.command == "prepare" && active_guest.lock().unwrap().is_some() {
                 return reply(&mut stream, false, "stop the running Guest before prepare");
             }
-            let result = prepare_session(&root, name, &req.command, req.force_regen, req.native_sepolicy, req.permissive);
+            let result = prepare_session(&root, name, &req.command, req.force_regen, req.native_sepolicy, req.permissive, req.audit);
             match result { Ok(message) => { log(&root, &message); reply(&mut stream, true, message) }, Err(e) => { let message = format!("prepare failed: {e}"); log(&root, &message); reply(&mut stream, false, message) } }
         }
         "start" => {
@@ -356,6 +362,7 @@ fn prepare_session(
     force_regen: bool,
     native_sepolicy: bool,
     permissive: bool,
+    audit: bool,
 ) -> io::Result<String> {
     let exe = daemon_exe()?;
     if mode == "prepare" {
@@ -394,6 +401,7 @@ fn prepare_session(
             if native_sepolicy { "native" } else { "ksud" },
         );
         worker.env("SSAL_PREPARE_PERMISSIVE", if permissive { "1" } else { "0" });
+        worker.env("SSAL_PREPARE_AUDIT", if audit { "1" } else { "0" });
         let output = worker.output()?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);

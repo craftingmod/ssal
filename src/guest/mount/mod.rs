@@ -183,6 +183,8 @@ pub(super) fn verify(
             force_regen,
             (mode == "--prepare-worker")
                 .then(|| std::env::var("SSAL_PREPARE_PERMISSIVE").as_deref() == Ok("1")),
+            (mode == "--prepare-worker")
+                .then(|| std::env::var("SSAL_PREPARE_AUDIT").as_deref() == Ok("1")),
         )?)
     } else {
         None
