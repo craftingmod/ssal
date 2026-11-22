@@ -48,5 +48,33 @@ pub(in crate::guest) fn linkerconfig(root: &Path) -> io::Result<()> {
             String::from_utf8_lossy(&output.stderr)
         )));
     }
+    allow_ssal_runtime_paths(&root.join("linkerconfig/ld.config.txt"))?;
     Ok(())
+}
+
+fn allow_ssal_runtime_paths(ld_config_path: &Path) -> io::Result<()> {
+    let text = fs::read_to_string(ld_config_path)?;
+    let mut out = String::with_capacity(text.len() + 512);
+    for line in text.lines() {
+        if let Some((lhs, rhs)) = line.split_once('=') {
+            let key = lhs.trim();
+            if (key.ends_with(".permitted.paths") || key.ends_with(".permitted.paths +"))
+                && !rhs.split(':').any(|p| p.trim() == "/run/ssal")
+            {
+                let rhs_trimmed = rhs.trim();
+                out.push_str(lhs);
+                if rhs_trimmed.is_empty() {
+                    out.push_str("= /run/ssal\n");
+                } else {
+                    out.push_str("= ");
+                    out.push_str(rhs_trimmed);
+                    out.push_str(":/run/ssal\n");
+                }
+                continue;
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    fs::write(ld_config_path, out)
 }

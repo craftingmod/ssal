@@ -1,11 +1,11 @@
 use rsbinder::{
     declare_binder_interface, Binder, Interface, Parcel, Result as BinderResult, SIBinder,
-    Status, TransactionCode,
+    Status, TransactionCode, FLAG_ONEWAY,
 };
 use std::ffi::{CStr, CString};
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
-use std::os::fd::FromRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -284,6 +284,35 @@ impl GuestNetd {
             default_net_id: Mutex::new(0),
         }
     }
+
+    fn emit_unsolicited<F>(&self, tx_code: TransactionCode, build: F)
+    where
+        F: Fn(&mut Parcel),
+    {
+        let listeners = self.listeners.lock().unwrap().clone();
+        for listener in listeners {
+            if let Some(tr) = listener.__transport() {
+                if let Ok(mut req) =
+                    tr.prepare_request("android.net.INetdUnsolicitedEventListener")
+                {
+                    build(&mut req);
+                    let _ = tr.submit_transact(tx_code, req, FLAG_ONEWAY);
+                }
+            }
+        }
+    }
+
+    fn notify_interface_address_updated(&self, addr: &str, prefix_len: i32, if_name: &str) {
+        let cidr = format!("{addr}/{prefix_len}");
+        // INetdUnsolicitedEventListener.onInterfaceAddressUpdated (tx 4):
+        // addr, ifName, flags (IFA_F_PERMANENT = 128), scope (RT_SCOPE_UNIVERSE = 0)
+        self.emit_unsolicited(4, |req| {
+            let _ = req.write(&cidr);
+            let _ = req.write(&if_name);
+            let _ = req.write(&128i32);
+            let _ = req.write(&0i32);
+        });
+    }
 }
 
 fn set_interface_up_down(if_name: &str, up: bool) {
@@ -332,10 +361,61 @@ fn set_interface_mtu(if_name: &str, mtu: i32) {
     unsafe { libc::close(sock) };
 }
 
-fn set_interface_ipv4(if_name: &str, addr_str: &str, prefix_len: i32) {
-    let Ok(ip) = addr_str.parse::<Ipv4Addr>() else {
-        return;
+fn netlink_exchange(msg: &[u8]) -> std::io::Result<()> {
+    let sock = unsafe {
+        libc::socket(
+            libc::AF_NETLINK,
+            libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+            libc::NETLINK_ROUTE,
+        )
     };
+    if sock < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let res = (|| {
+        let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+        addr.nl_family = libc::AF_NETLINK as _;
+        if unsafe {
+            libc::bind(
+                sock,
+                &addr as *const _ as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        if unsafe { libc::send(sock, msg.as_ptr().cast(), msg.len(), 0) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut ack = [0u8; 256];
+        let n = unsafe { libc::recv(sock, ack.as_mut_ptr().cast(), ack.len(), 0) };
+        if n < 20 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let nlmsg_type = u16::from_ne_bytes([ack[4], ack[5]]);
+        if nlmsg_type == libc::NLMSG_ERROR as u16 {
+            let err = i32::from_ne_bytes([ack[16], ack[17], ack[18], ack[19]]);
+            if err != 0 {
+                return Err(std::io::Error::from_raw_os_error(-err));
+            }
+        }
+        Ok(())
+    })();
+    unsafe { libc::close(sock) };
+    res
+}
+
+fn nl_put_attr(buf: &mut Vec<u8>, attr_type: u16, payload: &[u8]) {
+    let start = buf.len();
+    let len = (4 + payload.len()) as u16;
+    buf.extend_from_slice(&len.to_ne_bytes());
+    buf.extend_from_slice(&attr_type.to_ne_bytes());
+    buf.extend_from_slice(payload);
+    buf.resize(start + ((len as usize + 3) & !3), 0);
+}
+
+fn clear_interface_ipv4(if_name: &str) {
     let Ok(c_name) = CString::new(if_name) else {
         return;
     };
@@ -343,35 +423,86 @@ fn set_interface_ipv4(if_name: &str, addr_str: &str, prefix_len: i32) {
     if sock < 0 {
         return;
     }
-    let make_ifreq = || -> libc::ifreq {
-        let mut req: libc::ifreq = unsafe { std::mem::zeroed() };
-        let bytes = c_name.as_bytes_with_nul();
-        let copy_len = bytes.len().min(req.ifr_name.len());
-        for (dst, &src) in req.ifr_name[..copy_len].iter_mut().zip(&bytes[..copy_len]) {
-            *dst = src as libc::c_char;
-        }
-        req
-    };
-
-    let mut req = make_ifreq();
-    let sa = unsafe { &mut *(&mut req.ifr_ifru.ifru_addr as *mut libc::sockaddr as *mut libc::sockaddr_in) };
-    sa.sin_family = libc::AF_INET as _;
-    sa.sin_addr.s_addr = u32::from(ip).to_be();
-    if unsafe { libc::ioctl(sock, libc::SIOCSIFADDR as _, &mut req) } == 0 && (0..=32).contains(&prefix_len) {
-        let mask = if prefix_len == 0 {
-            0u32
-        } else {
-            !0u32 << (32 - prefix_len as u32)
-        };
-        let mut mask_req = make_ifreq();
-        let msa = unsafe {
-            &mut *(&mut mask_req.ifr_ifru.ifru_netmask as *mut libc::sockaddr as *mut libc::sockaddr_in)
-        };
-        msa.sin_family = libc::AF_INET as _;
-        msa.sin_addr.s_addr = mask.to_be();
-        let _ = unsafe { libc::ioctl(sock, libc::SIOCSIFNETMASK as _, &mut mask_req) };
+    let mut req: libc::ifreq = unsafe { std::mem::zeroed() };
+    let bytes = c_name.as_bytes_with_nul();
+    let copy_len = bytes.len().min(req.ifr_name.len());
+    for (dst, &src) in req.ifr_name[..copy_len].iter_mut().zip(&bytes[..copy_len]) {
+        *dst = src as libc::c_char;
     }
+    let sa = unsafe {
+        &mut *(&mut req.ifr_ifru.ifru_addr as *mut libc::sockaddr as *mut libc::sockaddr_in)
+    };
+    sa.sin_family = libc::AF_INET as _;
+    sa.sin_addr.s_addr = 0;
+    let _ = unsafe { libc::ioctl(sock, libc::SIOCSIFADDR as _, &mut req) };
     unsafe { libc::close(sock) };
+}
+
+fn ensure_default_route(if_idx: u32, gateway: [u8; 4]) {
+    // nlmsghdr (16) + rtmsg (12) = 28
+    let mut buf = vec![0u8; 28];
+    buf[4..6].copy_from_slice(&(libc::RTM_NEWROUTE as u16).to_ne_bytes());
+    buf[6..8].copy_from_slice(
+        &((libc::NLM_F_REQUEST | libc::NLM_F_CREATE | libc::NLM_F_REPLACE | libc::NLM_F_ACK)
+            as u16)
+            .to_ne_bytes(),
+    );
+    buf[8..12].copy_from_slice(&1u32.to_ne_bytes());
+    buf[16] = libc::AF_INET as u8; // rtm_family
+    buf[20] = 254; // RT_TABLE_MAIN
+    buf[21] = 3; // RTPROT_BOOT
+    buf[22] = 0; // RT_SCOPE_UNIVERSE
+    buf[23] = 1; // RTN_UNICAST
+    nl_put_attr(&mut buf, 5 /* RTA_GATEWAY */, &gateway);
+    nl_put_attr(&mut buf, 4 /* RTA_OIF */, &if_idx.to_ne_bytes());
+    let len = buf.len() as u32;
+    buf[0..4].copy_from_slice(&len.to_ne_bytes());
+    let _ = netlink_exchange(&buf);
+}
+
+fn set_interface_ipv4(if_name: &str, addr_str: &str, prefix_len: i32) {
+    let Ok(ip) = addr_str.parse::<Ipv4Addr>() else {
+        return;
+    };
+    let Ok(c_name) = CString::new(if_name) else {
+        return;
+    };
+    let idx = unsafe { libc::if_nametoindex(c_name.as_ptr()) };
+    if idx == 0 || !(0..=32).contains(&prefix_len) {
+        return;
+    }
+
+    // Delete any pre-existing primary IPv4 address first so the kernel emits
+    // a fresh RTM_NEWADDR for IpClientLinkObserver even if the IP matches.
+    clear_interface_ipv4(if_name);
+
+    // nlmsghdr (16) + ifaddrmsg (8) = 24
+    let mut buf = vec![0u8; 24];
+    buf[4..6].copy_from_slice(&(libc::RTM_NEWADDR as u16).to_ne_bytes());
+    buf[6..8].copy_from_slice(
+        &((libc::NLM_F_REQUEST | libc::NLM_F_CREATE | libc::NLM_F_REPLACE | libc::NLM_F_ACK)
+            as u16)
+            .to_ne_bytes(),
+    );
+    buf[8..12].copy_from_slice(&1u32.to_ne_bytes());
+    buf[16] = libc::AF_INET as u8;
+    buf[17] = prefix_len as u8;
+    buf[18] = 0;
+    buf[19] = 0; // RT_SCOPE_UNIVERSE
+    buf[20..24].copy_from_slice(&idx.to_ne_bytes());
+
+    let octets = ip.octets();
+    let bcast = [octets[0], octets[1], octets[2], 255];
+    nl_put_attr(&mut buf, 2 /* IFA_LOCAL */, &octets);
+    nl_put_attr(&mut buf, 1 /* IFA_ADDRESS */, &octets);
+    nl_put_attr(&mut buf, 4 /* IFA_BROADCAST */, &bcast);
+    let len = buf.len() as u32;
+    buf[0..4].copy_from_slice(&len.to_ne_bytes());
+    let _ = netlink_exchange(&buf);
+
+    if if_name == "eth0" && octets == [10, 242, 0, 2] {
+        ensure_default_route(idx, [10, 242, 0, 1]);
+    }
 }
 
 impl INetd for GuestNetd {
@@ -415,6 +546,7 @@ impl INetd for GuestNetd {
                     "guest_netd_call=interfaceAddAddress if={if_name} addr={addr}/{prefix_len} pid={pid} uid={uid}"
                 );
                 set_interface_ipv4(&if_name, &addr, prefix_len);
+                self.notify_interface_address_updated(&addr, prefix_len, &if_name);
                 reply.write(&Status::ok())?;
             }
             16 => {
@@ -510,6 +642,7 @@ impl INetd for GuestNetd {
                     );
                     if !ipv4_addr.is_empty() && ipv4_addr != "0.0.0.0" {
                         set_interface_ipv4(&if_name, &ipv4_addr, prefix_len);
+                        self.notify_interface_address_updated(&ipv4_addr, prefix_len, &if_name);
                     }
                     if flags.iter().any(|f| f == "up") {
                         set_interface_up_down(&if_name, true);
@@ -517,6 +650,13 @@ impl INetd for GuestNetd {
                         set_interface_up_down(&if_name, false);
                     }
                 }
+                reply.write(&Status::ok())?;
+            }
+            84 => {
+                // interfaceClearAddrs(String ifName)
+                let if_name = data.read::<String>().unwrap_or_default();
+                eprintln!("guest_netd_call=interfaceClearAddrs if={if_name} pid={pid} uid={uid}");
+                clear_interface_ipv4(&if_name);
                 reply.write(&Status::ok())?;
             }
             86 => {
@@ -790,6 +930,68 @@ fn resolve_ipv4(host: &str, nameservers: &[Ipv4Addr]) -> Vec<Ipv4Addr> {
     Vec::new()
 }
 
+fn decode_base64(input: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity((input.len() * 3) / 4);
+    let mut buf = 0u32;
+    let mut bits = 0u8;
+    for b in input.bytes() {
+        let val = match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a' + 26,
+            b'0'..=b'9' => b - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            b'=' | b'\r' | b'\n' => continue,
+            _ => return None,
+        };
+        buf = (buf << 6) | u32::from(val);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((buf >> bits) & 0xff) as u8);
+        }
+    }
+    Some(out)
+}
+
+fn forward_dns_wire(query: &[u8], nameservers: &[Ipv4Addr]) -> Option<Vec<u8>> {
+    let sock = UdpSocket::bind("0.0.0.0:0").ok()?;
+    let _ = sock.set_read_timeout(Some(Duration::from_millis(1500)));
+    let mut buf = [0u8; 4096];
+    for &ns in nameservers {
+        if sock.send_to(query, SocketAddrV4::new(ns, 53)).is_ok() {
+            if let Ok((n, _)) = sock.recv_from(&mut buf) {
+                if n >= 12 {
+                    return Some(buf[..n].to_vec());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn handle_resnsend(stream: &mut UnixStream, parts: &[&str], nameservers: &[Ipv4Addr]) {
+    let Some(b64_query) = parts.get(3).copied() else {
+        let _ = stream.write_all(&(-libc::EINVAL).to_be_bytes());
+        return;
+    };
+    let Some(query) = decode_base64(b64_query) else {
+        let _ = stream.write_all(&(-libc::EINVAL).to_be_bytes());
+        return;
+    };
+    let Some(ans) = forward_dns_wire(&query, nameservers) else {
+        let _ = stream.write_all(&(-libc::ETIMEDOUT).to_be_bytes());
+        return;
+    };
+    let rcode = i32::from(ans[3] & 0x0f);
+    let resplen = ans.len() as i32;
+    let mut out = Vec::with_capacity(8 + ans.len());
+    out.extend_from_slice(&rcode.to_be_bytes());
+    out.extend_from_slice(&resplen.to_be_bytes());
+    out.extend_from_slice(&ans);
+    let _ = stream.write_all(&out);
+}
+
 fn write_dnsproxy_error(stream: &mut UnixStream, eai_err: i32) {
     let _ = stream.write_all(&eai_err.to_be_bytes());
 }
@@ -797,7 +999,7 @@ fn write_dnsproxy_error(stream: &mut UnixStream, eai_err: i32) {
 fn handle_dnsproxy_client(mut stream: UnixStream, nameservers: Arc<Mutex<Vec<Ipv4Addr>>>) {
     let mut req = Vec::with_capacity(256);
     let mut byte = [0u8; 1];
-    while req.len() < 1024 {
+    while req.len() < 4096 {
         match stream.read(&mut byte) {
             Ok(0) | Err(_) => return,
             Ok(_) => {
@@ -813,6 +1015,11 @@ fn handle_dnsproxy_client(mut stream: UnixStream, nameservers: Arc<Mutex<Vec<Ipv
         return;
     };
     let parts: Vec<&str> = cmd.split_whitespace().collect();
+    if parts.first().copied() == Some("resnsend") {
+        let servers = nameservers.lock().unwrap().clone();
+        handle_resnsend(&mut stream, &parts, &servers);
+        return;
+    }
     if parts.first().copied() != Some("getaddrinfo") || parts.len() < 7 {
         write_dnsproxy_error(&mut stream, 7);
         return;
@@ -851,7 +1058,7 @@ fn handle_dnsproxy_client(mut stream: UnixStream, nameservers: Arc<Mutex<Vec<Ipv
     }
 
     let mut out = Vec::with_capacity(64);
-    out.extend_from_slice(&0i32.to_be_bytes()); // rv = 0
+    out.extend_from_slice(b"222\0"); // ResponseCode::DnsProxyQueryResult
     let effective_socktype = if socktype == 0 { libc::SOCK_STREAM } else { socktype };
     let effective_proto = if protocol == 0 {
         if effective_socktype == libc::SOCK_DGRAM {
@@ -885,6 +1092,105 @@ fn handle_dnsproxy_client(mut stream: UnixStream, nameservers: Arc<Mutex<Vec<Ipv
     let _ = stream.write_all(&out);
 }
 
+fn send_ssal_sock_response(stream_fd: i32, resp_err: i32, payload_fd: Option<i32>) -> bool {
+    let mut err_bytes = resp_err.to_le_bytes();
+    let mut iov = libc::iovec {
+        iov_base: err_bytes.as_mut_ptr().cast(),
+        iov_len: err_bytes.len(),
+    };
+    let mut cmsg_buf = vec![0u8; unsafe { libc::CMSG_SPACE(std::mem::size_of::<i32>() as u32) } as usize];
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+
+    if let Some(fd) = payload_fd {
+        msg.msg_control = cmsg_buf.as_mut_ptr().cast();
+        msg.msg_controllen = cmsg_buf.len() as _;
+        unsafe {
+            let cmsg = libc::CMSG_FIRSTHDR(&msg);
+            if !cmsg.is_null() {
+                (*cmsg).cmsg_level = libc::SOL_SOCKET;
+                (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+                (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<i32>() as u32) as _;
+                std::ptr::copy_nonoverlapping(
+                    (&fd as *const i32).cast::<u8>(),
+                    libc::CMSG_DATA(cmsg),
+                    std::mem::size_of::<i32>(),
+                );
+            }
+        }
+    }
+
+    loop {
+        let rc = unsafe { libc::sendmsg(stream_fd, &msg, libc::MSG_NOSIGNAL) };
+        if rc >= 0 {
+            return true;
+        }
+        if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        return false;
+    }
+}
+
+fn handle_ssal_sock_client(mut stream: UnixStream) {
+    let mut req = [0u8; 12];
+    while stream.read_exact(&mut req).is_ok() {
+        let domain = i32::from_le_bytes([req[0], req[1], req[2], req[3]]);
+        let sock_type = i32::from_le_bytes([req[4], req[5], req[6], req[7]]);
+        let protocol = i32::from_le_bytes([req[8], req[9], req[10], req[11]]);
+
+        if domain != libc::AF_INET && domain != libc::AF_INET6 {
+            if !send_ssal_sock_response(stream.as_raw_fd(), -libc::EAFNOSUPPORT, None) {
+                break;
+            }
+            continue;
+        }
+
+        let created = unsafe { libc::socket(domain, sock_type | libc::SOCK_CLOEXEC, protocol) };
+        if created < 0 {
+            let err = std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EINVAL);
+            if !send_ssal_sock_response(stream.as_raw_fd(), -err, None) {
+                break;
+            }
+            continue;
+        }
+
+        let ok = send_ssal_sock_response(stream.as_raw_fd(), 0, Some(created));
+        unsafe { libc::close(created) };
+        if !ok {
+            break;
+        }
+    }
+}
+
+fn spawn_ssal_sock() {
+    let Ok(fd_str) = std::env::var("ANDROID_SOCKET_ssal_sock") else {
+        return;
+    };
+    let Ok(fd) = fd_str.parse::<i32>() else {
+        return;
+    };
+    if unsafe { libc::listen(fd, 64) } != 0 {
+        eprintln!(
+            "ssal-netd: ssal_sock listen failed: {}",
+            std::io::Error::last_os_error()
+        );
+        return;
+    }
+    let listener = unsafe { UnixListener::from_raw_fd(fd) };
+    eprintln!("guest_ssal_sock_ready=1");
+    std::thread::spawn(move || {
+        for incoming in listener.incoming() {
+            if let Ok(stream) = incoming {
+                std::thread::spawn(move || handle_ssal_sock_client(stream));
+            }
+        }
+    });
+}
+
 fn spawn_dnsproxyd(nameservers: Arc<Mutex<Vec<Ipv4Addr>>>) {
     let Ok(fd_str) = std::env::var("ANDROID_SOCKET_dnsproxyd") else {
         return;
@@ -915,6 +1221,7 @@ fn serve(device: u64, hwbinder: Option<u64>, context: &str) -> ssal_binder_servi
         Ipv4Addr::new(1, 1, 1, 1),
     ]));
     spawn_dnsproxyd(Arc::clone(&nameservers));
+    spawn_ssal_sock();
     let dns_binder = BnDnsResolver::new_binder(GuestDnsResolver::new(nameservers));
     ssal_binder_service::register("dnsresolver", dns_binder)?;
     let binder = BnNetd::new_binder(GuestNetd::new());

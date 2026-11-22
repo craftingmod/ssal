@@ -79,6 +79,8 @@ if [[ "$build_target" == all || "$build_target" == native ]]; then
             -ldl -o "out/bin/${lib##*:}.so"
     done
     "$android_linker" -shared -fPIC -O2 -Wall -Wextra -Werror native/binder-probe/context-map.c -ldl -o out/bin/ssal-context-map.so
+    "$android30_linker" -shared -fPIC -Os -Wall -Wextra -Werror -Wl,-soname,libnetd_client.so \
+        native/binder-probe/netd-client-wrap.c -ldl -o out/bin/ssal-netd-client.so
     "$android_ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android30-clang" \
         -shared -fPIC -Os -Wall -Wextra -Werror native/binder-probe/log-to-stderr.c \
         -llog -o out/bin/ssal-phase2-log.so

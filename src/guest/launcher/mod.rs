@@ -1537,6 +1537,15 @@ pub(crate) fn verify(
     File::create(&aidl_server)?;
     let plan = ssal::guest_policy::runtime::load(root)?
         .ok_or_else(|| io::Error::other("Guest SELinux plan missing for AIDL server"))?;
+    let netd_client_wrap = bin.join("ssal-netd-client.so");
+    let orig_netd_client = root.join("system/lib64/libnetd_client.so");
+    if netd_client_wrap.is_file() && orig_netd_client.is_file() {
+        let orig_copy = runtime.join("libnetd_client_orig.so");
+        fs::copy(&orig_netd_client, &orig_copy)?;
+        fs::set_permissions(&orig_copy, fs::Permissions::from_mode(0o644))?;
+        ssal::guest_policy::runtime::set_label(&orig_copy, &plan.context("system_lib_file", false)?)?;
+        ssal::guest_policy::runtime::bind_file(mounts, root, &netd_client_wrap, &orig_netd_client)?;
+    }
     if start_system_server || system_server_graphics {
         graphics::install_vintf(mounts, root, &plan, system_server_graphics, start_system_server)?;
         crate::guest::concurrent::device_vintf::install_overlay(mounts, root, &plan)?;
@@ -2972,14 +2981,37 @@ fn start_netd(root: &Path, guest_binder: u64, hwbinder_rdev: u64) -> io::Result<
         3003,
         0o660,
     )?;
-    spawn_with_socket(
+    let ssal_sock = create_service_socket(
+        root,
+        netd.domain,
+        "dnsproxyd_socket",
+        "dev/socket/ssal_sock",
+        libc::SOCK_STREAM,
+        false,
+        0,
+        0,
+        0o666,
+    )?;
+    let ssal_sock_fd = ssal_sock.as_raw_fd();
+    cmd.env("ANDROID_SOCKET_ssal_sock", ssal_sock_fd.to_string());
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::fcntl(ssal_sock_fd, libc::F_SETFD, 0) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let service = spawn_with_socket(
         cmd,
         log,
         "ANDROID_SOCKET_dnsproxyd",
         socket,
         false,
         Some("guest_binder_registered=netd"),
-    )
+    )?;
+    drop(ssal_sock);
+    Ok(service)
 }
 
 fn start_socket_service(root: &Path, spec: SocketServiceSpec<'_>) -> io::Result<Service> {

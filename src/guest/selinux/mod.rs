@@ -13,7 +13,7 @@ pub mod native;
 pub mod runtime;
 mod symbols;
 
-const VERSION: u32 = 82;
+const VERSION: u32 = 85;
 
 const HOST_MLS_ATTRIBUTES: &[&str] = &[
     "mlstrustedsubject",
@@ -727,15 +727,28 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
                 .or_default()
                 .push(l[2].clone());
         }
-        if matches!(l[0].atom()?, "genfscon" | "fsuse") {
-            if let Some(Expr::List(context)) = l.last() {
-                if context.len() >= 3 {
-                    if let Ok(t) = context[2].atom() {
-                        plan.shared_types.insert(t.into());
+        if matches!(
+            l[0].atom()?,
+            "genfscon" | "fsuse" | "portcon" | "nodecon" | "netifcon"
+        ) {
+            let contexts = if l[0].atom()? == "netifcon" && l.len() >= 4 {
+                &l[l.len() - 2..]
+            } else {
+                &l[l.len() - 1..]
+            };
+            for item in contexts {
+                if let Expr::List(context) = item {
+                    if context.len() >= 3 {
+                        if let Ok(t) = context[2].atom() {
+                            plan.shared_types.insert(t.into());
+                        }
                     }
                 }
             }
         }
+    }
+    for net_type in ["port", "node", "netif"] {
+        plan.shared_types.insert(net_type.into());
     }
     for name in expressions.keys() {
         if let Err(e) = resolve_attribute(
@@ -1462,6 +1475,64 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
                     &[appdomain, "ksu", class, permission],
                 );
                 plan.rules.insert(rule);
+            }
+        }
+    }
+    if active_attributes.contains("netdomain") {
+        if let (Some(netdomain), Some(netd)) =
+            (plan.attributes.get("netdomain"), plan.types.get("netd"))
+        {
+            for (class, perms) in [
+                ("fd", &["use"][..]),
+                (
+                    "tcp_socket",
+                    &[
+                        "read", "write", "getattr", "setattr", "getopt", "setopt", "shutdown",
+                        "append", "bind", "connect", "listen", "accept",
+                    ][..],
+                ),
+                (
+                    "udp_socket",
+                    &[
+                        "read", "write", "getattr", "setattr", "getopt", "setopt", "shutdown",
+                        "append", "bind", "connect",
+                    ][..],
+                ),
+                (
+                    "rawip_socket",
+                    &[
+                        "read", "write", "getattr", "setattr", "getopt", "setopt", "shutdown",
+                        "append", "bind", "connect",
+                    ][..],
+                ),
+                ("unix_stream_socket", &["connectto"][..]),
+            ] {
+                let rule = format!("allow {netdomain} {netd} {class} {{ {} }}", perms.join(" "));
+                if plan.rules.insert(rule.clone()) {
+                    for perm in perms {
+                        native::record(
+                            &mut native_rules,
+                            rule.clone(),
+                            1,
+                            1,
+                            &[netdomain, netd, class, perm],
+                        );
+                    }
+                }
+            }
+            if let Some(dns_sock) = plan.types.get("dnsproxyd_socket") {
+                for perm in ["write", "getattr"] {
+                    let rule = format!("allow {netdomain} {dns_sock} sock_file {{ {perm} }}");
+                    if plan.rules.insert(rule.clone()) {
+                        native::record(
+                            &mut native_rules,
+                            rule,
+                            1,
+                            1,
+                            &[netdomain, dns_sock, "sock_file", perm],
+                        );
+                    }
+                }
             }
         }
     }

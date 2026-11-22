@@ -51,6 +51,7 @@ const entries: { name: string; path: string; mode: number }[] = [
     "ssal-keymint",
     "ssal-virtual-composer",
     "ssal-context-map.so",
+    "ssal-netd-client.so",
     "ssal-binder-ipc",
     "ssal-phase2-log.so",
     "ssal-zygote-diag.so",
