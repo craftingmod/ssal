@@ -151,10 +151,11 @@ Basic android feauture
 ### Not Working
 **ELSE**
 
-Network, Almost HAL, sound, navigation, settings, display brightness, etc
+Webview, Almost HAL, some settings, display brightness, etc
 
 ## Milestone
 * 0.0.1: Initial boot success
+* 0.0.2: Audio & Navbar 
 * ... SoonTM
 
 ## Build
