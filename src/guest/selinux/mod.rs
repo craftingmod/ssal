@@ -13,7 +13,7 @@ pub mod native;
 pub mod runtime;
 mod symbols;
 
-const VERSION: u32 = 79;
+const VERSION: u32 = 81;
 
 type Names = BTreeMap<String, String>;
 
@@ -145,6 +145,8 @@ pub struct Plan {
     #[serde(default)]
     pub permissive: bool,
     #[serde(default)]
+    pub audit: bool,
+    #[serde(default)]
     pub domains: BTreeSet<String>,
     pub input_hash: String,
     pub inputs: Vec<Input>,
@@ -165,6 +167,15 @@ pub struct Plan {
 }
 
 impl Plan {
+    pub fn strip_dontaudit(&mut self) {
+        self.rules.retain(|rule| {
+            !rule.starts_with("dontaudit ") && !rule.starts_with("dontauditxperm ")
+        });
+        self.native_rules.retain(|rule, _| {
+            !rule.starts_with("dontaudit ") && !rule.starts_with("dontauditxperm ")
+        });
+    }
+
     pub fn is_permissive_domain(&self, context: &str) -> bool {
         self.permissive
             && context
@@ -610,6 +621,7 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
         version: VERSION,
         id: id.into(),
         permissive: false,
+        audit: false,
         domains: BTreeSet::new(),
         input_hash: digest(&serde_json::to_vec(&hashes)?),
         inputs: hashes,
@@ -861,8 +873,13 @@ pub fn generate(id: &str, inputs: &BTreeMap<String, String>) -> io::Result<Plan>
             }
         }
     }
-    // Host mlsconstrain rules evaluate against Host mlstrustedsubject/mlstrustedobject.
-    for host_attr in ["mlstrustedsubject", "mlstrustedobject"] {
+    // Host mlsconstrain rules evaluate against Host MLS attributes.
+    for host_attr in [
+        "mlstrustedsubject",
+        "mlstrustedobject",
+        "app_data_file_type",
+        "appdomain_tmpfs",
+    ] {
         if let Some(values) = sets.get(host_attr) {
             for original in values {
                 if let Some(name) = plan.types.get(original) {
@@ -1797,6 +1814,7 @@ pub fn prepare(
     files: &BTreeMap<String, String>,
     force_regen: bool,
     permissive: Option<bool>,
+    audit: Option<bool>,
 ) -> io::Result<(Plan, bool)> {
     let directory = profile.join("selinux");
     fs::create_dir_all(&directory)?;
@@ -1809,7 +1827,7 @@ pub fn prepare(
         })
         .collect();
     let hash = digest(&serde_json::to_vec(&hashes)?);
-    let cached: Option<Plan> = if force_regen && permissive.is_some() {
+    let cached: Option<Plan> = if force_regen && permissive.is_some() && audit.is_some() {
         None
     } else {
         match fs::read(&path) {
@@ -1823,12 +1841,23 @@ pub fn prepare(
             .as_ref()
             .is_some_and(|plan| plan.id == id && plan.permissive)
     });
+    let audit = audit.unwrap_or_else(|| {
+        cached
+            .as_ref()
+            .is_some_and(|plan| plan.id == id && plan.audit)
+    });
     let cached = cached.filter(|plan| {
-        !force_regen && plan.version == VERSION && plan.id == id && plan.input_hash == hash
+        !force_regen
+            && plan.version == VERSION
+            && plan.id == id
+            && plan.input_hash == hash
+            && (!plan.audit || audit)
     });
     let regenerated = cached.is_none();
     let mut plan = match cached {
-        Some(plan) if plan.permissive == permissive => return Ok((plan, false)),
+        Some(plan) if plan.permissive == permissive && plan.audit == audit => {
+            return Ok((plan, false))
+        }
         Some(plan) => plan,
         None => match generate(id, files) {
             Ok(plan) => plan,
@@ -1843,15 +1872,20 @@ pub fn prepare(
             }
         },
     };
+    if audit {
+        plan.strip_dontaudit();
+    }
     plan.permissive = permissive;
+    plan.audit = audit;
     let bytes = serde_json::to_vec_pretty(&plan)?;
     let history = directory.join("plans");
     fs::create_dir_all(&history)?;
     atomic(
         &history.join(format!(
-            "v{VERSION}-{}{}.json",
+            "v{VERSION}-{}{}{}.json",
             plan.input_hash,
-            if permissive { "-permissive" } else { "" }
+            if permissive { "-permissive" } else { "" },
+            if audit { "-audit" } else { "" }
         )),
         &bytes,
     )?;
@@ -2411,23 +2445,23 @@ mod tests {
         let profile = root.join("profile");
         fs::create_dir(&profile)?;
         let files = fixture();
-        assert!(prepare(&profile, &id, &files, false, None)?.1);
-        assert!(!prepare(&profile, &id, &files, false, None)?.1);
-        assert!(prepare(&profile, &id, &files, true, None)?.1);
-        assert!(!prepare(&profile, &id, &files, false, None)?.1);
+        assert!(prepare(&profile, &id, &files, false, None, None)?.1);
+        assert!(!prepare(&profile, &id, &files, false, None, None)?.1);
+        assert!(prepare(&profile, &id, &files, true, None, None)?.1);
+        assert!(!prepare(&profile, &id, &files, false, None, None)?.1);
         let mut stale = generate(&id, &files)?;
         stale.version = 1;
         atomic(
             &profile.join("selinux/plan.json"),
             &serde_json::to_vec(&stale)?,
         )?;
-        assert!(prepare(&profile, &id, &files, false, None)?.1);
+        assert!(prepare(&profile, &id, &files, false, None, None)?.1);
         let mut changed = files;
         changed
             .get_mut("system/etc/selinux/plat_seapp_contexts")
             .unwrap()
             .push_str("# changed\n");
-        assert!(prepare(&profile, &id, &changed, false, None)?.1);
+        assert!(prepare(&profile, &id, &changed, false, None, None)?.1);
         assert_eq!(fs::read_dir(profile.join("selinux/plans"))?.count(), 2);
         fs::remove_dir_all(&profile)?;
         assert_eq!(allocate_id(&root)?, "p0002");
@@ -2440,7 +2474,7 @@ mod tests {
         let profile = std::env::temp_dir()
             .join(format!("ssal-permissive-{}", std::process::id()));
         let files = fixture();
-        let (plan, _) = prepare(&profile, "p0001", &files, false, Some(true))?;
+        let (plan, _) = prepare(&profile, "p0001", &files, false, Some(true), None)?;
         assert!(plan.is_permissive_domain("u:r:ssal_p0001_zygote:s0"));
         assert!(!plan.is_permissive_domain("u:r:zygote:s0"));
         assert!(!plan.is_permissive_domain("u:object_r:ssal_p0001_system_file:s0"));
@@ -2453,8 +2487,40 @@ mod tests {
             "permissive ssal_p0001_system_server".into(),
             "permissive ssal_p0001_zygote".into(),
         ].into());
-        assert!(prepare(&profile, "p0001", &files, false, None)?.0.permissive);
-        assert!(!prepare(&profile, "p0001", &files, false, Some(false))?.0.permissive);
+        assert!(prepare(&profile, "p0001", &files, false, None, None)?.0.permissive);
+        assert!(!prepare(&profile, "p0001", &files, false, Some(false), None)?.0.permissive);
+        fs::remove_dir_all(profile)?;
+        Ok(())
+    }
+
+    #[test]
+    fn prepare_audit_strips_dontaudit_and_can_be_reset() -> io::Result<()> {
+        let profile = std::env::temp_dir().join(format!("ssal-audit-{}", std::process::id()));
+        let mut files = fixture();
+        files
+            .get_mut("system/etc/selinux/plat_sepolicy.cil")
+            .unwrap()
+            .push_str(
+                " (class ioctl_file (ioctl)) (dontaudit zygote self (file (read))) (dontauditx zygote self (ioctl ioctl_file (0x1234)))",
+            );
+        let (plan, _) = prepare(&profile, "p0001", &files, false, None, Some(true))?;
+        assert!(plan.audit);
+        assert!(!plan
+            .rules
+            .iter()
+            .any(|rule| rule.starts_with("dontaudit ") || rule.starts_with("dontauditxperm ")));
+        assert!(!plan
+            .native_rules
+            .keys()
+            .any(|rule| rule.starts_with("dontaudit ") || rule.starts_with("dontauditxperm ")));
+        assert!(prepare(&profile, "p0001", &files, false, None, None)?.0.audit);
+        let (reset, _) = prepare(&profile, "p0001", &files, false, None, Some(false))?;
+        assert!(!reset.audit);
+        assert!(reset.rules.iter().any(|rule| rule.starts_with("dontaudit ")));
+        assert!(reset
+            .rules
+            .iter()
+            .any(|rule| rule.starts_with("dontauditxperm ")));
         fs::remove_dir_all(profile)?;
         Ok(())
     }
@@ -2485,9 +2551,9 @@ mod tests {
         );
         let generated = generate("p0001", &files)?;
         let expected = serde_json::to_vec_pretty(&generated)?;
-        let (miss, regenerated) = prepare(&root, "p0001", &files, false, None)?;
+        let (miss, regenerated) = prepare(&root, "p0001", &files, false, None, None)?;
         assert!(regenerated);
-        let (hit, regenerated) = prepare(&root, "p0001", &files, false, None)?;
+        let (hit, regenerated) = prepare(&root, "p0001", &files, false, None, None)?;
         assert!(!regenerated);
         for plan in [&miss, &hit] {
             assert_eq!(serde_json::to_vec_pretty(plan)?, expected);
@@ -2516,7 +2582,7 @@ mod tests {
             &root.join("selinux/plan.json"),
             &serde_json::to_vec(&legacy)?,
         )?;
-        let (upgraded, regenerated) = prepare(&root, "p0001", &files, false, None)?;
+        let (upgraded, regenerated) = prepare(&root, "p0001", &files, false, None, None)?;
         assert!(regenerated);
         assert_eq!(serde_json::to_vec_pretty(&upgraded)?, expected);
         // Reproduce the old mounted-only correction without changing its rule/command set.
@@ -2635,7 +2701,7 @@ mod tests {
         let mut files = BTreeMap::new();
         files.insert(
             "system/etc/selinux/plat_sepolicy.cil".into(),
-            "(type zygote) (type binder_device) (typeattribute mlstrustedsubject) (typeattribute mlstrustedobject) (typeattributeset mlstrustedsubject (zygote)) (typeattributeset mlstrustedobject (binder_device))".into(),
+            "(type zygote) (type binder_device) (type app_data_file) (typeattribute mlstrustedsubject) (typeattribute mlstrustedobject) (typeattribute app_data_file_type) (typeattributeset mlstrustedsubject (zygote)) (typeattributeset mlstrustedobject (binder_device)) (typeattributeset app_data_file_type (app_data_file))".into(),
         );
         let plan = generate("p0003", &files)?;
         assert!(plan
@@ -2644,6 +2710,9 @@ mod tests {
         assert!(plan
             .rules
             .contains("typeattribute ssal_p0003_binder_device mlstrustedobject"));
+        assert!(plan
+            .rules
+            .contains("typeattribute ssal_p0003_app_data_file app_data_file_type"));
         Ok(())
     }
 }

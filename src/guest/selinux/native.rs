@@ -87,9 +87,12 @@ impl PolicyCommand {
                     || (guest(0)
                         && matches!(
                             self.args[1].as_str(),
-                            "mlstrustedsubject" | "mlstrustedobject"
+                            "mlstrustedsubject"
+                                | "mlstrustedobject"
+                                | "app_data_file_type"
+                                | "appdomain_tmpfs"
                         ))
-            } // Shared Host labels may join a Guest target attribute; Guest types may join Host MLS trusted attributes.
+            } // Shared Host labels may join a Guest target attribute; Guest types may join Host MLS attributes.
             3 | 6 => guest(0),
             7 => {
                 guest(0)
